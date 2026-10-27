@@ -127,45 +127,217 @@ def new_feature(store, args):
     return state
 
 
+_PLANNER_TERMINAL_EVENTS = {
+    "process_completed",
+    "planning_exited",
+    "planning_interrupted",
+    "planning_launch_failed",
+}
+
+
+def _planner_attempt_has_terminal_evidence(events, attempt):
+    related = [event for event in events
+               if event.get("agent") == "planner" and event.get("attempt") == attempt]
+    if any(event.get("kind") == "planning_launch_failed" for event in related):
+        return True
+    starts = set()
+    for event in related:
+        pid, create_time = event.get("pid"), event.get("create_time")
+        if (event.get("kind") == "process_started" and isinstance(pid, int)
+                and isinstance(create_time, (int, float)) and create_time > 0):
+            starts.add((pid, create_time))
+    return any(
+        event.get("kind") == "process_completed"
+        and isinstance(event.get("pid"), int)
+        and isinstance(event.get("create_time"), (int, float))
+        and event.get("create_time") > 0
+        and (event.get("pid"), event.get("create_time")) in starts
+        for event in related
+    )
+
+
+def _planner_recovery_escalation(store, state, attempts, reason):
+    names = ", ".join(attempts) if attempts else "unidentified legacy attempt"
+    message = f"Planner dispatch {names} is unresolved ({reason}); refusing to launch Codex"
+    if state.phase != "ESCALATED":
+        state.previous_phase = state.phase
+    state.phase = "ESCALATED"
+    state.error = message
+    store.save(state)
+    store.event(state.run_id, "planner_recovery_escalated", attempts=attempts, reason=reason)
+    raise ContractError(message)
+
+
+def reconcile_planner_dispatches(store, state):
+    """Only terminal, attempt-correlated evidence permits another planner launch.
+
+    This intentionally never terminates an unresolved planner. A missing or
+    stale PID is not proof that its process tree ended, and process identity by
+    itself is not completion evidence.
+    """
+    import psutil
+
+    events = store.events(state.run_id)
+    planner_events = [event for event in events if event.get("agent") == "planner"]
+    intents = [event for event in planner_events if event.get("kind") == "dispatch_intent"]
+    attempts_by_key = {}
+    legacy_pending = False
+    unresolved = []
+
+    for intent in intents:
+        attempt = intent.get("attempt")
+        if isinstance(attempt, str) and attempt:
+            key = attempt
+            attempts_by_key[key] = intent
+            if not _planner_attempt_has_terminal_evidence(planner_events, attempt):
+                unresolved.append(attempt)
+            continue
+
+        # Pre-repair planner events lack attempt IDs. Pair them in journal order
+        # only; if their boundaries overlap or no terminal record follows, fail
+        # closed rather than borrowing another attempt's PID or completion.
+        if legacy_pending:
+            unresolved.append(f"legacy-intent-{intent.get('id')}")
+        legacy_pending = True
+        for event in planner_events:
+            if event.get("id", 0) <= intent.get("id", 0):
+                continue
+            if event.get("attempt") is None and event.get("kind") in _PLANNER_TERMINAL_EVENTS:
+                legacy_pending = False
+                break
+            if event.get("kind") == "dispatch_intent" and event.get("agent") == "planner":
+                break
+        if legacy_pending:
+            unresolved.append(f"legacy-intent-{intent.get('id')}")
+
+    # A start event without an intent cannot establish which planner attempt
+    # owns it. It must never be adopted as authority for a new invocation.
+    for event in planner_events:
+        if event.get("kind") != "process_started":
+            continue
+        attempt = event.get("attempt")
+        if isinstance(attempt, str):
+            if attempt not in attempts_by_key:
+                unresolved.append(attempt)
+        else:
+            legacy_intents = [
+                intent for intent in intents
+                if not isinstance(intent.get("attempt"), str)
+                and intent.get("id", 0) < event.get("id", 0)
+            ]
+            legacy_intent = max(legacy_intents, key=lambda item: item.get("id", 0), default=None)
+            if legacy_intent is None or any(
+                prior.get("kind") in _PLANNER_TERMINAL_EVENTS
+                and prior.get("attempt") is None
+                and legacy_intent.get("id", 0) < prior.get("id", 0) < event.get("id", 0)
+                for prior in planner_events
+            ):
+                unresolved.append("unmatched-process-start")
+
+    planner = state.workers.get("planner", {})
+    current_attempt = planner.get("uncertain_attempt_id") or planner.get("attempt_id")
+    current_identity = None
+    if (current_attempt and planner.get("process_attempt_id") == current_attempt
+            and isinstance(planner.get("process"), dict)):
+        current_identity = {**planner["process"], "attempt": current_attempt}
+
+    if (planner.get("status") in {"running", "starting", "uncertain"} and current_attempt
+            and current_attempt not in attempts_by_key):
+        # State is written before the dispatch-intent event. Therefore an
+        # attempt with no intent is known not to have reached Popen unless a
+        # process identity was already persisted, which is inconsistent.
+        if (planner.get("process_attempt_id") == current_attempt
+                or planner.get("uncertain_attempt_id") == current_attempt):
+            _planner_recovery_escalation(
+                store, state, [current_attempt],
+                "attempt-specific process evidence exists without its dispatch intent",
+            )
+        planner.update(status="interrupted", process=None, process_attempt_id=None)
+        store.save(state)
+        store.event(state.run_id, "planning_launch_not_started", attempt=current_attempt)
+
+    if unresolved:
+        unresolved = sorted(set(unresolved))
+        evidence = []
+        for attempt in unresolved:
+            related = [event for event in planner_events if event.get("attempt") == attempt]
+            identities = [
+                {"pid": event.get("pid"), "create_time": event.get("create_time"),
+                 "source": "process_started"}
+                for event in related if event.get("kind") == "process_started"
+            ]
+            if current_identity and current_identity.get("attempt") == attempt:
+                identities.append({**current_identity, "source": "saved_state"})
+            if not identities:
+                evidence.append(f"{attempt}: no matching durable process identity")
+                continue
+            for identity in identities:
+                pid, create_time = identity.get("pid"), identity.get("create_time")
+                if not isinstance(pid, int) or not isinstance(create_time, (int, float)) or create_time <= 0:
+                    evidence.append(f"{attempt}: invalid identity evidence")
+                    continue
+                try:
+                    observed = psutil.Process(pid)
+                    if abs(observed.create_time() - create_time) > 0.01:
+                        evidence.append(f"{attempt}: process identity no longer matches")
+                    elif observed.status() == psutil.STATUS_ZOMBIE:
+                        evidence.append(f"{attempt}: process exited without terminal evidence")
+                    else:
+                        evidence.append(f"{attempt}: matching process may still be active")
+                except psutil.NoSuchProcess:
+                    evidence.append(f"{attempt}: process is absent but terminal evidence is missing")
+                except psutil.Error:
+                    evidence.append(f"{attempt}: process identity cannot be verified")
+        _planner_recovery_escalation(store, state, unresolved, "; ".join(evidence))
+
+    return state
+
+
 def plan_feature(store, entry, feature, state):
     import psutil
 
     from orch.agents import AgentRequest, CodexAdapter
     from orch.platform_support import executable_argv
+    # Reconcile before writing a new instruction or changing planner state. This
+    # path is shared by both `orch plan` and `orch resume` from DISCUSSING.
+    reconcile_planner_dispatches(store, state)
     plan = Path(entry["plan"])
-    instruction = store.run_dir(state.run_id) / "planning-instruction.md"
+    planner = state.workers.setdefault("planner", {})
+    attempt = int(planner.get("attempt", 0)) + 1
+    attempt_id = f"planner-{state.round}-{attempt}"
+    instruction = store.run_dir(state.run_id) / f"planning-instruction-{attempt_id}.md"
     model = feature.models.resolve("planner")
     template = Path(__file__).parent / "templates" / "planner.md"
     body = template.read_text() if template.exists() else "Maintain discussion.md and write all plan artifacts."
     atomic_write(instruction, f"# Planning session\n\nCanonical plan folder: {plan}\nRequirement: {plan / 'requirement.md'}\nDiscussion: {plan / 'discussion.md'}\n\n{body}\n")
     state.phase = "DISCUSSING"
     state = store.save(state)
-    model = feature.models.resolve("planner")
-    request = AgentRequest(role="planner", logical_id="planner", attempt_id="interactive",
+    request = AgentRequest(role="planner", logical_id="planner", attempt_id=attempt_id,
                            instruction_file=instruction, output_file=plan / "plan.md",
                            cwd=Path(state.workspace["feature_path"]), model=model,
                            writable_roots=(plan,))
     argv = CodexAdapter().interactive_argv(request)
-    store.event(state.run_id, "dispatch_intent", agent="planner", role="planner", model=model.model)
+    planner = state.workers.setdefault("planner", {})
+    planner.update(status="running", role="planner", attempt=attempt, attempt_id=attempt_id,
+                   started_at=timestamp(), output=str(request.output_file))
+    planner.pop("process", None)
+    planner.pop("process_attempt_id", None)
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="planner", attempt=attempt_id,
+                role="planner", model=model.model, instruction=str(instruction),
+                output=str(request.output_file))
 
     def stop_owned_process(process, identity):
         """Stop only the planner process tree whose creation identity was recorded."""
-        processes = []
-        try:
-            parent = psutil.Process(identity["pid"])
-            if abs(parent.create_time() - identity["create_time"]) <= 0.01:
-                processes = [*parent.children(recursive=True), parent]
-        except psutil.NoSuchProcess:
-            pass
+        parent = psutil.Process(identity["pid"])
+        if abs(parent.create_time() - identity["create_time"]) > 0.01:
+            raise ContractError("Planner process identity changed; refusing to terminate it")
+        processes = [*parent.children(recursive=True), parent]
         for child in reversed(processes):
             try:
                 child.terminate()
             except psutil.NoSuchProcess:
                 pass
-        try:
-            process.terminate()
-        except OSError:
-            pass
         _, alive = psutil.wait_procs(processes, timeout=1.0)
         for child in alive:
             try:
@@ -189,16 +361,41 @@ def plan_feature(store, entry, feature, state):
         info = state.workers["planner"]
         info["status"] = "failed"
         store.save(state)
+        store.event(state.run_id, "planning_launch_failed", agent="planner", attempt=attempt_id,
+                    error="Popen failed before creating a process")
         raise
     try:
         created = psutil.Process(process.pid).create_time()
-    except psutil.NoSuchProcess:
-        created = 0.0
+    except psutil.Error as exc:
+        info = state.workers["planner"]
+        info.update(status="uncertain", uncertain_attempt_id=attempt_id,
+                    process={"pid": process.pid, "create_time": None},
+                    process_attempt_id=attempt_id)
+        state.phase = "ESCALATED"
+        state.previous_phase = "DISCUSSING"
+        state.error = f"Planner {attempt_id} started but its process identity cannot be verified"
+        state = store.save(state)
+        store.event(state.run_id, "planning_identity_uncertain", agent="planner",
+                    attempt=attempt_id, pid=process.pid, error=str(exc))
+        raise ContractError(state.error) from exc
+    if created <= 0:
+        info = state.workers["planner"]
+        info.update(status="uncertain", uncertain_attempt_id=attempt_id,
+                    process={"pid": process.pid, "create_time": created},
+                    process_attempt_id=attempt_id)
+        state.phase = "ESCALATED"
+        state.previous_phase = "DISCUSSING"
+        state.error = f"Planner {attempt_id} started without a verifiable process identity"
+        state = store.save(state)
+        store.event(state.run_id, "planning_identity_uncertain", agent="planner",
+                    attempt=attempt_id, pid=process.pid, create_time=created)
+        raise ContractError(state.error)
     identity = {"pid": process.pid, "create_time": created}
     info = state.workers["planner"]
     info["process"] = identity
+    info["process_attempt_id"] = attempt_id
     state = store.save(state)
-    store.event(state.run_id, "process_started", agent="planner", **identity)
+    store.event(state.run_id, "process_started", agent="planner", attempt=attempt_id, **identity)
 
     interrupted = None
     try:
@@ -233,16 +430,20 @@ def plan_feature(store, entry, feature, state):
         state.phase = "ABORTED" if interrupted == "abort" else "PAUSED"
         state.workers["planner"].update(status="interrupted", process=identity)
         state = store.save(state)
-        store.event(state.run_id, "planning_interrupted", request=interrupted,
+        store.event(state.run_id, "process_completed", agent="planner", attempt=attempt_id,
+                    exit_code=process.returncode, reason=interrupted, **identity)
+        store.event(state.run_id, "planning_interrupted", agent="planner", attempt=attempt_id,
+                    request=interrupted,
                     exit_code=process.returncode, **identity)
         return state
 
-    store.event(state.run_id, "process_completed", agent="planner", exit_code=process.returncode,
-                **identity)
+    store.event(state.run_id, "process_completed", agent="planner", attempt=attempt_id,
+                exit_code=process.returncode, **identity)
     state.workers["planner"].update(status="done" if process.returncode == 0 else "failed",
                                     exit_code=process.returncode)
     state = store.save(state)
-    store.event(state.run_id, "planning_exited", exit_code=process.returncode)
+    store.event(state.run_id, "planning_exited", agent="planner", attempt=attempt_id,
+                exit_code=process.returncode)
     if process.returncode:
         raise ContractError("Planning session exited unsuccessfully; discussion files retained")
     try:

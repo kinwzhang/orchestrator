@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 import threading
 import time
@@ -299,7 +300,189 @@ def test_interactive_planner_observes_pause_and_abort(delivery, monkeypatch, con
     assert result.phase == phase
     assert result.previous_phase == "DISCUSSING"
     assert result.workers["planner"]["status"] == "interrupted"
-    assert any(event["kind"] == "planning_interrupted" for event in store.events(state.run_id))
+    planner_attempt = result.workers["planner"]["attempt_id"]
+    assert any(event["kind"] == "planning_interrupted" and event.get("attempt") == planner_attempt
+               for event in store.events(state.run_id))
+    assert any(event["kind"] == "process_completed" and event.get("attempt") == planner_attempt
+               for event in store.events(state.run_id))
+
+
+class PlannerCrash(BaseException):
+    pass
+
+
+class PlannerPopenStub:
+    def __init__(self, pid, returncode=None):
+        self.pid = pid
+        self.returncode = returncode
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+
+def _planner_cli(monkeypatch, store, feature, plan):
+    from orch.cli import main
+
+    entry = {"slug": feature.slug, "run_id": "sample-run",
+             "repo": str(feature.target_project), "plan": str(plan)}
+    monkeypatch.setattr("orch.cli.registry", lambda _store: [entry])
+
+    def invoke(command):
+        return main(["--data-dir", str(store.data_dir), command, feature.slug])
+
+    return invoke
+
+
+def _crash_after_planner_popen(store, state, feature, plan, monkeypatch):
+    from orch.agents import CodexAdapter
+    from orch.cli import plan_feature
+
+    state.phase = "DISCUSSING"
+    state.approved_hashes = {}
+    state = store.save(state)
+    launches = []
+    stub = PlannerPopenStub(pid=os.getpid())
+    monkeypatch.setattr(CodexAdapter, "interactive_argv",
+                        lambda self, request: [sys.executable, "-c", "pass"])
+    monkeypatch.setattr("orch.cli.subprocess.Popen",
+                        lambda *args, **kwargs: launches.append(stub) or stub)
+    save = store.save
+
+    def crash_before_identity_is_durable(next_state, expected_revision=None):
+        planner = next_state.workers.get("planner", {})
+        if planner.get("process_attempt_id"):
+            raise PlannerCrash("crash after Popen and before process identity save")
+        return save(next_state, expected_revision)
+
+    monkeypatch.setattr(store, "save", crash_before_identity_is_durable)
+    entry = {"plan": str(plan), "repo": str(feature.target_project)}
+    with pytest.raises(PlannerCrash):
+        plan_feature(store, entry, feature, state)
+    monkeypatch.setattr(store, "save", save)
+    return launches, stub
+
+
+def test_planner_crash_after_popen_preserves_unresolved_attempt(delivery, monkeypatch):
+    store, state, feature, _, plan = delivery
+    launches, process = _crash_after_planner_popen(store, state, feature, plan, monkeypatch)
+
+    assert len(launches) == 1
+    interrupted = store.load(state.run_id)
+    attempt = interrupted.workers["planner"]["attempt_id"]
+    events = store.events(state.run_id)
+    assert interrupted.workers["planner"]["status"] == "running"
+    assert sum(event["kind"] == "dispatch_intent" and event.get("attempt") == attempt
+               for event in events) == 1
+    assert not any(event["kind"] == "process_started" and event.get("attempt") == attempt
+                   for event in events)
+    assert process.terminate_calls == process.kill_calls == 0
+
+
+def test_plan_and_resume_refuse_duplicate_after_uncertain_planner_crash(delivery, monkeypatch, capsys):
+    store, state, feature, _, plan = delivery
+    launches, process = _crash_after_planner_popen(store, state, feature, plan, monkeypatch)
+    invoke = _planner_cli(monkeypatch, store, feature, plan)
+    planning_files = list(store.run_dir(state.run_id).glob("planning-instruction-*.md"))
+    assert len(planning_files) == 1
+    original_instruction = planning_files[0].read_text(encoding="utf-8")
+    codex_argv_calls = []
+    from orch.agents import CodexAdapter
+    monkeypatch.setattr(CodexAdapter, "interactive_argv",
+                        lambda self, request: codex_argv_calls.append(request) or [sys.executable, "-c", "pass"])
+
+    assert invoke("plan") == 1
+    first_error = capsys.readouterr().err
+    assert "no matching durable process identity" in first_error
+    assert store.load(state.run_id).phase == "ESCALATED"
+    assert invoke("resume") == 1
+    second_error = capsys.readouterr().err
+    assert "no matching durable process identity" in second_error
+    assert store.load(state.run_id).phase == "ESCALATED"
+    assert len(launches) == 1
+    assert not codex_argv_calls
+    assert process.terminate_calls == process.kill_calls == 0
+    assert list(store.run_dir(state.run_id).glob("planning-instruction-*.md")) == planning_files
+    assert planning_files[0].read_text(encoding="utf-8") == original_instruction
+    assert sum(event["kind"] == "dispatch_intent" and event.get("agent") == "planner"
+               for event in store.events(state.run_id)) == 1
+
+
+def test_stale_planner_identity_from_another_attempt_is_not_reused(delivery, monkeypatch, capsys):
+    store, state, feature, _, plan = delivery
+    state.phase = "DISCUSSING"
+    state.approved_hashes = {}
+    old_attempt, current_attempt = "planner-1-1", "planner-1-2"
+    state.workers["planner"] = {
+        "status": "running", "attempt": 2, "attempt_id": current_attempt,
+        "process_attempt_id": old_attempt,
+        "process": {"pid": os.getpid(), "create_time": 1.0},
+    }
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="planner", attempt=old_attempt)
+    store.event(state.run_id, "process_started", agent="planner", attempt=old_attempt,
+                pid=987654321, create_time=1.0)
+    store.event(state.run_id, "process_completed", agent="planner", attempt=old_attempt,
+                pid=987654321, create_time=1.0, exit_code=0)
+    store.event(state.run_id, "planning_exited", agent="planner", attempt=old_attempt,
+                exit_code=0)
+    store.event(state.run_id, "dispatch_intent", agent="planner", attempt=current_attempt)
+
+    invoke = _planner_cli(monkeypatch, store, feature, plan)
+    launches = []
+    monkeypatch.setattr("orch.cli.subprocess.Popen",
+                        lambda *args, **kwargs: launches.append(args) or None)
+    assert invoke("plan") == 1
+    assert "no matching durable process identity" in capsys.readouterr().err
+    assert not launches
+    assert store.load(state.run_id).phase == "ESCALATED"
+
+
+def test_completed_planner_attempt_allows_fresh_session(delivery, monkeypatch):
+    store, state, feature, _, plan = delivery
+    state.phase = "DISCUSSING"
+    state.approved_hashes = {}
+    old_attempt = "planner-1-1"
+    state.workers["planner"] = {
+        "status": "done", "attempt": 1, "attempt_id": old_attempt,
+        "process_attempt_id": old_attempt,
+        "process": {"pid": 987654321, "create_time": 1.0},
+    }
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="planner", attempt=old_attempt)
+    store.event(state.run_id, "process_started", agent="planner", attempt=old_attempt,
+                pid=987654321, create_time=1.0)
+    store.event(state.run_id, "process_completed", agent="planner", attempt=old_attempt,
+                pid=987654321, create_time=1.0, exit_code=0)
+    store.event(state.run_id, "planning_exited", agent="planner", attempt=old_attempt,
+                exit_code=0)
+
+    from orch.agents import CodexAdapter
+    from orch.cli import plan_feature
+    monkeypatch.setattr(CodexAdapter, "interactive_argv",
+                        lambda self, request: [sys.executable, "-c", "pass"])
+    process = PlannerPopenStub(pid=os.getpid(), returncode=0)
+    launches = []
+    monkeypatch.setattr("orch.cli.subprocess.Popen",
+                        lambda *args, **kwargs: launches.append(args) or process)
+    entry = {"plan": str(plan), "repo": str(feature.target_project)}
+
+    result = plan_feature(store, entry, feature, state)
+    assert len(launches) == 1
+    assert result.phase == "PLAN_READY"
+    assert result.workers["planner"]["attempt_id"] == "planner-1-2"
+    assert any(event["kind"] == "planning_exited" and event.get("attempt") == "planner-1-2"
+               for event in store.events(state.run_id))
 
 
 def test_crash_after_worker_commit_reconciles_before_checkpoint(delivery):
