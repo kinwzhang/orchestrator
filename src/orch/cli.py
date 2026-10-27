@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -135,25 +136,48 @@ _PLANNER_TERMINAL_EVENTS = {
 }
 
 
-def _planner_attempt_has_terminal_evidence(events, attempt):
+def _planner_attempt_has_terminal_evidence(events, attempt, after_id):
+    """Only terminal evidence recorded after the specific dispatch intent counts.
+
+    A completion from an earlier launch must never resolve a later dispatch,
+    even when legacy or corrupted state repeats an attempt ID.
+    """
     related = [event for event in events
-               if event.get("agent") == "planner" and event.get("attempt") == attempt]
+               if event.get("agent") == "planner" and event.get("attempt") == attempt
+               and event.get("id", 0) > after_id]
     if any(event.get("kind") == "planning_launch_failed" for event in related):
         return True
     starts = set()
-    for event in related:
+    for event in sorted(related, key=lambda item: item.get("id", 0)):
         pid, create_time = event.get("pid"), event.get("create_time")
+        identity = (pid, create_time)
         if (event.get("kind") == "process_started" and isinstance(pid, int)
                 and isinstance(create_time, (int, float)) and create_time > 0):
-            starts.add((pid, create_time))
-    return any(
-        event.get("kind") == "process_completed"
-        and isinstance(event.get("pid"), int)
-        and isinstance(event.get("create_time"), (int, float))
-        and event.get("create_time") > 0
-        and (event.get("pid"), event.get("create_time")) in starts
-        for event in related
-    )
+            starts.add(identity)
+        elif (event.get("kind") == "process_completed"
+              and isinstance(pid, int)
+              and isinstance(create_time, (int, float))
+              and create_time > 0
+              and identity in starts):
+            return True
+    return False
+
+
+def _planner_next_attempt(events, planner):
+    """Return a persisted counter that never reuses an attempt seen on disk."""
+    stored = planner.get("attempt")
+    counter = stored if isinstance(stored, int) and not isinstance(stored, bool) and stored > 0 else 0
+    observed = 0
+    for event in events:
+        if event.get("agent") != "planner":
+            continue
+        attempt_id = event.get("attempt")
+        if not isinstance(attempt_id, str):
+            continue
+        match = re.fullmatch(r"planner-\d+-(\d+)", attempt_id)
+        if match:
+            observed = max(observed, int(match.group(1)))
+    return max(counter, observed) + 1
 
 
 def _planner_recovery_escalation(store, state, attempts, reason):
@@ -181,16 +205,14 @@ def reconcile_planner_dispatches(store, state):
     planner_events = [event for event in events if event.get("agent") == "planner"]
     intents = [event for event in planner_events if event.get("kind") == "dispatch_intent"]
     attempts_by_key = {}
+    ambiguous = {}
     legacy_pending = False
     unresolved = []
 
     for intent in intents:
         attempt = intent.get("attempt")
         if isinstance(attempt, str) and attempt:
-            key = attempt
-            attempts_by_key[key] = intent
-            if not _planner_attempt_has_terminal_evidence(planner_events, attempt):
-                unresolved.append(attempt)
+            attempts_by_key.setdefault(attempt, []).append(intent)
             continue
 
         # Pre-repair planner events lack attempt IDs. Pair them in journal order
@@ -209,6 +231,19 @@ def reconcile_planner_dispatches(store, state):
                 break
         if legacy_pending:
             unresolved.append(f"legacy-intent-{intent.get('id')}")
+
+    for attempt, attempt_intents in attempts_by_key.items():
+        if len(attempt_intents) > 1:
+            # Repeated dispatch IDs cannot identify one owner. Legacy or
+            # corrupted journals fail closed instead of borrowing completion
+            # evidence across occurrences.
+            ambiguous[attempt] = "dispatch ID repeats in persisted evidence"
+            unresolved.append(attempt)
+            continue
+        intent = attempt_intents[0]
+        if not _planner_attempt_has_terminal_evidence(
+                planner_events, attempt, intent.get("id", 0)):
+            unresolved.append(attempt)
 
     # A start event without an intent cannot establish which planner attempt
     # owns it. It must never be adopted as authority for a new invocation.
@@ -253,14 +288,21 @@ def reconcile_planner_dispatches(store, state):
                 "attempt-specific process evidence exists without its dispatch intent",
             )
         planner.update(status="interrupted", process=None, process_attempt_id=None)
-        store.save(state)
+        state = store.save(state)
         store.event(state.run_id, "planning_launch_not_started", attempt=current_attempt)
 
     if unresolved:
         unresolved = sorted(set(unresolved))
         evidence = []
         for attempt in unresolved:
-            related = [event for event in planner_events if event.get("attempt") == attempt]
+            if attempt in ambiguous:
+                evidence.append(f"{attempt}: {ambiguous[attempt]}; cannot choose an owner")
+                continue
+            attempt_intents = attempts_by_key.get(attempt, [])
+            after_id = attempt_intents[0].get("id", 0) if attempt_intents else 0
+            # Only evidence from this dispatch occurrence may describe it.
+            related = [event for event in planner_events
+                       if event.get("attempt") == attempt and event.get("id", 0) > after_id]
             identities = [
                 {"pid": event.get("pid"), "create_time": event.get("create_time"),
                  "source": "process_started"}
@@ -300,10 +342,10 @@ def plan_feature(store, entry, feature, state):
     from orch.platform_support import executable_argv
     # Reconcile before writing a new instruction or changing planner state. This
     # path is shared by both `orch plan` and `orch resume` from DISCUSSING.
-    reconcile_planner_dispatches(store, state)
+    state = reconcile_planner_dispatches(store, state)
     plan = Path(entry["plan"])
     planner = state.workers.setdefault("planner", {})
-    attempt = int(planner.get("attempt", 0)) + 1
+    attempt = _planner_next_attempt(store.events(state.run_id), planner)
     attempt_id = f"planner-{state.round}-{attempt}"
     instruction = store.run_dir(state.run_id) / f"planning-instruction-{attempt_id}.md"
     model = feature.models.resolve("planner")
@@ -352,7 +394,8 @@ def plan_feature(store, entry, feature, state):
         process.wait()
 
     info = state.workers.setdefault("planner", {})
-    info.update(status="running", role="planner", attempt=1, started_at=timestamp())
+    info.update(status="running", role="planner", attempt=attempt, attempt_id=attempt_id,
+                started_at=timestamp())
     state = store.save(state)
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     try:

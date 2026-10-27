@@ -97,6 +97,24 @@ discussion content in place. Resume continues from persisted stages and
 retained worktrees; abort retains evidence and does not resume automatically.
 Use `status` and `watch` to confirm the resulting state.
 
+### When planning stops for recovery
+
+Before `plan` or `resume` starts another interactive planning session, `orch`
+checks the persisted planner dispatch evidence. Planning stops and the feature
+is escalated instead of launching another Codex session when the latest dispatch
+has no conclusive terminal record, or when its process ownership is missing,
+repeated, conflicting or otherwise ambiguous. The uncertain process is not
+terminated on this path because it may not be the process that was launched.
+
+Operator intervention is required before planning continues. Do not retry
+blindly, delete run evidence or kill a process whose identity has not been
+positively confirmed. Use `status` and `watch` to confirm the escalated phase
+and blocker, then inspect the run directory's `checklist.md`, `activity_log.md`
+and `issues.md` for the planner attempt, its recorded process identity and its
+terminal events. Continue only after establishing whether that process is still
+active. Pause and abort remain the supported way to stop a planning session
+while the owning command still controls its process.
+
 After successful code/docs review and promotion, test the feature branch and
 close the human gate with:
 
