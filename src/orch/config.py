@@ -72,7 +72,9 @@ def effective_feature(feature: FeatureSpec, config: Config, source: Path) -> Fea
 
     Role model overrides merge field by field, so a feature that pins
     ``models.worker.model`` keeps the configured reasoning setting for that
-    role, and replacement always inherits the final worker model.
+    role, and replacement always inherits the final worker model. A replacement
+    may additionally override only its reasoning; without that override it
+    inherits the worker's reasoning as well.
     """
     values = feature.model_dump(mode="json", exclude_unset=True)
     defaults = {"models": config.models.model_dump(exclude_none=True),

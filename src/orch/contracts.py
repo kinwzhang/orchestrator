@@ -205,7 +205,10 @@ class ModelSpec(StrictModel):
 
 
 class ReplacementModel(StrictModel):
+    """A replacement reuses the worker model and may override only its reasoning."""
+
     inherit: Literal["worker"] = "worker"
+    reasoning: str | None = None
 
 
 class RoleModels(StrictModel):
@@ -217,10 +220,20 @@ class RoleModels(StrictModel):
     replacement: ReplacementModel = Field(default_factory=ReplacementModel)
 
     def resolve(self, role: str) -> ModelSpec:
-        name = "worker" if role == "replacement" else role
-        value = getattr(self, name, None)
+        """Return the effective specification without mutating configured roles."""
+        if role == "replacement":
+            worker = self.worker
+            if not isinstance(worker, ModelSpec):
+                raise ContractError("Configure models.worker.model before dispatch")
+            # Always a fresh value: callers own the resolved replacement and the
+            # ordinary worker keeps its independent reasoning setting.
+            override = self.replacement.reasoning
+            if override is None:
+                return worker.model_copy(deep=True)
+            return worker.model_copy(update={"reasoning": override}, deep=True)
+        value = getattr(self, role, None)
         if not isinstance(value, ModelSpec):
-            raise ContractError(f"Configure models.{name}.model before dispatch")
+            raise ContractError(f"Configure models.{role}.model before dispatch")
         return value
 
 

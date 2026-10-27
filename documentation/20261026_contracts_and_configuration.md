@@ -30,32 +30,44 @@ Configure roles explicitly:
 ```toml
 [models.planner]
 model = "YOUR_CODEX_MODEL"
+reasoning = "OPTIONAL_PLANNER_REASONING"
 
 [models.worker]
 model = "PROVIDER/CODER_MODEL"
+reasoning = "OPTIONAL_WORKER_REASONING"
 
 [models.code_reviewer]
 model = "PROVIDER/STRONG_REVIEW_MODEL"
+reasoning = "OPTIONAL_REVIEW_REASONING"
 
 [models.docs_reviewer]
 model = "PROVIDER/SEMANTIC_MODEL"
+reasoning = "OPTIONAL_REVIEW_REASONING"
 
 [models.conflict_resolver]
 model = "PROVIDER/STRONG_CODING_MODEL"
+reasoning = "OPTIONAL_RESOLVER_REASONING"
 
 [models.replacement]
 inherit = "worker"
+reasoning = "OPTIONAL_REPLACEMENT_REASONING"
 ```
 
-These are placeholders, not available model recommendations. The selected CLI
-must support the supplied provider/model IDs. Replacement always resolves to
-the effective worker model after global, repository, and feature overrides and
-starts a new session. A replacement cannot specify a separate model. Optional
-reasoning settings must be supported by the selected adapter; unsupported
-settings fail rather than silently downgrade. Never put API keys in feature or
-config files. Authentication remains in the agent CLI's existing credential
-mechanism; configure log redaction separately for secrets supplied through
-environment variables.
+These are placeholders, not available model recommendations. Replace reasoning
+placeholders with values supported by the selected adapter, or omit the
+setting to leave that adapter's default. The selected CLI must support the
+supplied provider/model IDs. Replacement always resolves to the effective
+worker model after global, repository, and feature overrides and starts a new
+session. A replacement cannot specify a separate model: its configuration
+accepts only `inherit = "worker"` and an optional reasoning override. Resolving
+a replacement returns a fresh model specification, so a stronger replacement
+reasoning setting does not change ordinary worker dispatches. Without an
+override the replacement retains the worker's complete model and reasoning.
+Optional reasoning settings must be supported by the selected adapter;
+unsupported settings fail before dispatch rather than silently downgrade.
+Never put API keys in feature or config files. Authentication remains in the
+agent CLI's existing credential mechanism; configure log redaction separately
+for secrets supplied through environment variables.
 
 ## Scope and approval
 
@@ -69,7 +81,8 @@ root. Windows case collisions are rejected even when planning on Fedora.
 
 Approval covers the feature settings, requirement snapshot, discussion, plan,
 manifest, reviewer instructions and every worker instruction. It also covers
-the normalized effective model/limit settings, run mode, plan/history options,
+the normalized effective model/limit settings including a replacement
+reasoning override, run mode, plan/history options,
 configured checks and reviewer paths, and notification/viewer/redaction policy.
 Only environment variable names are included; secret values are never hashed
 into or copied to approval metadata. `contracts.approval_hashes` computes
