@@ -1,12 +1,24 @@
 import asyncio
 import base64
+import contextlib
+import json
+import shutil
 import sys
+import threading
 import urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
-from orch.agents import AgentCapabilities, AgentRequest, CodexAdapter, OpenCodeAdapter
+from orch.agents import (
+    AgentCapabilities,
+    AgentRequest,
+    CodexAdapter,
+    OpenCodeAdapter,
+    _verify_docs_access_profile,
+    docs_access_profile,
+)
 from orch.contracts import ModelSpec
 from orch.platform_support import (
     LaunchError,
@@ -105,6 +117,237 @@ def test_docs_wrapper_forbids_code(tmp_path):
     text = OpenCodeAdapter().wrapper(request(tmp_path, role="docs_reviewer"))
     assert "Judge relevance only" in text
     assert "Do not read code" in text
+
+
+def docs_request(tmp_path, **overrides):
+    cwd = tmp_path / "curated"
+    cwd.mkdir()
+    instruction = tmp_path / "attempt.md"
+    instruction.write_text("Review only curated Markdown.")
+    document = cwd / "guide.md"
+    document.write_text("Curated project documentation.")
+    return request(
+        tmp_path,
+        role="docs_reviewer",
+        instruction_file=instruction,
+        input_files=(document,),
+        cwd=cwd,
+        output_file=tmp_path / "verdict-docs.md",
+        **overrides,
+    )
+
+
+def test_docs_access_profile_is_deny_by_default_and_file_scoped(tmp_path):
+    target = docs_request(tmp_path)
+    profile_cwd = target.cwd / "isolated-profile"
+    profile_cwd.mkdir()
+    profile = docs_access_profile(target, profile_cwd)
+    permissions = profile["permission"]
+    allowed = {
+        str(target.instruction_file.resolve()),
+        *(str(path.resolve()) for path in target.input_files),
+        str(target.output_file.resolve()),
+    }
+    assert permissions["*"] == "deny"
+    assert permissions["read"] == {"*": "deny", **dict.fromkeys(allowed, "allow")}
+    assert permissions["edit"] == {
+        "*": "deny",
+        str(target.output_file.resolve()): "allow",
+    }
+    assert permissions["external_directory"] == {
+        "*": "deny",
+        **dict.fromkeys(
+            {str(Path(path).parent / "**") for path in allowed}, "allow"
+        ),
+    }
+    assert all(value is False for value in profile["tools"].values())
+    assert profile["plugin"] == []
+
+
+def test_docs_access_profile_rejects_repo_cwd_and_escaped_input(tmp_path):
+    target = docs_request(tmp_path)
+    (target.cwd / ".git").mkdir()
+    with pytest.raises(LaunchError, match="outside Git checkouts"):
+        docs_access_profile(target)
+
+    outside = tmp_path / "outside.md"
+    outside.write_text("Not copied into the curated directory.")
+    (target.cwd / ".git").rmdir()
+    target.input_files = (outside,)
+    with pytest.raises(LaunchError, match="copied into its curated"):
+        docs_access_profile(target)
+
+
+def test_docs_access_preflight_rejects_missing_open_code_deny(tmp_path, monkeypatch):
+    target = docs_request(tmp_path)
+    profile_cwd = target.cwd / "isolated-profile"
+    profile_cwd.mkdir()
+    config_path = profile_cwd / "opencode.json"
+    config_path.write_text(
+        json.dumps(docs_access_profile(target, profile_cwd)),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "orch.agents._capture",
+        lambda *_args, **_kwargs: json.dumps(
+            [{"type": "document", "path": str(config_path), "info": {"permissions": []}}]
+        ),
+    )
+    with pytest.raises(LaunchError, match="omitted a required docs-role deny rule"):
+        _verify_docs_access_profile("opencode", config_path, profile_cwd, {})
+
+
+@pytest.mark.skipif(shutil.which("opencode") is None, reason="OpenCode CLI is not installed")
+def test_opencode_docs_policy_denies_source_read_and_allows_verdict(tmp_path):
+    """Exercise v2 tool permissions with a local fake provider; no paid API is used."""
+    source_secret = "LOCAL_ONLY_SOURCE_SENTINEL"
+    verdict = "# Verdict\n\n## Summary\nLocal permission test passed.\n"
+
+    class FakeProvider(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+            self.server.requests_seen.append(body)
+            tool_names = [
+                item.get("function", {}).get("name") for item in body.get("tools", [])
+            ]
+            if "read" in tool_names and not self.server.read_requested:
+                self.server.read_requested = True
+                delta = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-source-read",
+                            "type": "function",
+                            "function": {
+                                "name": "read",
+                                "arguments": json.dumps({"path": str(self.server.source)}),
+                            },
+                        }
+                    ],
+                }
+                finish = "tool_calls"
+            elif "write" in tool_names and not self.server.verdict_written:
+                self.server.verdict_written = True
+                delta = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-verdict-write",
+                            "type": "function",
+                            "function": {
+                                "name": "write",
+                                "arguments": json.dumps(
+                                    {"path": str(self.server.output), "content": verdict}
+                                ),
+                            },
+                        }
+                    ],
+                }
+                finish = "tool_calls"
+            else:
+                delta = {
+                    "role": "assistant",
+                    "content": "The source read was denied and the verdict was written.",
+                }
+                finish = "stop"
+            chunks = [
+                {
+                    "id": "chatcmpl-local-test",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "fake",
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                },
+                {
+                    "id": "chatcmpl-local-test",
+                    "object": "chat.completion.chunk",
+                    "created": 1,
+                    "model": "fake",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                },
+                "[DONE]",
+            ]
+            response = "".join(
+                "data: " + (chunk if isinstance(chunk, str) else json.dumps(chunk)) + "\n\n"
+                for chunk in chunks
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeProvider)
+    server.requests_seen = []
+    server.read_requested = False
+    server.verdict_written = False
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        target = docs_request(tmp_path, model="local/fake")
+        source = target.cwd / "src" / "private.py"
+        source.parent.mkdir()
+        source.write_text(source_secret, encoding="utf-8")
+        server.source = source
+        server.output = target.output_file
+
+        class LocalProviderAdapter(OpenCodeAdapter):
+            @contextlib.contextmanager
+            def request_environment(self, request):
+                with super().request_environment(request) as (cwd, env):
+                    config_path = Path(env["OPENCODE_CONFIG"])
+                    config = json.loads(config_path.read_text(encoding="utf-8"))
+                    config.update(
+                        {
+                            "autoupdate": False,
+                            "update": "disable",
+                            "share": "disabled",
+                            "warming": False,
+                            "small_model": "local/fake",
+                            "provider": {
+                                "local": {
+                                    "npm": "@ai-sdk/openai-compatible",
+                                    "name": "Local permission-test provider",
+                                    "options": {
+                                        "baseURL": f"http://127.0.0.1:{server.server_port}/v1",
+                                        "apiKey": "local-test-only",
+                                    },
+                                    "models": {
+                                        "fake": {
+                                            "name": "Local fake model",
+                                            "tool_call": True,
+                                            "limit": {"context": 8192, "output": 1024},
+                                        }
+                                    },
+                                }
+                            },
+                        }
+                    )
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    yield cwd, env
+
+        result = asyncio.run(LocalProviderAdapter().run(target))
+        all_messages = [
+            message
+            for request_body in server.requests_seen
+            for message in request_body.get("messages", [])
+        ]
+        serialized = json.dumps(all_messages) + result.stdout_log.read_text() + result.stderr_log.read_text()
+        assert result.exit_code == 0
+        assert server.read_requested
+        assert any("permission.rejected" in json.dumps(message) for message in all_messages)
+        assert server.verdict_written
+        assert target.output_file.read_text(encoding="utf-8") == verdict
+        assert source_secret not in serialized
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_powershell_shim_quotes_literals(tmp_path, monkeypatch):
