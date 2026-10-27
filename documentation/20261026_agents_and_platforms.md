@@ -30,10 +30,11 @@ verify CLI capabilities, not credentials, provider model availability or billing
 a provider rejection remains an infrastructure error for workflow to handle. No models
 or credentials are inferred from an environment dump.
 
-Installed versions probed on Fedora: Codex CLI 0.164.0 and OpenCode v2.1.4. OpenCode v2
-reasoning variants use `provider/model#variant`; older CLI variants are accepted only
-when the CLI advertises `--variant`. Codex reasoning uses explicit config override.
-Unsupported reasoning mechanisms fail before dispatch.
+Local Linux environment, distribution not independently established: Codex CLI 0.164.0
+and OpenCode v2.1.4. These are local version and help probes, not Fedora acceptance
+evidence. OpenCode v2 reasoning variants use `provider/model#variant`; older CLI variants
+are accepted only when the CLI advertises `--variant`. Codex reasoning uses explicit
+config override. Unsupported reasoning mechanisms fail before dispatch.
 
 ## Evidence and live output
 
@@ -56,8 +57,8 @@ mapping, never an estimated token count. Raw unredacted JSON is not persisted se
 
 ## Cancellation and restart
 
-On Fedora, each invocation is launched in an isolated process session. Cancellation checks
-the saved leader creation time and group identity while the leader is alive. If it exits
+On POSIX systems, each invocation is launched in an isolated process session. Cancellation
+checks the saved leader creation time and group identity while the leader is alive. If it exits
 before a child closes inherited output pipes, the still-active invocation may signal only
 a surviving member of that isolated session; a recovered handle requires verified process
 identity instead. A stale saved PID alone never authorizes a process-group signal. On
@@ -90,33 +91,58 @@ multiline agent prompts through batch-only installations; do not silently flatte
 or weaken quoting. Native Windows launch, long paths and process termination still require
 verification on the user's Windows machine; mocked argv tests are not native proof.
 
-## Review permissions and optional helpers
+## Documentation-review access policy
 
-The docs reviewer receives an explicit relevance-only instruction. Its working directory
-and input documents must be prepared by workflow as documentation-only, with no code,
-source diffs or code-bearing logs. The adapter does not claim OS-level containment:
-OpenCode permissions must restrict external reads where supported; prompts alone cannot
-prevent a hostile agent from reading arbitrary user files.
+The docs reviewer receives only the Markdown instruction, curated Markdown inputs and
+verdict path. Before dispatch, the adapter creates a temporary OpenCode configuration in
+a private child of the curated working directory. Its permission profile denies all
+actions by default, allows reads only for those exact Markdown paths, and allows edits only
+to the verdict. Shell, file search, language-server, subagent, web and skill tools are
+disabled; plugins are disabled. External-directory permission grants cover only the
+curated-input and run-artifact directories; the read and edit rules remain exact-file
+grants. OpenCode's automatic approval mode does not override explicit denials.
+
+The adapter asks the selected CLI to load and report the temporary configuration before
+dispatch. If it cannot confirm the deny rules, exact path grants, disabled source-access
+tools or disabled plugins, it fails docs-role preflight rather than starting the review.
+On the installed OpenCode v2.1.4, both the local `debug config` probe and an end-to-end
+loopback fake-provider test passed without a live or billable model call. The test asked
+OpenCode itself to read a source file and verified its permission-rejected tool result,
+then verified the same session could write the verdict. This is an OpenCode tool permission
+boundary, not an OS sandbox against a compromised CLI or arbitrary plugin code. Repeat the
+loopback permission test on native Windows before claiming Windows acceptance.
+
+Workflow must still prepare the curated documents and a working directory outside the
+source checkout. The adapter rejects a docs-review directory inside a Git checkout,
+project OpenCode configuration in that directory, non-Markdown inputs, and curated inputs
+that resolve outside it. The workflow's run instruction may be read by exact path outside
+the curated directory; source files and logs are not granted.
+
+## Optional helpers
 
 Agent-native attachment is currently reported unavailable. The supported read-only live
 view is `orch watch` plus sanitized logs; native attachment needs a version-specific
 experiment before activation.
 
-`launch_viewer` opens a tmux split inside an existing Fedora tmux session or a Windows
-Terminal tab with PowerShell 7. If unavailable it returns the manual watch command.
-`notify` supports a configured HTTP(S) webhook and Fedora `notify-send`; unavailable desktop
-notifications, including native Windows toast support, return an explicit diagnostic.
+On POSIX, `launch_viewer` opens a tmux split inside an existing tmux session; on Windows it
+can open a Windows Terminal tab with PowerShell 7. If unavailable it returns the manual
+watch command. `notify` supports a configured HTTP(S) webhook and POSIX `notify-send`;
+unavailable desktop notifications, including native Windows toast support, return an
+explicit diagnostic.
 Notification failures never erase reports or repeat merges. Webhook invocation sends only
 a bounded, already-redacted summary; credentials/URLs are not included in failure text.
 
 ## Verification
 
-Run `uv run pytest tests/agents` and `uv run ruff check src/orch/agents.py
+Run `uv run pytest -q tests/agents` and `uv run ruff check src/orch/agents.py
 src/orch/processes.py src/orch/platform_support.py tests/agents`.
 
 The suite exercises split-read secret redaction, separate streams, nonzero exits,
 timeout process-tree cleanup, cancellation, callback failure cleanup, shell exit status,
 explicit model/variant command construction, fresh isolated sessions, missing capabilities,
 Markdown input/output constraints, usage events and mocked PowerShell/batch shim quoting.
-Real capability probes can run without launching a model. Real-agent and native Windows
-acceptance runs remain separate acceptance gates.
+Local version/help and docs-profile configuration probes do not launch a model. The
+end-to-end policy test uses only a loopback fake provider and makes no paid or live model
+call. This environment is Linux and its distribution was not independently confirmed.
+Native Fedora and Windows/PowerShell 7 behavior remain unverified; repeat the process/shim
+and docs-role permission checks on those platforms before claiming platform acceptance.

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,9 +56,11 @@ class AgentResult:
     adapter_version: str = "unknown"
 
 
-def _capture(argv: list[str]) -> str:
+def _capture(argv: list[str], *, cwd: Path | None = None, env: dict | None = None) -> str:
     result = subprocess.run(
         executable_argv(argv),
+        cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -66,6 +71,206 @@ def _capture(argv: list[str]) -> str:
     if result.returncode:
         raise LaunchError("Agent capability probe failed; verify CLI installation")
     return result.stdout + result.stderr
+
+
+_DOCS_REVIEW_DISABLED_TOOLS = (
+    "bash",
+    "glob",
+    "grep",
+    "lsp",
+    "task",
+    "skill",
+    "webfetch",
+    "websearch",
+)
+_DOCS_REVIEW_DENIED_ACTIONS = (
+    "shell",
+    "glob",
+    "grep",
+    "lsp",
+    "subagent",
+    "skill",
+    "webfetch",
+    "websearch",
+)
+
+
+def docs_access_profile(request: AgentRequest, profile_cwd: Path | None = None) -> dict:
+    """Build a deny-by-default OpenCode profile for a curated docs review.
+
+    Only the Markdown instruction and supplied curated Markdown files may be read;
+    only the requested verdict may be edited. The cwd must be outside every Git
+    checkout so a project config cannot supersede this generated profile.
+    """
+    if request.role != "docs_reviewer":
+        raise LaunchError("A docs access profile is only valid for the docs_reviewer role")
+    cwd = Path(request.cwd).resolve()
+    if not cwd.is_dir():
+        raise LaunchError("Docs reviewer working directory must be an existing curated directory")
+    if any((parent / ".git").exists() for parent in (cwd, *cwd.parents)):
+        raise LaunchError(
+            "Docs reviewer access policy requires a curated working directory outside Git checkouts"
+        )
+    if any(
+        (parent / name).exists()
+        for parent in (cwd, *cwd.parents)
+        for name in ("opencode.json", "opencode.jsonc")
+    ) or (cwd / ".opencode").exists():
+        raise LaunchError(
+            "Docs reviewer access policy refuses OpenCode project configuration in its directory ancestry"
+        )
+    profile_cwd = Path(profile_cwd or cwd).resolve()
+    if not profile_cwd.is_dir() or any(
+        (parent / ".git").exists() for parent in (profile_cwd, *profile_cwd.parents)
+    ):
+        raise LaunchError("Docs reviewer policy directory must be outside Git checkouts")
+
+    def markdown_path(path: Path, *, must_exist: bool) -> Path:
+        path = Path(path)
+        if path.suffix.lower() != ".md":
+            raise LaunchError("Docs reviewer access policy allows Markdown files only")
+        try:
+            resolved = path.resolve(strict=must_exist)
+        except (OSError, RuntimeError) as exc:
+            raise LaunchError("Docs reviewer access policy input is unavailable") from exc
+        if any(char in str(resolved) for char in "*?"):
+            raise LaunchError("Docs reviewer access policy cannot safely match wildcard path characters")
+        if must_exist and not resolved.is_file():
+            raise LaunchError("Docs reviewer access policy input must be a regular Markdown file")
+        if any((parent / ".git").exists() for parent in (resolved.parent, *resolved.parents)):
+            raise LaunchError("Docs reviewer access policy refuses files inside a Git checkout")
+        return resolved
+
+    curated_inputs = []
+    for candidate in (request.instruction_file, *request.input_files):
+        path = markdown_path(Path(candidate), must_exist=True)
+        if candidate != request.instruction_file and not path.is_relative_to(cwd):
+            raise LaunchError(
+                "Docs reviewer inputs must be copied into its curated working directory"
+            )
+        curated_inputs.append(path)
+
+    output_path = Path(request.output_file)
+    if output_path.is_symlink():
+        raise LaunchError("Docs reviewer verdict path cannot be a symbolic link")
+    output = markdown_path(output_path, must_exist=False)
+    read_paths = sorted({str(path) for path in (*curated_inputs, output)})
+    external_directories = sorted(
+        {
+            str(path.parent / "**")
+            for path in (*curated_inputs, output)
+            if not path.is_relative_to(profile_cwd)
+        }
+    )
+    permission = {
+        "*": "deny",
+        "read": {"*": "deny", **{path: "allow" for path in read_paths}},
+        "edit": {"*": "deny", str(output): "allow"},
+        "external_directory": {
+            "*": "deny",
+            **{pattern: "allow" for pattern in external_directories},
+        },
+    }
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "permission": permission,
+        "tools": {name: False for name in _DOCS_REVIEW_DISABLED_TOOLS},
+        "plugin": [],
+        # MCP tools are still denied by the wildcard permission, even when
+        # user configuration defines servers unknown to this adapter.
+        "mcp": {},
+    }
+
+
+def _verify_docs_access_profile(
+    executable: str, config_path: Path, cwd: Path, env: dict
+) -> None:
+    """Ask the installed CLI to parse the profile and verify its resolved rules."""
+    try:
+        sources = json.loads(
+            _capture([executable, "debug", "config"], cwd=cwd, env=env)
+        )
+    except (LaunchError, json.JSONDecodeError, TypeError) as exc:
+        raise LaunchError(
+            "OpenCode docs-role access policy could not be validated; refusing docs review"
+        ) from exc
+    if not isinstance(sources, list):
+        raise LaunchError("OpenCode docs-role access policy returned an invalid config report")
+    normalized_config = str(config_path.resolve())
+    documents = [source for source in sources if source.get("type") == "document"]
+    profile_index = next(
+        (
+            index
+            for index, source in enumerate(documents)
+            if str(Path(source.get("path", "")).resolve()) == normalized_config
+        ),
+        None,
+    )
+    if profile_index is None:
+        raise LaunchError("OpenCode did not load the docs-role access policy; refusing docs review")
+    profile = documents[profile_index].get("info", {})
+    rules = profile.get("permissions")
+    if not isinstance(rules, list):
+        raise LaunchError("OpenCode did not expose resolved docs-role permissions; refusing review")
+
+    def find_rule(action: str, resource: str, effect: str, after: int = -1) -> int | None:
+        return next(
+            (
+                index
+                for index, rule in enumerate(rules)
+                if index > after
+                and rule.get("action") == action
+                and rule.get("resource") == resource
+                and rule.get("effect") == effect
+            ),
+            None,
+        )
+
+    deny_all = find_rule("*", "*", "deny")
+    read_deny = find_rule("read", "*", "deny", deny_all if deny_all is not None else -1)
+    edit_deny = find_rule("edit", "*", "deny", deny_all if deny_all is not None else -1)
+    external_deny = find_rule(
+        "external_directory", "*", "deny", deny_all if deny_all is not None else -1
+    )
+    if None in (deny_all, read_deny, edit_deny, external_deny):
+        raise LaunchError("OpenCode omitted a required docs-role deny rule; refusing docs review")
+    if any(find_rule(action, "*", "deny") is None for action in _DOCS_REVIEW_DENIED_ACTIONS):
+        raise LaunchError("OpenCode omitted a source-access tool denial; refusing docs review")
+    for later in documents[profile_index + 1 :]:
+        later_info = later.get("info", {})
+        if later_info.get("plugins") or later_info.get("mcp"):
+            raise LaunchError(
+                "A later OpenCode config enables plugins or MCP tools; refusing docs review"
+            )
+        for rule in later_info.get("permissions", []):
+            if rule.get("effect") == "allow":
+                raise LaunchError(
+                    "A later OpenCode config adds an allow rule after docs-role denies; refusing review"
+                )
+
+    # `read` and `edit` grants must be exact file paths and occur after their
+    # corresponding deny-all rules. Verify the CLI did not broaden a grant.
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    permissions = config["permission"]
+    for path, effect in permissions["read"].items():
+        expected = "deny" if path == "*" else "allow"
+        if effect != expected:
+            raise LaunchError("Invalid docs-role read policy; refusing docs review")
+        if path != "*" and find_rule("read", path, "allow", read_deny) is None:
+            raise LaunchError("OpenCode did not preserve a curated Markdown read grant")
+    output_path = next(path for path, effect in permissions["edit"].items() if path != "*")
+    if find_rule("edit", output_path, "allow", edit_deny) is None:
+        raise LaunchError("OpenCode did not preserve the verdict-only write grant")
+    for path, effect in permissions["external_directory"].items():
+        expected = "deny" if path == "*" else "allow"
+        if effect != expected:
+            raise LaunchError("Invalid docs-role external-path policy; refusing docs review")
+        if path != "*" and find_rule(
+            "external_directory", path, "allow", external_deny
+        ) is None:
+            raise LaunchError("OpenCode did not preserve an exact external Markdown path grant")
+    if profile.get("plugins") != []:
+        raise LaunchError("OpenCode docs-role profile did not disable plugins; refusing review")
 
 
 class AgentAdapter:
@@ -130,6 +335,10 @@ class AgentAdapter:
     def command(self, request: AgentRequest) -> list[str]:
         raise NotImplementedError
 
+    @contextlib.contextmanager
+    def request_environment(self, request: AgentRequest):
+        yield Path(request.cwd), None
+
     async def run(self, request: AgentRequest, on_event: Callable | None = None) -> AgentResult:
         for path in (request.instruction_file, *request.input_files):
             if Path(path).suffix.lower() != ".md" or not Path(path).is_file():
@@ -140,8 +349,6 @@ class AgentAdapter:
             raise LaunchError("Agent log_dir must be provided outside its worktree")
         request.output_file.parent.mkdir(parents=True, exist_ok=True)
         request.log_dir.mkdir(parents=True, exist_ok=True)
-        capabilities = await asyncio.to_thread(self.capabilities)
-        command = self.command(request)
         session_id = None
         usage = {}
 
@@ -165,13 +372,17 @@ class AgentAdapter:
                         usage = candidate
             await emit(on_event, value)
 
-        result = await self.runner.run(
-            command,
-            request.cwd,
-            timeout=request.timeout_seconds,
-            log_paths=(request.log_dir / "stdout.log", request.log_dir / "stderr.log"),
-            on_event=event,
-        )
+        with self.request_environment(request) as (cwd, env):
+            capabilities = await asyncio.to_thread(self.capabilities)
+            command = self.command(request)
+            result = await self.runner.run(
+                command,
+                cwd,
+                timeout=request.timeout_seconds,
+                log_paths=(request.log_dir / "stdout.log", request.log_dir / "stderr.log"),
+                on_event=event,
+                env=env,
+            )
         if request.output_file.exists():
             content = request.output_file.read_text(encoding="utf-8", errors="replace")
             sanitized = self.runner.redact(content)
@@ -243,6 +454,40 @@ class CodexAdapter(AgentAdapter):
 
 class OpenCodeAdapter(AgentAdapter):
     tool = "opencode"
+
+    @contextlib.contextmanager
+    def request_environment(self, request: AgentRequest):
+        if request.role != "docs_reviewer":
+            yield Path(request.cwd), None
+            return
+        try:
+            # OpenCode v2.1.4 only loaded OPENCODE_CONFIG when it was rooted in
+            # the selected project directory during local CLI probes. Run from a
+            # private child of the curated workspace, never from a source tree.
+            with tempfile.TemporaryDirectory(
+                prefix=".orch-opencode-docs-", dir=request.cwd
+            ) as temporary:
+                root = Path(temporary)
+                config_path = root / "opencode.json"
+                config_path.write_text(
+                    json.dumps(docs_access_profile(request, root), ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                config_dir = root / "config-dir"
+                config_dir.mkdir()
+                env = os.environ.copy()
+                env["OPENCODE_CONFIG"] = str(config_path)
+                env["OPENCODE_CONFIG_DIR"] = str(config_dir)
+                # Inline config has higher precedence than the generated policy.
+                env.pop("OPENCODE_CONFIG_CONTENT", None)
+                _verify_docs_access_profile(self.executable, config_path, root, env)
+                yield root, env
+        except LaunchError:
+            raise
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise LaunchError(
+                "OpenCode docs-role access policy setup failed; refusing docs review"
+            ) from exc
 
     def command(self, request: AgentRequest) -> list[str]:
         capabilities = self.capabilities()
