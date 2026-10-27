@@ -21,8 +21,8 @@ from orch.contracts import (
     Manifest,
     RunState,
     Verdict,
+    approval_hashes,
     approved_files,
-    file_hashes,
     read_markdown,
     within,
 )
@@ -73,14 +73,6 @@ def _change_snapshot(root: Path, paths: list[str]) -> str:
         else:
             digest.update(b"missing\0")
     return digest.hexdigest()
-
-
-def approval_hashes(plan: Path, manifest: Manifest, feature: FeatureSpec) -> dict[str, str]:
-    values = file_hashes(approved_files(plan, manifest))
-    values["effective_configuration"] = hashlib.sha256(
-        feature.model_dump_json().encode("utf-8")
-    ).hexdigest()
-    return values
 
 
 def validate_plan(plan: Path) -> Manifest:
@@ -229,12 +221,21 @@ class Engine:
 
     async def dispatch(self, role, logical_id, instruction, output, cwd, inputs=()):
         from orch.agents import AgentRequest
+
+        self.check_approval()
         info = self.state.workers.setdefault(logical_id, {})
         attempt = int(info.get("attempt", 0)) + 1
         attempt_id = f"{logical_id}-{self.state.round}-{attempt}"
         log_dir = self.run_dir / f"round-{self.state.round}" / "logs" / attempt_id
         model = self.feature.models.resolve(role)
-        info.update(status="running", role=role, attempt=attempt, activity=timestamp(),
+        if info.get("uncertain_attempt_id"):
+            raise Escalation(
+                f"Prior dispatch {logical_id}/{info['uncertain_attempt_id']} has uncertain ownership"
+            )
+        info.pop("process", None)
+        info.pop("process_attempt_id", None)
+        info.update(status="running", role=role, attempt=attempt, attempt_id=attempt_id,
+                    activity=timestamp(),
                     started_at=timestamp(), output=str(output), log=str(log_dir / "stdout.log"))
         self.save()
         self.event("dispatch_intent", agent=logical_id, attempt=attempt_id, role=role,
@@ -251,22 +252,65 @@ class Engine:
             kind = event.get("kind")
             if kind == "process_started":
                 info["process"] = {k: event[k] for k in ("pid", "create_time") if k in event}
+                info["process_attempt_id"] = attempt_id
+            elif kind == "process_completed" and info.get("process_attempt_id") == attempt_id:
+                info.pop("process", None)
+                info.pop("process_attempt_id", None)
             if kind in {"process_started", "process_children", "process_completed"}:
                 self.event(kind, agent=logical_id, attempt=attempt_id,
                            **{k: v for k, v in event.items() if k != "kind"})
             self.save()
+        # Recheck after persisting the intent and immediately before the
+        # adapter can create a process. Retries enter this boundary anew.
+        try:
+            self.check_approval()
+        except ApprovalRequired:
+            # This invocation was prevented before process creation, so recovery
+            # must not mistake its intent-only journal for an uncertain spawn.
+            info["status"] = "blocked"
+            self.save()
+            self.event("dispatch_blocked", agent=logical_id, attempt=attempt_id,
+                       reason="approval changed before process launch")
+            raise
         try:
             result = await adapter.run(request, on_event=activity)
         except asyncio.CancelledError:
             info["status"] = "interrupted"
+            attempt_started = any(
+                event.get("kind") == "process_started"
+                and event.get("agent") == logical_id
+                and event.get("attempt") == attempt_id
+                for event in self.store.events(self.state.run_id)
+            )
+            if not attempt_started:
+                info["uncertain_attempt_id"] = attempt_id
             self.save()
-            self.event("agent_interrupted", agent=logical_id, attempt=attempt_id)
+            self.event("agent_interruption_uncertain" if not attempt_started else "agent_interrupted",
+                       agent=logical_id, attempt=attempt_id)
+            self.check_approval()
             raise
         except Exception as exc:
+            attempt_started = any(
+                event.get("kind") == "process_started"
+                and event.get("agent") == logical_id
+                and event.get("attempt") == attempt_id
+                for event in self.store.events(self.state.run_id)
+            )
+            if not attempt_started:
+                info.update(status="uncertain", activity=timestamp(), uncertain_attempt_id=attempt_id)
+                self.save()
+                self.event("agent_launch_uncertain", agent=logical_id, attempt=attempt_id,
+                           error=_failure_message(exc))
+                self.check_approval()
+                raise Escalation(
+                    f"Dispatch {logical_id}/{attempt_id} failed without durable process identity; "
+                    f"refusing a retry: {_failure_message(exc)}"
+                ) from exc
             info.update(status="failed", activity=timestamp())
             self.save()
             self.event("agent_failed", agent=logical_id, attempt=attempt_id,
                        error=_failure_message(exc))
+            self.check_approval()
             raise
         info.update(status="done" if result.exit_code == 0 else "failed", activity=timestamp(),
                     duration_seconds=result.duration_seconds)
@@ -274,6 +318,9 @@ class Engine:
         self.event("agent_completed", agent=logical_id, attempt=attempt_id,
                    exit_code=result.exit_code, duration_seconds=result.duration_seconds,
                    usage=result.usage, model=model.model, adapter_version=result.adapter_version)
+        # A failed call is still an approval boundary: never retry using inputs
+        # or runtime policy edited while the attempt was active.
+        self.check_approval()
         if result.exit_code != 0:
             retries = info.get("infrastructure_retries", 0)
             if retries < self.feature.limits.max_infrastructure_retries:
@@ -284,7 +331,6 @@ class Engine:
             raise Escalation(f"Agent {logical_id} failed: {result.reason or result.exit_code}")
         info["infrastructure_retries"] = 0
         self.save()
-        self.check_approval()
         return result
 
     def input_file(self, name, title, files, extra=""):
@@ -716,30 +762,119 @@ class Engine:
                 raise Escalation("Total runtime limit reached")
 
     async def reconcile_processes(self):
-        """Cancel positively identified survivors before restarting interrupted calls."""
+        """Reconcile process evidence by attempt, failing closed on uncertain launch."""
         import psutil
 
         from orch.processes import ProcessHandle, reconcile_events
-        for identity in reconcile_events(self.store.events(self.state.run_id)):
-            for live in identity["live"]:
-                await self.runner.cancel(ProcessHandle(**live))
-            self.event("process_completed", pid=identity["pid"], create_time=identity["create_time"],
-                       reason="reconciled-after-interruption")
-        for name, info in self.state.workers.items():
-            if info.get("status") != "running":
+
+        events = self.store.events(self.state.run_id)
+
+        def attempt_events(agent, attempt):
+            return [event for event in events
+                    if event.get("agent") == agent and event.get("attempt") == attempt]
+
+        # Close every process-start record that lacks its matching completion.
+        # The event's attempt identity is part of the ownership proof: PID-only
+        # matching could otherwise mistake an earlier call for a current one.
+        starts = [event for event in events if event.get("kind") == "process_started"]
+        for started in starts:
+            agent, attempt = started.get("agent"), started.get("attempt")
+            pid, create_time = started.get("pid"), started.get("create_time")
+            if not isinstance(agent, str) or not isinstance(attempt, str):
+                raise Escalation("Process start has no durable agent/attempt identity")
+            if not isinstance(pid, int) or not isinstance(create_time, (int, float)) or create_time <= 0:
+                raise Escalation(f"Process identity for {agent}/{attempt} is incomplete")
+            correlated = attempt_events(agent, attempt)
+            completed = any(
+                event.get("kind") == "process_completed"
+                and event.get("pid") == pid
+                and event.get("create_time") == create_time
+                for event in correlated
+            )
+            if completed:
                 continue
-            process = info.get("process")
-            if process and "create_time" in process:
+
+            identities = reconcile_events([
+                event for event in correlated
+                if event.get("kind") in {"process_started", "process_children", "process_completed"}
+            ])
+            identity = next((item for item in identities
+                             if item.get("pid") == pid and item.get("create_time") == create_time), None)
+            if identity is None:
+                raise Escalation(
+                    f"Cannot reconcile process identity for {agent}/{attempt}; refusing a duplicate dispatch"
+                )
+            for live in identity["live"]:
+                await self.runner.cancel(ProcessHandle(pid=live["pid"], create_time=live["create_time"]))
+            for live in identity["live"]:
                 try:
-                    observed = psutil.Process(process["pid"])
-                    if abs(observed.create_time() - process["create_time"]) < 0.01:
-                        await self.runner.cancel(ProcessHandle(**process))
+                    process = psutil.Process(live["pid"])
+                    if (abs(process.create_time() - live["create_time"]) < 0.01
+                            and process.status() != psutil.STATUS_ZOMBIE):
+                        raise Escalation(
+                            f"Owned process {live['pid']} for {agent}/{attempt} survived cancellation"
+                        )
                 except psutil.NoSuchProcess:
                     pass
-            elif process:
-                raise Escalation(f"Cannot establish ownership of interrupted process for {name}")
+            children_observed = any(
+                event.get("kind") == "process_children" for event in correlated
+            )
+            if identity.get("status") == "reused":
+                raise Escalation(
+                    f"Process leader for {agent}/{attempt} was reused before ownership could be "
+                    "reconciled; refusing a duplicate dispatch"
+                )
+            if identity.get("status") == "exited" and not children_observed:
+                raise Escalation(
+                    f"Process leader for {agent}/{attempt} exited and descendant ownership was not "
+                    "recorded; refusing a duplicate dispatch"
+                )
+            self.event("process_completed", agent=agent, attempt=attempt, pid=pid,
+                       create_time=create_time, reason="reconciled-after-interruption")
+            events = self.store.events(self.state.run_id)
+
+        for name, info in self.state.workers.items():
+            if info.get("status") != "running" and not info.get("uncertain_attempt_id"):
+                continue
+
+            attempt = info.get("uncertain_attempt_id") or info.get("attempt_id")
+            if not attempt:
+                # Compatibility with state saved just before an intent. The
+                # intent is written before adapter invocation, so no intent is
+                # evidence that launch could not yet have happened.
+                open_intents = []
+                for event in events:
+                    if event.get("kind") != "dispatch_intent" or event.get("agent") != name:
+                        continue
+                    event_attempt = event.get("attempt")
+                    if not isinstance(event_attempt, str):
+                        continue
+                    related = attempt_events(name, event_attempt)
+                    if not any(e.get("kind") in {"agent_completed", "agent_failed", "agent_interrupted"}
+                               for e in related):
+                        open_intents.append(event_attempt)
+                if open_intents:
+                    attempt = open_intents[-1]
+                    info["attempt_id"] = attempt
+
+            related = attempt_events(name, attempt) if attempt else []
+            intent_exists = any(event.get("kind") == "dispatch_intent" for event in related)
+            process_started = any(event.get("kind") == "process_started" for event in related)
+            terminal = any(event.get("kind") in {"agent_completed", "agent_failed", "agent_interrupted"}
+                           for event in related)
+            if intent_exists and not process_started and not terminal:
+                raise Escalation(
+                    f"Dispatch {name}/{attempt} may have launched but has no durable process identity; "
+                    "refusing to relaunch"
+                )
+            if info.get("process_attempt_id") != attempt:
+                info.pop("process", None)
+                info.pop("process_attempt_id", None)
             info["status"] = "interrupted"
-            self.event("interrupted_job_reconciled", agent=name)
+            info.pop("process", None)
+            info.pop("process_attempt_id", None)
+            self.event("interrupted_job_reconciled", agent=name, attempt=attempt,
+                       identity_established=process_started)
         self.save()
 
     async def run(self, one_stage=False):

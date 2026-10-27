@@ -117,6 +117,34 @@ def test_effective_model_change_invalidates_approval(delivery):
     assert store.load(state.run_id).phase == "PLAN_READY"
 
 
+@pytest.mark.parametrize("change", ["runtime", "instruction"])
+def test_failed_attempt_rechecks_approval_before_retry(delivery, change):
+    store, state, feature, manifest, plan = delivery
+
+    class MutatingFailure:
+        calls = 0
+
+        async def run(self, request, on_event=None):
+            self.calls += 1
+            if change == "runtime":
+                feature._runtime_settings = {"viewer": "changed-after-approval"}
+            else:
+                (plan / "workers/w1.md").write_text("Changed during failed call\n")
+            return SimpleNamespace(exit_code=17, duration_seconds=0.01,
+                                   reason="simulated failure", usage=None,
+                                   adapter_version="failure-stub")
+
+    fake = MutatingFailure()
+    engine = Engine(store, state, feature, manifest, plan, adapters={"opencode": fake})
+    instruction = plan / "workers/w1.md"
+    output = store.run_dir(state.run_id) / "round-1" / "handover" / "w1.md"
+    with pytest.raises(ApprovalRequired):
+        asyncio.run(engine.dispatch("worker", "w1", instruction, output,
+                                    Path(state.workspace["feature_path"])))
+    assert fake.calls == 1
+    assert store.load(state.run_id).phase == "PLAN_READY"
+
+
 def test_next_does_not_implicitly_resume_paused_feature(delivery, monkeypatch, capsys):
     from orch.cli import main
 
@@ -305,6 +333,125 @@ def test_crash_after_worker_commit_reconciles_before_checkpoint(delivery):
     operation = next(value for key, value in recovered.operations.items() if key.startswith("worker-commit:w1:"))
     assert operation["status"] == "completed"
     assert operation["reconciled"] is True
+
+
+def test_spawn_before_identity_event_escalates_without_redispatch(delivery, monkeypatch):
+    from orch.processes import ProcessRunner
+
+    store, state, feature, manifest, plan = delivery
+    spawned = []
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    class SimulatedProcess:
+        pid = 987654321
+
+    async def simulated_spawn(*args, **kwargs):
+        spawned.append(True)
+        return SimulatedProcess()
+
+    def identity_lookup(_pid):
+        raise SimulatedCrash("crash after spawn, before identity persistence")
+
+    runner = ProcessRunner()
+
+    class ProcessAdapter:
+        async def run(self, request, on_event=None):
+            return await runner.run(
+                [sys.executable, "-c", "pass"], request.cwd, timeout=1,
+                log_paths=(request.log_dir / "stdout.log", request.log_dir / "stderr.log"),
+                on_event=on_event,
+            )
+
+    engine = Engine(store, state, feature, manifest, plan,
+                    adapters={"opencode": ProcessAdapter()})
+    instruction = plan / "workers/w1.md"
+    output = store.run_dir(state.run_id) / "round-1" / "handover" / "w1.md"
+    with monkeypatch.context() as patch:
+        patch.setattr("orch.processes.asyncio.create_subprocess_exec", simulated_spawn)
+        patch.setattr("orch.processes.psutil.Process", identity_lookup)
+        with pytest.raises(SimulatedCrash):
+            asyncio.run(engine.dispatch("worker", "w1", instruction, output,
+                                        Path(state.workspace["feature_path"])))
+
+    assert spawned == [True]
+    after_crash = store.load(state.run_id)
+    attempt = after_crash.workers["w1"]["attempt_id"]
+    assert after_crash.workers["w1"]["status"] == "running"
+    assert any(event["kind"] == "dispatch_intent" and event.get("attempt") == attempt
+               for event in store.events(state.run_id))
+    assert not any(event["kind"] == "process_started" and event.get("attempt") == attempt
+                   for event in store.events(state.run_id))
+
+    resumed_adapter = FakeAgents()
+    resumed = Engine(store, after_crash, feature, manifest, plan,
+                     adapters={"opencode": resumed_adapter})
+    with pytest.raises(Escalation, match="no durable process identity"):
+        asyncio.run(resumed.reconcile_processes())
+    assert not resumed_adapter.calls
+
+
+def test_stale_process_identity_from_prior_attempt_cannot_authorize_recovery(delivery):
+    store, state, feature, manifest, plan = delivery
+    current_attempt = "w1-1-2"
+    old_attempt = "w1-1-1"
+    state.workers["w1"] = {
+        "status": "running", "attempt": 2, "attempt_id": current_attempt,
+        "process_attempt_id": old_attempt,
+        "process": {"pid": 987654321, "create_time": 1.0},
+    }
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="w1", attempt=old_attempt)
+    store.event(state.run_id, "process_started", agent="w1", attempt=old_attempt,
+                pid=987654321, create_time=1.0)
+    store.event(state.run_id, "process_completed", agent="w1", attempt=old_attempt,
+                pid=987654321, create_time=1.0, exit_code=1)
+    store.event(state.run_id, "dispatch_intent", agent="w1", attempt=current_attempt)
+
+    engine = Engine(store, store.load(state.run_id), feature, manifest, plan,
+                    adapters={"opencode": FakeAgents()})
+    with pytest.raises(Escalation, match="no durable process identity"):
+        asyncio.run(engine.reconcile_processes())
+
+
+def test_matching_attempt_process_completion_allows_safe_recovery(delivery):
+    store, state, feature, manifest, plan = delivery
+    attempt = "w1-1-1"
+    state.workers["w1"] = {"status": "running", "attempt": 1, "attempt_id": attempt}
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="w1", attempt=attempt)
+    store.event(state.run_id, "process_started", agent="w1", attempt=attempt,
+                pid=987654321, create_time=1.0)
+    store.event(state.run_id, "process_completed", agent="w1", attempt=attempt,
+                pid=987654321, create_time=1.0, exit_code=1)
+
+    engine = Engine(store, store.load(state.run_id), feature, manifest, plan,
+                    adapters={"opencode": FakeAgents()})
+    asyncio.run(engine.reconcile_processes())
+    recovered = store.load(state.run_id)
+    assert recovered.workers["w1"]["status"] == "interrupted"
+    assert recovered.workers["w1"]["attempt_id"] == attempt
+
+
+def test_recovery_escalates_if_leader_exited_before_descendants_were_observed(delivery, monkeypatch):
+    store, state, feature, manifest, plan = delivery
+    attempt = "w1-1-1"
+    state.workers["w1"] = {"status": "running", "attempt": 1, "attempt_id": attempt}
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="w1", attempt=attempt)
+    store.event(state.run_id, "process_started", agent="w1", attempt=attempt,
+                pid=987654321, create_time=1.0)
+    monkeypatch.setattr("orch.processes.reconcile_events", lambda _events: [{
+        "pid": 987654321, "create_time": 1.0, "children": [], "live": [], "status": "exited",
+    }])
+    adapter = FakeAgents()
+    engine = Engine(store, store.load(state.run_id), feature, manifest, plan,
+                    adapters={"opencode": adapter})
+
+    with pytest.raises(Escalation, match="descendant ownership was not recorded"):
+        asyncio.run(engine.reconcile_processes())
+    assert not adapter.calls
 
 
 def test_post_check_worker_mutation_blocks_candidate_and_returns_to_work(delivery):
