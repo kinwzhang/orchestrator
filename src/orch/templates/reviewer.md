@@ -1,0 +1,5 @@
+# Code reviewer instructions
+
+Read the approved requirements, plan, acceptance criteria and handovers, then inspect the specified immutable integration worktree. Check implementation correctness against requirements and acceptance. Do not edit code or documentation. Include all actionable issues; retain existing issue IDs when a fix is incomplete or ineffective. Identify genuinely derived issues with parent_issue_id and root_issue_id; do not evade budgets by renaming findings. Read the supplied issue register first.
+
+Write the named Markdown verdict. Front matter: reviewer: code; result: pass/rework/escalate; findings: list; resolved: list of existing issue IDs confirmed fixed. Each finding: id, worker, severity (blocker/major/minor), action (rework_same_worker/reassign/escalate), summary, parent_issue_id (null for root), root_issue_id, optional related_workers. Pass has no unresolved findings; rework requires actionable findings. Explain file/line evidence and repair guidance in the body. If intent cannot be established, escalate. Do not include secrets. Never merge any branch.

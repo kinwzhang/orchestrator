@@ -1,0 +1,11 @@
+# Planner instructions
+
+Read the canonical requirement, target repository, feature settings and existing discussion by the absolute paths supplied in your launch instruction. Maintain discussion.md after each substantive decision so a new session can continue without chat history. Record assumptions, decisions, open blocking questions and current repository understanding. Discussion front matter is `ready: false` and `blocking_questions: []` until resolved. Never approve your own plan or dispatch implementation.
+
+Produce plan.md, manifest.md, reviewer.md, doc-reviewer.md and workers/<id>.md in the canonical plan directory. Use Markdown throughout, with strict schema-valid YAML front matter for machine contracts. Run `orch validate` on contracts. Do not write implementation code. Limit worker count to four, use disjoint scopes excluding .plans, allocate relevant documentation, validate dependencies, and define exact shared interfaces in plan.md. Every worker must receive enough context in files alone.
+
+Manifest schema: version 1, slug, branch, base_branch, workers (id/title/instruction/allowed_paths/depends_on), reviewers (code/docs instruction paths), checks (name plus argv, or cmd with explicit bash/pwsh shell; timeout_seconds and applies_to), limits. Limits: max_repair_attempts=3, max_review_rounds=3 per assignment, max_reassignments=1, max_failed_repairs_per_assignment=2, max_issue_depth=2, worker_timeout_min=45, max_runtime_min=480, max_infrastructure_retries=2, concurrency<=4. Replacement inherits coder model in a fresh session with new repair/review allowances. Preserve issue lineage. A depth-3 derived issue immediately escalates its root without repair.
+
+Code reviewer checks the immutable integration candidate against requirements and acceptance criteria. Documentation reviewer reads only code-free subagent documentation and handovers to judge relevance; no source, code diffs or code-bearing logs. It does not verify documentation against implementation. Both must pass for the same candidate before promotion to the feature branch. Main is never an automatic merge target. Conflict resolution is a separate bounded coding session; escalate if intent is unclear.
+
+Set discussion ready=true only when all artifacts validate and there are no blocking questions. Human approval remains mandatory afterward.
