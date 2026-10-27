@@ -11,7 +11,7 @@ PowerShell 7 run and no live Codex/OpenCode model call was performed.
 
 | Command | Result | Evidence |
 |---|---|---|
-| `uv run pytest -q` | Pass | 121 tests passed in 5.19 seconds on the final run. |
+| `uv run pytest -q` | Pass | 135 tests passed on the final local run. |
 | `uv run ruff check .` | Pass | Ruff reported no findings on the final run. |
 | `uv run orch --help` | Pass | CLI parsed and displayed all registered lifecycle and validation commands. |
 
@@ -22,7 +22,11 @@ human resume gate, planner pause and abort, retained partial worker changes,
 worker commit recovery after a simulated crash before checkpoint, detection of
 post-CHECK worktree mutation, sibling cancellation with preserved leaf error
 details from an exception group, issue lineage/budgets, and safe dashboard
-rendering of untrusted output. These tests do not evaluate LLM judgment.
+rendering of untrusted output. Planner recovery coverage also checks distinct
+increasing attempt IDs across repeated sessions and reloads, and verifies that
+both `plan` and `resume` escalate rather than launch when a later dispatch could
+be masked by earlier completion evidence or when legacy evidence repeats an
+attempt ID. These tests do not evaluate LLM judgment.
 
 ## Platform gates still required
 
@@ -39,4 +43,8 @@ rendering of untrusted output. These tests do not evaluate LLM judgment.
   are not an OS-level filesystem sandbox.
 - Crash recovery can restore only persisted state, written discussion decisions
   and output bytes. Data that an agent had not written before interruption is
-  not recoverable.
+  not recoverable. Planner recovery stops and escalates when the latest dispatch
+  lacks conclusive terminal evidence or has missing, repeated or conflicting
+  process ownership; it neither relaunches nor terminates an unverified planner.
+  Operator review of the persisted planner attempt and process evidence is
+  required before planning continues.
