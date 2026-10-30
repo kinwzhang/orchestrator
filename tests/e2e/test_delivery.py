@@ -1,5 +1,6 @@
 import asyncio
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -1045,7 +1046,7 @@ def test_partial_handover_is_retained_and_supplied_on_resume(delivery):
     assert final.workers["w1"]["attempt"] == 4
 
 
-def _legacy_uncertain_attempt(store, state):
+def _legacy_uncertain_attempt(store, state, kind="agent_launch_uncertain"):
     run_dir = store.run_dir(state.run_id)
     intended = run_dir / "round-1" / "handover" / "w1-1-4.md"
     state.phase = "ESCALATED"
@@ -1057,9 +1058,15 @@ def _legacy_uncertain_attempt(store, state):
     }
     state = store.save(state)
     store.event(state.run_id, "dispatch_intent", agent="w1", attempt="w1-1-4")
-    store.event(state.run_id, "agent_launch_uncertain", agent="w1", attempt="w1-1-4",
+    store.event(state.run_id, kind, agent="w1", attempt="w1-1-4",
                 error="Agent inputs must be existing Markdown files")
     return state, intended
+
+
+def _audit_events(store, run_id, attempt="w1-1-4"):
+    return [event for event in store.events(run_id)
+            if event["kind"] == "uncertain_attempt_resolved"
+            and event.get("agent") == "w1" and event.get("attempt") == attempt]
 
 
 def test_audited_recovery_requires_evidence_and_preserves_budgets(delivery):
@@ -1080,14 +1087,30 @@ def test_audited_recovery_requires_evidence_and_preserves_budgets(delivery):
     assert info["attempt"] == 4
     assert info["infrastructure_retries"] == 2
     assert info["uncertain_attempt_resolutions"][0]["operator"] == "reviewer"
-    audit = [item for item in store.events(state.run_id)
-             if item["kind"] == "uncertain_attempt_resolved"]
-    assert audit[0]["process_identity_events"] == 0
-    assert audit[0]["evidence_event_ids"]
+    assert len(_audit_events(store, state.run_id)) == 1
+    assert _audit_events(store, state.run_id)[0]["process_identity_events"] == 0
+    activity = (store.run_dir(state.run_id) / "activity_log.md").read_text(encoding="utf-8")
+    checklist = (store.run_dir(state.run_id) / "checklist.md").read_text(encoding="utf-8")
+    assert activity.count("uncertain_attempt_resolved") == 1
+    assert "status=interrupted" in checklist
+    assert "retries=2" in checklist
 
-    with pytest.raises(ContractError, match="No single recorded uncertain"):
-        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="reviewer",
-                                   reason="second attempt")
+    # Duplicate re-entry returns the original decision and appends nothing.
+    replay = resolve_uncertain_dispatch(
+        store, state.run_id, "w1-1-4", operator="someone-else",
+        reason="a different second decision",
+    )
+    assert replay["id"] == event["id"]
+    saved = store.load(state.run_id)
+    assert saved.workers["w1"]["uncertain_attempt_resolutions"][0]["operator"] == "reviewer"
+    assert len(saved.workers["w1"]["uncertain_attempt_resolutions"]) == 1
+    assert len(_audit_events(store, state.run_id)) == 1
+    assert saved.operations["uncertain-recovery:w1-1-4"]["status"] == "completed"
+    assert saved.approved_hashes == state.approved_hashes
+    saved_engine = Engine(store, saved, feature, manifest, plan,
+                          adapters={"opencode": FakeAgents()})
+    assert saved_engine.recovery_audit_gaps() == []
+
     with pytest.raises(ContractError, match="operator and reason"):
         resolve_uncertain_dispatch(store, state.run_id, "w1-1-5", operator=" ", reason=" ")
 
@@ -1156,3 +1179,289 @@ def test_stale_or_invalid_previous_handover_is_not_supplied(delivery):
     assert "identity" in skipped[0]["reason"]
     assert "invalid" in skipped[1]["reason"]
     assert "outside" in skipped[2]["reason"]
+
+
+class RecoveryCrash(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("mode", ["before-event", "after-event", "before-completion"])
+def test_audited_recovery_replays_each_interrupted_boundary(delivery, monkeypatch, mode):
+    store, state, feature, manifest, plan = delivery
+    _legacy_uncertain_attempt(store, state)
+    original_event, original_record = store.event, store.record_operation
+    if mode in {"before-event", "after-event"}:
+        def event(run_id, kind, **details):
+            if kind == "uncertain_attempt_resolved":
+                if mode == "after-event":
+                    original_event(run_id, kind, **details)
+                raise RecoveryCrash(mode)
+            return original_event(run_id, kind, **details)
+        monkeypatch.setattr(store, "event", event)
+    else:
+        def record_operation(current, key, value):
+            if value.get("status") == "completed":
+                raise RecoveryCrash(mode)
+            return original_record(current, key, value)
+        monkeypatch.setattr(store, "record_operation", record_operation)
+
+    with pytest.raises(RecoveryCrash):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="first",
+                                   reason="first decision")
+    monkeypatch.undo()
+
+    interrupted = store.load(state.run_id)
+    operation = interrupted.operations["uncertain-recovery:w1-1-4"]
+    assert operation["status"] == "intent"
+    assert len(_audit_events(store, state.run_id)) == (1 if mode != "before-event" else 0)
+    blocked = Engine(store, interrupted, feature, manifest, plan,
+                     adapters={"opencode": FakeAgents()})
+    with pytest.raises(Escalation, match="incomplete or unaudited"):
+        asyncio.run(blocked.reconcile_processes())
+
+    # Re-entry uses the recorded decision, not the changed arguments.
+    event = resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="second",
+                                       reason="second decision")
+    saved = store.load(state.run_id)
+    info = saved.workers["w1"]
+    assert "uncertain_attempt_id" not in info
+    assert info["status"] == "interrupted"
+    assert info["attempt"] == 4
+    assert info["infrastructure_retries"] == 2
+    assert [entry["operator"] for entry in info["uncertain_attempt_resolutions"]] == ["first"]
+    audits = _audit_events(store, state.run_id)
+    assert len(audits) == 1
+    assert audits[0]["id"] == event["id"]
+    assert audits[0]["operator"] == "first"
+    assert saved.operations["uncertain-recovery:w1-1-4"]["status"] == "completed"
+    assert saved.operations["uncertain-recovery:w1-1-4"]["event_id"] == event["id"]
+    assert saved.approved_hashes == state.approved_hashes
+    activity = (store.run_dir(state.run_id) / "activity_log.md").read_text(encoding="utf-8")
+    assert activity.count("uncertain_attempt_resolved") == 1
+
+    # A completed recovery returns its existing result from any non-live phase.
+    saved.phase = "APPROVED"
+    store.save(saved)
+    again = resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="third",
+                                       reason="third decision")
+    assert again["id"] == event["id"]
+    assert len(_audit_events(store, state.run_id)) == 1
+    assert len(store.load(state.run_id).workers["w1"]["uncertain_attempt_resolutions"]) == 1
+
+
+def test_cancellation_before_identity_uses_current_uncertainty_event(delivery):
+    store, state, feature, manifest, plan = delivery
+
+    class CancelledAdapter:
+        async def run(self, request, on_event=None):
+            raise asyncio.CancelledError
+
+    engine = Engine(store, state, feature, manifest, plan,
+                    adapters={"opencode": CancelledAdapter()})
+    instruction = plan / "workers/w1.md"
+    output = store.run_dir(state.run_id) / "round-1" / "handover" / "w1-1.md"
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(engine.dispatch("worker", "w1", instruction, output,
+                                    Path(state.workspace["feature_path"]),
+                                    inputs=(instruction,)))
+    cancelled = store.load(state.run_id)
+    assert cancelled.workers["w1"]["uncertain_attempt_id"] == "w1-1-1"
+    kinds = [event["kind"] for event in store.events(state.run_id)
+             if event.get("agent") == "w1" and event.get("attempt") == "w1-1-1"]
+    assert "agent_interruption_uncertain" in kinds
+    assert "agent_interrupted_uncertain" not in kinds
+
+    cancelled.phase = "PAUSED"
+    store.save(cancelled)
+    event = resolve_uncertain_dispatch(store, state.run_id, "w1-1-1",
+                                       operator="reviewer", reason="pause before identity")
+    assert event["kind"] == "uncertain_attempt_resolved"
+    resolved = store.load(state.run_id)
+    assert "uncertain_attempt_id" not in resolved.workers["w1"]
+    assert resolved.workers["w1"]["status"] == "interrupted"
+
+
+def test_legacy_uncertainty_spelling_is_explicitly_supported(delivery):
+    store, state, *_ = delivery
+    _legacy_uncertain_attempt(store, state, kind="agent_interrupted_uncertain")
+    event = resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                       operator="reviewer", reason="legacy spelling")
+    assert event["kind"] == "uncertain_attempt_resolved"
+    assert _audit_events(store, state.run_id)[0]["attempt"] == "w1-1-4"
+
+
+@pytest.mark.parametrize("state_evidence", [
+    {"process": {"pid": 123, "create_time": 1.0}, "process_attempt_id": "w1-1-4"},
+    {"process": {"pid": 123, "create_time": 1.0}},
+    {"process_attempt_id": "w1-1-4"},
+    {"process_attempt_id": "w1-1-3"},
+    {"process": "malformed"},
+])
+def test_audited_recovery_refuses_state_process_evidence(delivery, state_evidence):
+    store, state, *_ = delivery
+    _legacy_uncertain_attempt(store, state)
+    saved = store.load(state.run_id)
+    saved.workers["w1"].update(state_evidence)
+    store.save(saved)
+
+    with pytest.raises(ContractError, match="records process"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                   operator="reviewer", reason="attempt")
+    after = store.load(state.run_id)
+    for key, value in state_evidence.items():
+        assert after.workers["w1"][key] == value
+    assert after.workers["w1"]["uncertain_attempt_id"] == "w1-1-4"
+    assert not _audit_events(store, state.run_id)
+    assert "uncertain-recovery:w1-1-4" not in after.operations
+
+
+def test_audited_recovery_refuses_lock_contention(delivery):
+    store, state, *_ = delivery
+    _legacy_uncertain_attempt(store, state)
+    script = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "from orch.store import StateStore\n"
+        "store = StateStore(Path(sys.argv[1]))\n"
+        "with store.lock('active', timeout=0):\n"
+        "    print('locked', flush=True)\n"
+        "    sys.stdin.read()\n"
+    )
+    process = subprocess.Popen([sys.executable, "-c", script, str(store.data_dir)],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert process.stdout.readline().strip() == "locked"
+        with pytest.raises(ContractError, match="live engine"):
+            resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                       operator="reviewer", reason="concurrent")
+    finally:
+        process.stdin.close()
+        process.terminate()
+        process.wait(timeout=5)
+    assert store.load(state.run_id).workers["w1"]["uncertain_attempt_id"] == "w1-1-4"
+
+
+def test_recovery_replay_refuses_new_process_evidence(delivery, monkeypatch):
+    store, state, _, _, _ = delivery
+    _legacy_uncertain_attempt(store, state)
+    original = store.event
+
+    def crash(run_id, kind, **details):
+        if kind == "uncertain_attempt_resolved":
+            raise RecoveryCrash(kind)
+        return original(run_id, kind, **details)
+
+    monkeypatch.setattr(store, "event", crash)
+    with pytest.raises(RecoveryCrash):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                   operator="first", reason="first decision")
+    monkeypatch.undo()
+    store.event(state.run_id, "process_started", agent="w1", attempt="w1-1-4",
+                pid=987654321, create_time=1.0)
+
+    with pytest.raises(ContractError, match="process identity"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                   operator="second", reason="second decision")
+    saved = store.load(state.run_id)
+    assert saved.workers["w1"]["uncertain_attempt_id"] == "w1-1-4"
+    assert saved.operations["uncertain-recovery:w1-1-4"]["status"] == "intent"
+    assert not _audit_events(store, state.run_id)
+
+
+def test_recovery_refuses_duplicate_intent(delivery):
+    store, state, *_ = delivery
+    _legacy_uncertain_attempt(store, state)
+    store.event(state.run_id, "dispatch_intent", agent="w1", attempt="w1-1-4")
+    with pytest.raises(ContractError, match="exactly one launch intent"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                   operator="reviewer", reason="duplicate intent")
+    assert store.load(state.run_id).workers["w1"]["uncertain_attempt_id"] == "w1-1-4"
+
+
+def test_recovery_refuses_malformed_recorded_decision(delivery):
+    store, state, *_ = delivery
+    _legacy_uncertain_attempt(store, state)
+    saved = store.load(state.run_id)
+    saved.operations["uncertain-recovery:w1-1-4"] = {
+        "status": "intent", "worker": "w1", "attempt": "w1-1-4",
+        "evidence_event_ids": [1, 2],
+    }
+    store.save(saved)
+    with pytest.raises(ContractError, match="incomplete"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                   operator="reviewer", reason="malformed")
+    assert store.load(state.run_id).workers["w1"]["uncertain_attempt_id"] == "w1-1-4"
+
+
+def test_engine_refuses_completed_recovery_without_audit_event(delivery):
+    store, state, feature, manifest, plan = delivery
+    _legacy_uncertain_attempt(store, state)
+    saved = store.load(state.run_id)
+    saved.operations["uncertain-recovery:w1-1-4"] = {
+        "status": "completed", "worker": "w1", "attempt": "w1-1-4",
+        "operator": "reviewer", "reason": "missing event",
+        "event_id": 999999, "evidence_event_ids": [1, 2],
+    }
+    store.save(saved)
+    engine = Engine(store, saved, feature, manifest, plan,
+                    adapters={"opencode": FakeAgents()})
+    assert "resolution audit event missing or conflicting" in " ".join(
+        engine.recovery_audit_gaps())
+    with pytest.raises(Escalation, match="incomplete or unaudited"):
+        asyncio.run(engine.reconcile_processes())
+
+
+def test_engine_refuses_malformed_resolution_history(delivery):
+    store, state, feature, manifest, plan = delivery
+    state.workers["w1"] = {"attempt_id": "w1-1-4",
+                           "uncertain_attempt_resolutions": "not-a-list"}
+    saved = store.save(state)
+    engine = Engine(store, saved, feature, manifest, plan,
+                    adapters={"opencode": FakeAgents()})
+    assert "malformed resolution history" in " ".join(engine.recovery_audit_gaps())
+    with pytest.raises(Escalation, match="incomplete or unaudited"):
+        asyncio.run(engine.reconcile_processes())
+
+
+def test_recovery_replays_after_markdown_refresh_crash(delivery, monkeypatch):
+    store, state, feature, manifest, plan = delivery
+    _legacy_uncertain_attempt(store, state)
+    original_render = store.render
+    calls = {"count": 0}
+
+    def render(current, *args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] >= 2:
+            raise RecoveryCrash("markdown refresh")
+        return original_render(current, *args, **kwargs)
+
+    monkeypatch.setattr(store, "render", render)
+    with pytest.raises(RecoveryCrash):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                   operator="first", reason="first decision")
+    monkeypatch.undo()
+
+    interrupted = store.load(state.run_id)
+    info = interrupted.workers["w1"]
+    assert info["status"] == "interrupted"
+    assert "uncertain_attempt_id" not in info
+    assert len(info["uncertain_attempt_resolutions"]) == 1
+    assert interrupted.operations["uncertain-recovery:w1-1-4"]["status"] == "intent"
+    assert len(_audit_events(store, state.run_id)) == 1
+    engine = Engine(store, interrupted, feature, manifest, plan,
+                    adapters={"opencode": FakeAgents()})
+    with pytest.raises(Escalation, match="incomplete or unaudited"):
+        asyncio.run(engine.reconcile_processes())
+
+    event = resolve_uncertain_dispatch(store, state.run_id, "w1-1-4",
+                                       operator="second", reason="second decision")
+    saved = store.load(state.run_id)
+    assert saved.operations["uncertain-recovery:w1-1-4"]["status"] == "completed"
+    assert saved.operations["uncertain-recovery:w1-1-4"]["event_id"] == event["id"]
+    assert len(_audit_events(store, state.run_id)) == 1
+    assert saved.workers["w1"]["uncertain_attempt_resolutions"][0]["operator"] == "first"
+    activity = (store.run_dir(state.run_id) / "activity_log.md").read_text(encoding="utf-8")
+    assert activity.count("uncertain_attempt_resolved") == 1
+    refreshed = Engine(store, saved, feature, manifest, plan,
+                       adapters={"opencode": FakeAgents()})
+    assert refreshed.recovery_audit_gaps() == []

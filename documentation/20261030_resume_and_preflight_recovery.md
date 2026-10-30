@@ -26,6 +26,14 @@ the workflow sees a launch intent but no recorded process identity, it records
 Absence of a process-start event is not treated as proof that nothing started.
 Resume keeps refusing until an operator establishes what happened.
 
+The same uncertain marker is set when a dispatch is cancelled or paused before a
+process identity is recorded. That case is journaled as
+`agent_interruption_uncertain`. The first repair candidate's helper looked for a
+different spelling, `agent_interrupted_uncertain`; that spelling is now accepted
+only as an explicitly supported legacy form for evidence already written by that
+candidate. The workflow never emits it. Do not rename or otherwise relabel an
+existing event.
+
 ## Optional previous-handover evidence
 
 `workers.<id>.handover` records where an attempt was asked to write. It is not
@@ -52,16 +60,28 @@ decision permanently.
 Before using it, confirm from the run directory that the attempt truly has no
 process evidence:
 
-- `activity_log.md` and `events.jsonl` contain the attempt's `dispatch_intent` and
-  its `agent_launch_uncertain` record;
-- no `process_started` or `process_children` event carries that attempt identity;
-- no process identity or PID is recorded for it in `state.json`;
+- `activity_log.md` and `events.jsonl` contain exactly one `dispatch_intent` for
+  the attempt and a recognized uncertainty event: `agent_launch_uncertain` for a
+  launch that may have started, or `agent_interruption_uncertain` for a
+  cancellation before process identity;
+- no `process_started`, `process_children` or `process_completed` event carries
+  that attempt identity;
+- `state.json` records no `process` dictionary and no `process_attempt_id` for the
+  worker, including a stale identity that belongs to another attempt;
 - the corresponding `round-<n>/logs/<attempt>/` directory does not exist, which
-  is consistent with rejection before the adapter created logs.
+  is consistent with rejection or cancellation before the adapter created logs;
+- the recorded handover path does not exist because the attempt never wrote one.
 
-If any process identity exists, stop. The helper refuses that case and the
-attempt requires escalation, not recovery. Do not kill an unverified process and
-do not delete or edit journal events.
+### Stop, preserve and do not bypass
+
+If any item above does not match, if the evidence is missing, duplicated,
+contradictory, malformed or has changed since an operator decision was recorded,
+or if the helper refuses for any reason, stop. Do not retry with different
+arguments, clear a marker, delete or edit an event, remove a process field, kill a
+process, rewrite `state.json` or fabricate a handover. Preserve the run directory
+and its worktrees together and escalate for review. The helper is the last line
+of defence for legacy and damaged evidence; a refusal is a reason to inspect, not
+an obstacle to work around.
 
 Run the helper from the reviewed runner checkout, with the run stopped and no
 `orch resume` process active:
@@ -85,26 +105,91 @@ PY
 ```
 
 Use the configured data directory when it is not the Linux default. The helper
-requires the run to be `PAUSED` or `ESCALATED` and holds the active-run lock, so
-it cannot run beside a live engine. It refuses an attempt that has no recorded
-intent, no recorded uncertainty, terminal evidence or any process identity
-evidence. It preserves the attempt counter, retry counters, approvals and
-previous handovers, clears only the uncertainty marker and appends a
-`uncertain_attempt_resolutions` history entry. The decision, operator and reason
-are journaled as `uncertain_attempt_resolved`.
+requires a paused or escalated phase for a new decision and holds the active-run
+lock, so it cannot run beside a live engine. It refuses an attempt that does not
+have exactly one launch intent and a recognized uncertainty event, or that has
+terminal evidence, process identity in either the journal or worker state,
+contradictory state, multiple resolution events or a conflicting recorded
+decision. It never deletes process identity or other evidence.
+
+The human decision, operator and evidence identities are persisted as an
+operation intent before uncertainty can be cleared. The audit event is written
+before the worker state becomes resumable, and the operation is then completed.
+If an invocation is interrupted at any of those boundaries, resume is blocked
+and re-running the helper finishes the same recorded operation using the
+original operator, reason and evidence. Changed arguments on re-entry are
+ignored; a second human decision is not requested and a duplicate decision is
+never appended. A fully completed recovery returns its existing audit event and
+performs no further side effects. It preserves the attempt counter, retry
+counters, approvals and previous handovers, and appends one
+`uncertain_attempt_resolutions` history entry.
+
+## Retry budget inspection
+
+The infrastructure retry limit is per manifest, under `limits` in the plan's
+`manifest.md` (`max_infrastructure_retries`). The current counter for a worker is
+recorded as `infrastructure_retries` in `state.json` and shown as `retries=` in
+the run's `checklist.md` whenever it is non-zero. Read both before predicting what
+a resumed launch will do; do not rely on another run's values.
+
+The attempt counter is different from the retry counter. `attempt` counts all
+cumulative dispatch attempts across rounds; `infrastructure_retries` counts the
+automatic retries used for non-zero agent exits within the current dispatch cycle.
+A success resets `infrastructure_retries` to zero. When the counter has reached the
+manifest maximum, the next non-zero agent call escalates immediately instead of
+retrying. Do not reset either counter to obtain another retry; preserve the
+recorded budget and escalate.
+
+As a dated observation only, the paused run `model-preferences-cli-5ec7f5ee` at
+attempt `w01-1-4` records `infrastructure_retries` 2 and its manifest limit is 2,
+so a non-zero resumed call would escalate immediately. Recheck that run's current
+manifest and state before acting; this is not an assumption for other runs.
+
+## Decidable worked example
+
+The paused run `model-preferences-cli-5ec7f5ee` is the dated example for this
+procedure. Before using it, recheck every value below; stop if anything differs.
+The run-specific record with machine paths and input hashes is
+`analysis_and_reviews/20261030_live_resume_case_w01_1_4.md`.
+
+| Item | Expected value |
+|---|---|
+| Run | `model-preferences-cli-5ec7f5ee` |
+| Worker / attempt | `w01` / `w01-1-4` |
+| Attempt counter / retries | 4 / 2 |
+| Manifest retry maximum | 2 |
+| Launch intent event | `dispatch_intent`, event 32 |
+| Uncertainty event | `agent_launch_uncertain`, event 33 |
+| Process events for the attempt | none |
+| State process identity | none (`process` and `process_attempt_id` absent) |
+| `round-1/logs/w01-1-4/` | absent |
+| `round-1/handover/w01-4.md` | absent |
+
+Expected post-recovery state: phase remains `ESCALATED` until the next step;
+worker status becomes `interrupted`; `uncertain_attempt_id` is absent; one
+`uncertain_attempt_resolutions` entry exists; the operation
+`uncertain-recovery:w01-1-4` is `completed`; and the journal contains one
+`uncertain_attempt_resolved` event with evidence event IDs 32 and 33 and zero
+process-identity events. Attempt 4, retries 2 and the approval hashes must be
+unchanged. Re-entry returns the same event without adding another one.
 
 ## Order of operator steps
 
 1. Stop the runner and back up the run directory and its worktrees together.
-2. Review the attempt evidence as described above.
-3. Run the audited recovery helper. It must come before approval, because it
-   requires a paused or escalated phase.
-4. Run `orch approve <slug>`. Approval re-binds the current effective settings
-   and records the current feature head, including orchestrator report commits
-   written by earlier escalations.
+2. Recheck the evidence table above (or the generic checklist for another run).
+3. Run the audited recovery helper. It must come before approval, because a new
+   decision requires a paused or escalated phase. If it refuses, stop and
+   preserve the run.
+4. Run `orch approve <slug>`. Approval is required because the run's recorded
+   feature head is stale: the stored head predates the escalated report commit
+   written after the last approval. Approval records the actual head so the
+   later reviewed-candidate head check can pass. Recheck approval separately; in
+   this observed case the approval hashes already match and are not the reason
+   for this step.
 5. Run `orch resume <slug>` and watch the next attempt. A missing optional
    handover is skipped explicitly; a new launch receives a new attempt identity.
+   For the worked example the next attempt is expected to be `w01-1-5`.
 
 A resumed launch that exits non-zero remains an ordinary infrastructure failure
-and follows the existing retry budget. Do not reset counters or hand-edit
+and follows the recorded retry budget. Do not reset counters or hand-edit
 `state.json`, `events.jsonl` or the Markdown evidence files to force progress.

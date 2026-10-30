@@ -10,6 +10,8 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+import portalocker
+
 from orch.config import Config
 from orch.contracts import (
     ApprovalRequiredError,
@@ -85,6 +87,20 @@ _ATTEMPT_TERMINAL_EVENTS = frozenset({
     "dispatch_preflight_failed",
     "dispatch_blocked",
 })
+_PROCESS_EVENT_KINDS = frozenset({
+    "process_started",
+    "process_children",
+    "process_completed",
+})
+# The workflow journals agent_interruption_uncertain for a cancellation before
+# process identity. agent_interrupted_uncertain is accepted only as the legacy
+# spelling already recorded by the first repair candidate; it is never emitted.
+_UNCERTAINTY_EVENTS = frozenset({
+    "agent_launch_uncertain",
+    "agent_interruption_uncertain",
+    "agent_interrupted_uncertain",
+})
+_RECOVERY_OPERATION_PREFIX = "uncertain-recovery:"
 
 
 def _change_snapshot(root: Path, paths: list[str]) -> str:
@@ -201,30 +217,260 @@ def route_verdicts(state: RunState, verdicts: list[Verdict], manifest: Manifest)
     return {f.worker for f in findings.values()}
 
 
+def _attempt_events(events: list[dict], agent: str, attempt: str) -> list[dict]:
+    return [event for event in events
+            if event.get("agent") == agent and event.get("attempt") == attempt]
+
+
+def _recovery_evidence(events: list[dict], attempt_id: str) -> list[dict]:
+    """Validate attempt-scoped prelaunch and uncertainty evidence.
+
+    Resolution events are excluded so replay can re-validate the same source
+    evidence. Any process, terminal, duplicate-intent or missing-uncertainty
+    evidence raises instead of being discarded.
+    """
+    source = [event for event in events
+              if event.get("kind") != "uncertain_attempt_resolved"]
+    if any(event.get("kind") in _PROCESS_EVENT_KINDS for event in source):
+        raise ContractError(
+            f"Attempt {attempt_id} has durable process identity evidence; "
+            "it requires escalation, not manual recovery"
+        )
+    if any(event.get("kind") in _ATTEMPT_TERMINAL_EVENTS for event in source):
+        raise ContractError(f"Attempt {attempt_id} already has terminal evidence")
+    intents = [event for event in source if event.get("kind") == "dispatch_intent"]
+    if len(intents) != 1:
+        raise ContractError(
+            f"Attempt {attempt_id} must have exactly one launch intent; found {len(intents)}"
+        )
+    if not any(event.get("kind") in _UNCERTAINTY_EVENTS for event in source):
+        raise ContractError(
+            f"Attempt {attempt_id} has no recognized uncertainty event "
+            "(agent_launch_uncertain or agent_interruption_uncertain)"
+        )
+    return source
+
+
+def _require_recovery_state(info: dict | None, attempt_id: str) -> None:
+    """Refuse contradictory or identity-bearing worker state without editing it."""
+    if info is None:
+        raise ContractError(f"Worker state for attempt {attempt_id} is missing")
+    if info.get("attempt_id") != attempt_id:
+        raise ContractError(
+            f"Worker attempt identity {info.get('attempt_id')!r} does not match {attempt_id}"
+        )
+    recorded = [name for name in ("process", "process_attempt_id")
+                if info.get(name) is not None]
+    if recorded:
+        raise ContractError(
+            f"Worker state for {attempt_id} records {', '.join(recorded)}; "
+            "refusing recovery and leaving that identity inspectable"
+        )
+    marker = info.get("uncertain_attempt_id")
+    if marker not in (None, attempt_id):
+        raise ContractError(
+            f"Worker state points at uncertain attempt {marker!r}, not {attempt_id}"
+        )
+    status = info.get("status")
+    if marker == attempt_id and status not in {"uncertain", "interrupted"}:
+        raise ContractError(
+            f"Worker {attempt_id} is contradictory: status {status!r} with an uncertainty marker"
+        )
+    if marker is None and status not in {"interrupted", "uncertain"}:
+        raise ContractError(
+            f"Worker {attempt_id} is not in a recoverable state: status {status!r}"
+        )
+
+
+def _same_recovery_decision(entry: dict, operator: str, reason: str,
+                            evidence_ids: list[int]) -> bool:
+    return (
+        entry.get("operator") == operator
+        and entry.get("reason") == reason
+        and sorted(entry.get("evidence_event_ids") or []) == sorted(evidence_ids)
+        and entry.get("process_identity_events", 0) == 0
+    )
+
+
+def _matching_resolution_event(events: list[dict], name: str, attempt_id: str,
+                               operator: str, reason: str,
+                               evidence_ids: list[int]) -> dict | None:
+    audits = [event for event in _attempt_events(events, name, attempt_id)
+              if event.get("kind") == "uncertain_attempt_resolved"]
+    if len(audits) > 1:
+        raise ContractError(
+            f"Attempt {attempt_id} has multiple resolution events; refusing recovery"
+        )
+    if not audits:
+        return None
+    event = audits[0]
+    if (event.get("operator") != operator or event.get("reason") != reason
+            or sorted(event.get("evidence_event_ids") or []) != sorted(evidence_ids)):
+        raise ContractError(
+            f"Existing resolution event for {attempt_id} conflicts with the recorded decision"
+        )
+    return event
+
+
+def _completed_recovery_event(state: RunState, events: list[dict], key: str) -> dict:
+    attempt_id = key.removeprefix(_RECOVERY_OPERATION_PREFIX)
+    operation = state.operations.get(key)
+    if not isinstance(operation, dict):
+        raise ContractError(f"Recovery operation {key} is malformed")
+    name, event_id = operation.get("worker"), operation.get("event_id")
+    evidence_ids = operation.get("evidence_event_ids")
+    if (not isinstance(name, str) or not isinstance(event_id, int)
+            or not isinstance(operation.get("operator"), str)
+            or not isinstance(operation.get("reason"), str)
+            or not isinstance(evidence_ids, list)
+            or not all(isinstance(item, int) for item in evidence_ids)):
+        raise ContractError(
+            f"Recovery operation {key} has an incomplete completion record"
+        )
+    matching = [event for event in events if event.get("id") == event_id]
+    if len(matching) != 1:
+        raise ContractError(f"Recovery operation {key} has no unique audit event")
+    event = matching[0]
+    if (event.get("kind") != "uncertain_attempt_resolved"
+            or event.get("agent") != name or event.get("attempt") != attempt_id):
+        raise ContractError(f"Recovery operation {key} references a conflicting audit event")
+    _matching_resolution_event(events, name, attempt_id, operation["operator"],
+                               operation["reason"], evidence_ids)
+    info = state.workers.get(name) or {}
+    if info.get("uncertain_attempt_id") == attempt_id:
+        raise ContractError(
+            f"Recovery for {attempt_id} is recorded complete but the uncertainty marker remains"
+        )
+    return event
+
+
+def _finish_uncertain_recovery(store: StateStore, state: RunState, *, key: str, name: str,
+                               attempt_id: str, operator: str, reason: str,
+                               evidence_ids: list[int]) -> dict:
+    """Write the audit event, then the resolution state, then the completion.
+
+    Replay at every boundary reuses the recorded decision and existing event;
+    it never appends a second decision and never trusts changed arguments.
+    """
+    events = store.events(state.run_id)
+    source = _recovery_evidence(_attempt_events(events, name, attempt_id), attempt_id)
+    if sorted(event["id"] for event in source) != sorted(evidence_ids):
+        raise ContractError(
+            f"Attempt {attempt_id} evidence changed since the operator decision; "
+            "refusing to complete recovery"
+        )
+    info = state.workers.get(name)
+    _require_recovery_state(info, attempt_id)
+    event = _matching_resolution_event(
+        events, name, attempt_id, operator, reason, evidence_ids
+    )
+    if event is None:
+        event = store.event(
+            state.run_id, "uncertain_attempt_resolved", agent=name, attempt=attempt_id,
+            operator=operator, reason=reason, evidence_event_ids=list(evidence_ids),
+            process_identity_events=0,
+        )
+    entries = info.get("uncertain_attempt_resolutions", [])
+    if not isinstance(entries, list):
+        raise ContractError(
+            f"Resolution history for {attempt_id} is malformed; refusing recovery"
+        )
+    entries = [entry for entry in entries
+               if isinstance(entry, dict) and entry.get("attempt") == attempt_id]
+    if len(entries) > 1:
+        raise ContractError(
+            f"Attempt {attempt_id} has multiple resolution history entries; refusing recovery"
+        )
+    changed = False
+    if entries:
+        if not _same_recovery_decision(entries[0], operator, reason, evidence_ids):
+            raise ContractError(
+                f"Resolution history for {attempt_id} conflicts with the recorded decision"
+            )
+    else:
+        info.setdefault("uncertain_attempt_resolutions", []).append({
+            "attempt": attempt_id, "operator": operator, "reason": reason,
+            "resolved_at": timestamp(), "evidence_event_ids": list(evidence_ids),
+            "process_identity_events": 0,
+        })
+        changed = True
+    if info.get("uncertain_attempt_id") == attempt_id:
+        info.pop("uncertain_attempt_id")
+        changed = True
+    if info.get("status") != "interrupted":
+        info["status"] = "interrupted"
+        changed = True
+    if changed:
+        info["activity"] = timestamp()
+        state = store.save(state)
+    operation = state.operations.get(key)
+    if not isinstance(operation, dict):
+        operation = {}
+    if operation.get("status") != "completed":
+        store.record_operation(state, key, {"status": "completed", "event_id": event["id"]})
+    return event
+
+
 def resolve_uncertain_dispatch(store: StateStore, run_id: str, attempt_id: str, *,
                                operator: str, reason: str) -> dict:
     """Audited, operator-controlled resolution of one uncertain dispatch.
 
-    The orchestrator cannot prove that an attempt without a recorded process
-    identity did not launch, so this function never decides that from exception
-    text. It requires a human operator and reason, refuses when any process
-    identity evidence exists for the attempt, and permanently journals the
-    evidence it relied on. Counters, approvals and attempt history are kept.
+    A fresh decision is persisted as an operation intent before uncertainty can
+    be cleared. Re-entry for an existing operation uses the original durable
+    operator, reason and evidence, finishes the same operation, and never asks
+    for or records a second decision. The helper refuses journal or worker-state
+    process identity, terminal evidence, duplicate intents, contradictory state
+    and changed evidence rather than deleting or relabelling any of it.
     """
-    operator, reason = operator.strip(), reason.strip()
-    if not operator or not reason:
-        raise ContractError("Audited recovery requires a non-empty operator and reason")
     if not re.fullmatch(r"[A-Za-z0-9_-]+", attempt_id):
         raise ContractError(f"Unsafe attempt identity: {attempt_id!r}")
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(store.lock("active", timeout=0))
-        except Exception as exc:
+        except portalocker.exceptions.LockException as exc:
             raise ContractError(
                 "A live engine holds this run; pause it and wait for the process to exit "
                 "before audited recovery"
             ) from exc
         state = store.load(run_id)
+        events = store.events(run_id)
+        key = f"{_RECOVERY_OPERATION_PREFIX}{attempt_id}"
+        existing = state.operations.get(key)
+        if existing is not None:
+            if not isinstance(existing, dict):
+                raise ContractError(f"Recovery operation {key} is malformed")
+            status = existing.get("status")
+            if status == "completed":
+                return _completed_recovery_event(state, events, key)
+            if status != "intent":
+                raise ContractError(
+                    f"Recovery operation {key} has unknown status {status!r}; refusing"
+                )
+            if state.phase not in {"PAUSED", "ESCALATED", "APPROVED"}:
+                raise ContractError(
+                    f"Run phase {state.phase} does not permit recovery replay"
+                )
+            name = existing.get("worker")
+            recorded_operator = existing.get("operator")
+            recorded_reason = existing.get("reason")
+            evidence_ids = existing.get("evidence_event_ids")
+            if (not isinstance(name, str) or not name
+                    or not isinstance(recorded_operator, str) or not recorded_operator
+                    or not isinstance(recorded_reason, str) or not recorded_reason
+                    or not isinstance(evidence_ids, list) or not evidence_ids
+                    or not all(isinstance(item, int) for item in evidence_ids)):
+                raise ContractError(
+                    f"Recorded recovery decision for {attempt_id} is incomplete; refusing replay"
+                )
+            return _finish_uncertain_recovery(
+                store, state, key=key, name=name, attempt_id=attempt_id,
+                operator=recorded_operator, reason=recorded_reason,
+                evidence_ids=evidence_ids,
+            )
+
+        operator, reason = operator.strip(), reason.strip()
+        if not operator or not reason:
+            raise ContractError("Audited recovery requires a non-empty operator and reason")
         if state.phase not in {"PAUSED", "ESCALATED"}:
             raise ContractError(
                 f"Run phase {state.phase} does not permit audited recovery"
@@ -234,51 +480,18 @@ def resolve_uncertain_dispatch(store: StateStore, run_id: str, attempt_id: str, 
         if len(matches) != 1:
             raise ContractError(f"No single recorded uncertain dispatch {attempt_id}")
         name, _ = matches[0]
-        events = [event for event in store.events(run_id)
-                  if event.get("agent") == name and event.get("attempt") == attempt_id]
-        process_evidence = [event for event in events
-                            if event.get("kind") in {"process_started", "process_children",
-                                                     "process_completed"}]
-        if process_evidence:
-            raise ContractError(
-                f"Attempt {attempt_id} has durable process identity evidence; "
-                "it requires escalation, not manual recovery"
-            )
-        if any(event.get("kind") in _ATTEMPT_TERMINAL_EVENTS for event in events):
-            raise ContractError(f"Attempt {attempt_id} already has terminal evidence")
-        recorded_uncertainty = [event for event in events
-                                if event.get("kind") in {"agent_launch_uncertain",
-                                                         "agent_interrupted_uncertain"}]
-        intents = [event for event in events if event.get("kind") == "dispatch_intent"]
-        if not intents or not recorded_uncertainty:
-            raise ContractError(
-                f"Attempt {attempt_id} lacks the intent and uncertainty events required "
-                "for audited recovery"
-            )
-        evidence_ids = [event["id"] for event in events]
-        key = f"uncertain-recovery:{attempt_id}"
+        source = _recovery_evidence(_attempt_events(events, name, attempt_id), attempt_id)
+        _require_recovery_state(state.workers.get(name), attempt_id)
+        evidence_ids = [event["id"] for event in source]
         state = store.record_operation(state, key, {
             "status": "intent", "worker": name, "attempt": attempt_id,
-            "operator": operator, "reason": reason, "evidence_event_ids": evidence_ids,
+            "operator": operator, "reason": reason,
+            "evidence_event_ids": evidence_ids,
         })
-        info = state.workers[name]
-        info.setdefault("uncertain_attempt_resolutions", []).append({
-            "attempt": attempt_id, "operator": operator, "reason": reason,
-            "resolved_at": timestamp(), "evidence_event_ids": evidence_ids,
-            "process_identity_events": 0,
-        })
-        info.pop("uncertain_attempt_id", None)
-        info.pop("process", None)
-        info.pop("process_attempt_id", None)
-        info.update(status="interrupted", activity=timestamp())
-        state = store.save(state)
-        event = store.event(
-            run_id, "uncertain_attempt_resolved", agent=name, attempt=attempt_id,
-            operator=operator, reason=reason, evidence_event_ids=evidence_ids,
-            process_identity_events=0,
+        return _finish_uncertain_recovery(
+            store, state, key=key, name=name, attempt_id=attempt_id,
+            operator=operator, reason=reason, evidence_ids=evidence_ids,
         )
-        store.record_operation(state, key, {"status": "completed", "event_id": event["id"]})
-    return event
 
 
 class Engine:
@@ -558,6 +771,7 @@ class Engine:
         return resolved
 
     async def run_worker(self, worker):
+        self.check_recovery_audit()
         workspace = self.record.workers[worker.id]
         info = self.state.workers.setdefault(worker.id, {})
         if info.get("commit_pending"):
@@ -950,9 +1164,67 @@ class Engine:
             if elapsed >= self.feature.limits.max_runtime_min * 60:
                 raise Escalation("Total runtime limit reached")
 
+    def recovery_audit_gaps(self) -> list[str]:
+        """List unfinished or unaudited recovery records that block resume."""
+        gaps: set[str] = set()
+        events = self.store.events(self.state.run_id)
+        for key, operation in self.state.operations.items():
+            if not key.startswith(_RECOVERY_OPERATION_PREFIX):
+                continue
+            if not isinstance(operation, dict):
+                gaps.add(f"{key} (malformed recovery operation)")
+                continue
+            attempt_id = key.removeprefix(_RECOVERY_OPERATION_PREFIX)
+            status = operation.get("status")
+            if status != "completed":
+                gaps.add(f"{attempt_id} (resolution status {status or 'unknown'})")
+                continue
+            event_id = operation.get("event_id")
+            matching = [event for event in events
+                        if event.get("id") == event_id
+                        and event.get("kind") == "uncertain_attempt_resolved"
+                        and event.get("agent") == operation.get("worker")
+                        and event.get("attempt") == attempt_id
+                        and event.get("operator") == operation.get("operator")
+                        and event.get("reason") == operation.get("reason")
+                        and sorted(event.get("evidence_event_ids") or [])
+                        == sorted(operation.get("evidence_event_ids") or [])]
+            if len(matching) != 1:
+                gaps.add(f"{attempt_id} (resolution audit event missing or conflicting)")
+            for info in self.state.workers.values():
+                if (info.get("attempt_id") == attempt_id
+                        and info.get("uncertain_attempt_id") == attempt_id):
+                    gaps.add(f"{attempt_id} (uncertainty marker remains)")
+        for name, info in self.state.workers.items():
+            history = info.get("uncertain_attempt_resolutions", []) or []
+            if not isinstance(history, list):
+                gaps.add(f"{name} (malformed resolution history)")
+                continue
+            for entry in history:
+                attempt_id = entry.get("attempt") if isinstance(entry, dict) else None
+                if not isinstance(attempt_id, str):
+                    gaps.add(f"{name} (malformed resolution history)")
+                    continue
+                operation = self.state.operations.get(
+                    f"{_RECOVERY_OPERATION_PREFIX}{attempt_id}") or {}
+                if operation.get("status") != "completed":
+                    gaps.add(f"{attempt_id} (resolution history is not audited)")
+        return sorted(gaps)
+
+    def check_recovery_audit(self):
+        gaps = self.recovery_audit_gaps()
+        if gaps:
+            raise Escalation(
+                "Audited recovery is incomplete or unaudited for "
+                + ", ".join(gaps)
+                + "; re-run the audited recovery helper for that attempt before resume"
+            )
+
     async def reconcile_processes(self):
         """Reconcile process evidence by attempt, failing closed on uncertain launch."""
         import psutil
+
+        self.check_recovery_audit()
 
         from orch.processes import ProcessHandle, reconcile_events
 
