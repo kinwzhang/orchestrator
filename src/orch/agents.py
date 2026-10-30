@@ -19,6 +19,61 @@ from orch.processes import ProcessRunner, emit
 from orch.store import atomic_write
 
 
+class PreflightError(LaunchError):
+    """A dispatch was rejected before any process could be created.
+
+    Adapters raise this only from deterministic pre-spawn checks, so workflow
+    may treat it as proof that no agent process owns the attempt. It must never
+    be raised after ``ProcessRunner.run`` has been called.
+    """
+
+    category = "validation"
+
+    def __init__(self, message: str, *, input_kind: str, path: Path | str | None = None):
+        super().__init__(message)
+        self.input_kind = input_kind
+        self.path = None if path is None else str(path)
+
+
+def validate_launch_paths(
+    instruction_file: Path,
+    input_files: tuple[Path, ...],
+    output_file: Path,
+    log_dir: Path | None,
+) -> None:
+    """Reject unusable launch paths with their exact kind and safe path.
+
+    Workflow calls this before durable launch intent and the adapter calls it
+    again immediately before spawning. Optional evidence paths are filtered by
+    the caller; every path passed here is mandatory.
+    """
+
+    def require_markdown(path: Path, kind: str) -> None:
+        candidate = Path(path)
+        if candidate.suffix.lower() != ".md":
+            raise PreflightError(
+                f"{kind} is not a Markdown file: {candidate}", input_kind=kind, path=candidate
+            )
+        if not candidate.is_file():
+            raise PreflightError(
+                f"{kind} is missing: {candidate}", input_kind=kind, path=candidate
+            )
+
+    require_markdown(instruction_file, "instruction")
+    for path in input_files:
+        require_markdown(path, "input")
+    if Path(output_file).suffix.lower() != ".md":
+        raise PreflightError(
+            f"output is not a Markdown file: {Path(output_file)}",
+            input_kind="output",
+            path=output_file,
+        )
+    if log_dir is None:
+        raise PreflightError(
+            "log directory must be provided outside the worktree", input_kind="log_dir"
+        )
+
+
 @dataclass
 class AgentRequest:
     role: str
@@ -340,13 +395,14 @@ class AgentAdapter:
         yield Path(request.cwd), None
 
     async def run(self, request: AgentRequest, on_event: Callable | None = None) -> AgentResult:
-        for path in (request.instruction_file, *request.input_files):
-            if Path(path).suffix.lower() != ".md" or not Path(path).is_file():
-                raise LaunchError("Agent inputs must be existing Markdown files")
-        if request.output_file.suffix.lower() != ".md":
-            raise LaunchError("Agent result must be a Markdown file")
-        if request.log_dir is None:
-            raise LaunchError("Agent log_dir must be provided outside its worktree")
+        # Deterministic pre-spawn validation, reported separately from failures
+        # that could follow process creation.
+        validate_launch_paths(
+            request.instruction_file,
+            request.input_files,
+            request.output_file,
+            request.log_dir,
+        )
         request.output_file.parent.mkdir(parents=True, exist_ok=True)
         request.log_dir.mkdir(parents=True, exist_ok=True)
         session_id = None

@@ -16,8 +16,10 @@ from orch.agents import (
     AgentRequest,
     CodexAdapter,
     OpenCodeAdapter,
+    PreflightError,
     _verify_docs_access_profile,
     docs_access_profile,
+    validate_launch_paths,
 )
 from orch.contracts import ModelSpec
 from orch.platform_support import (
@@ -117,6 +119,58 @@ def test_docs_wrapper_forbids_code(tmp_path):
     text = OpenCodeAdapter().wrapper(request(tmp_path, role="docs_reviewer"))
     assert "Judge relevance only" in text
     assert "Do not read code" in text
+
+
+def test_missing_mandatory_input_fails_preflight_with_exact_path(tmp_path):
+    probed = []
+
+    class Stub(OpenCodeAdapter):
+        def capabilities(self):
+            probed.append(True)
+            raise AssertionError("capability probe must not run before input validation")
+
+    missing = tmp_path / "handover" / "previous.md"
+    target = request(tmp_path, input_files=(missing,))
+    with pytest.raises(PreflightError) as failure:
+        asyncio.run(Stub().run(target))
+    assert failure.value.input_kind == "input"
+    assert failure.value.path == str(missing)
+    assert str(missing) in str(failure.value)
+    assert "missing" in str(failure.value)
+    assert probed == []
+    assert not target.log_dir.exists()
+
+
+def test_preflight_categories_name_instruction_and_output(tmp_path):
+    absent = tmp_path / "absent.md"
+    with pytest.raises(PreflightError) as failure:
+        validate_launch_paths(absent, (), tmp_path / "handover.md", tmp_path / "logs")
+    assert failure.value.input_kind == "instruction"
+    assert failure.value.path == str(absent)
+
+    with pytest.raises(PreflightError) as failure:
+        validate_launch_paths(request(tmp_path).instruction_file, (), tmp_path / "handover.json",
+                              tmp_path / "logs")
+    assert failure.value.input_kind == "output"
+
+    with pytest.raises(PreflightError) as failure:
+        validate_launch_paths(request(tmp_path).instruction_file, (), tmp_path / "handover.md", None)
+    assert failure.value.input_kind == "log_dir"
+
+
+def test_post_launch_secret_rejection_is_not_a_preflight_failure(tmp_path):
+    class Stub(OpenCodeAdapter):
+        def capabilities(self):
+            return AgentCapabilities("stub", frozenset())
+
+        def command(self, request):
+            return [sys.executable, "-c", "pass"]
+
+    target = request(tmp_path)
+    target.output_file.write_text("# Result\nTOPSECRET\n")
+    with pytest.raises(LaunchError) as failure:
+        asyncio.run(Stub(secrets=["TOPSECRET"]).run(target))
+    assert not isinstance(failure.value, PreflightError)
 
 
 def docs_request(tmp_path, **overrides):

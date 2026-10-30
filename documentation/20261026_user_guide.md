@@ -115,6 +115,18 @@ terminal events. Continue only after establishing whether that process is still
 active. Pause and abort remain the supported way to stop a planning session
 while the owning command still controls its process.
 
+### When a worker launch is rejected or uncertain
+
+A missing or invalid mandatory input is rejected before any agent process starts.
+The run escalates with the exact input kind and path, records
+`dispatch_preflight_failed`, and does not mark the attempt uncertain; correct the
+input (and approve again if an approved file changed), then resume. By contrast,
+a dispatch that may have started but has no durable process identity stays
+uncertain and refuses to relaunch. Resolve that only after reviewing the run's
+evidence and with the audited recovery helper described in
+`20261030_resume_and_preflight_recovery.md`. Never fabricate a handover, delete
+evidence or clear uncertainty by editing state.
+
 After successful code/docs review and promotion, test the feature branch and
 close the human gate with:
 
@@ -157,5 +169,6 @@ the read-only watch dashboard and sanitized logs.
 
 - `20261026_contracts_and_configuration.md` — schemas, settings and durable state
 - `20261026_git_and_recovery.md` — worktrees, integration and recovery
+- `20261030_resume_and_preflight_recovery.md` — prelaunch rejection, uncertain attempts and audited recovery
 - `20261026_agents_and_platforms.md` — adapters, processes and platform helpers
 - `20261026_verification.md` — commands, evidence and unverified platform gates

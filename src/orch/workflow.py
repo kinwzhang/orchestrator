@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,6 +40,12 @@ class Escalation(RuntimeError):
     pass
 
 
+def _exception_leaves(error: BaseException) -> list[BaseException]:
+    if isinstance(error, BaseExceptionGroup):
+        return [leaf for child in error.exceptions for leaf in _exception_leaves(child)]
+    return [error]
+
+
 def _exception_details(error: BaseException) -> list[str]:
     """Return leaf failure messages instead of TaskGroup's generic wrapper text."""
     if isinstance(error, BaseExceptionGroup):
@@ -54,6 +62,29 @@ def _failure_message(error: BaseException) -> str:
     if len(details) == 1:
         return details[0]
     return "Concurrent failures: " + "; ".join(details)
+
+
+def _preflight_failure(error: BaseException):
+    """Return a prelaunch rejection only when every leaf proves one.
+
+    A mixed or unknown group keeps the fail-closed uncertain-launch path even
+    if one member happened to fail validation.
+    """
+    from orch.agents import PreflightError
+
+    leaves = _exception_leaves(error)
+    if leaves and all(isinstance(leaf, PreflightError) for leaf in leaves):
+        return leaves[0]
+    return None
+
+
+_ATTEMPT_TERMINAL_EVENTS = frozenset({
+    "agent_completed",
+    "agent_failed",
+    "agent_interrupted",
+    "dispatch_preflight_failed",
+    "dispatch_blocked",
+})
 
 
 def _change_snapshot(root: Path, paths: list[str]) -> str:
@@ -170,6 +201,86 @@ def route_verdicts(state: RunState, verdicts: list[Verdict], manifest: Manifest)
     return {f.worker for f in findings.values()}
 
 
+def resolve_uncertain_dispatch(store: StateStore, run_id: str, attempt_id: str, *,
+                               operator: str, reason: str) -> dict:
+    """Audited, operator-controlled resolution of one uncertain dispatch.
+
+    The orchestrator cannot prove that an attempt without a recorded process
+    identity did not launch, so this function never decides that from exception
+    text. It requires a human operator and reason, refuses when any process
+    identity evidence exists for the attempt, and permanently journals the
+    evidence it relied on. Counters, approvals and attempt history are kept.
+    """
+    operator, reason = operator.strip(), reason.strip()
+    if not operator or not reason:
+        raise ContractError("Audited recovery requires a non-empty operator and reason")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", attempt_id):
+        raise ContractError(f"Unsafe attempt identity: {attempt_id!r}")
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(store.lock("active", timeout=0))
+        except Exception as exc:
+            raise ContractError(
+                "A live engine holds this run; pause it and wait for the process to exit "
+                "before audited recovery"
+            ) from exc
+        state = store.load(run_id)
+        if state.phase not in {"PAUSED", "ESCALATED"}:
+            raise ContractError(
+                f"Run phase {state.phase} does not permit audited recovery"
+            )
+        matches = [(name, info) for name, info in state.workers.items()
+                   if info.get("uncertain_attempt_id") == attempt_id]
+        if len(matches) != 1:
+            raise ContractError(f"No single recorded uncertain dispatch {attempt_id}")
+        name, _ = matches[0]
+        events = [event for event in store.events(run_id)
+                  if event.get("agent") == name and event.get("attempt") == attempt_id]
+        process_evidence = [event for event in events
+                            if event.get("kind") in {"process_started", "process_children",
+                                                     "process_completed"}]
+        if process_evidence:
+            raise ContractError(
+                f"Attempt {attempt_id} has durable process identity evidence; "
+                "it requires escalation, not manual recovery"
+            )
+        if any(event.get("kind") in _ATTEMPT_TERMINAL_EVENTS for event in events):
+            raise ContractError(f"Attempt {attempt_id} already has terminal evidence")
+        recorded_uncertainty = [event for event in events
+                                if event.get("kind") in {"agent_launch_uncertain",
+                                                         "agent_interrupted_uncertain"}]
+        intents = [event for event in events if event.get("kind") == "dispatch_intent"]
+        if not intents or not recorded_uncertainty:
+            raise ContractError(
+                f"Attempt {attempt_id} lacks the intent and uncertainty events required "
+                "for audited recovery"
+            )
+        evidence_ids = [event["id"] for event in events]
+        key = f"uncertain-recovery:{attempt_id}"
+        state = store.record_operation(state, key, {
+            "status": "intent", "worker": name, "attempt": attempt_id,
+            "operator": operator, "reason": reason, "evidence_event_ids": evidence_ids,
+        })
+        info = state.workers[name]
+        info.setdefault("uncertain_attempt_resolutions", []).append({
+            "attempt": attempt_id, "operator": operator, "reason": reason,
+            "resolved_at": timestamp(), "evidence_event_ids": evidence_ids,
+            "process_identity_events": 0,
+        })
+        info.pop("uncertain_attempt_id", None)
+        info.pop("process", None)
+        info.pop("process_attempt_id", None)
+        info.update(status="interrupted", activity=timestamp())
+        state = store.save(state)
+        event = store.event(
+            run_id, "uncertain_attempt_resolved", agent=name, attempt=attempt_id,
+            operator=operator, reason=reason, evidence_event_ids=evidence_ids,
+            process_identity_events=0,
+        )
+        store.record_operation(state, key, {"status": "completed", "event_id": event["id"]})
+    return event
+
+
 class Engine:
     def __init__(self, store: StateStore, state: RunState, feature: FeatureSpec,
                  manifest: Manifest, plan: Path, *, adapters=None, runner=None, config: Config | None = None):
@@ -220,7 +331,7 @@ class Engine:
         raise asyncio.CancelledError
 
     async def dispatch(self, role, logical_id, instruction, output, cwd, inputs=()):
-        from orch.agents import AgentRequest
+        from orch.agents import AgentRequest, PreflightError, validate_launch_paths
 
         self.check_approval()
         info = self.state.workers.setdefault(logical_id, {})
@@ -232,6 +343,26 @@ class Engine:
             raise Escalation(
                 f"Prior dispatch {logical_id}/{info['uncertain_attempt_id']} has uncertain ownership"
             )
+        # Validate every mandatory path before writing a durable launch intent.
+        # A missing input is a deterministic configuration error, not an
+        # uncertain spawn window, so it must never leave an intent that resume
+        # cannot distinguish from a real launch.
+        try:
+            validate_launch_paths(instruction, tuple(inputs), output, log_dir)
+        except PreflightError as exc:
+            info.update(status="preflight_failed", role=role, attempt=attempt,
+                        attempt_id=attempt_id, activity=timestamp(),
+                        output=str(output), log=str(log_dir / "stdout.log"),
+                        preflight_error={"kind": exc.input_kind, "path": exc.path,
+                                         "message": str(exc)})
+            self.save()
+            self.event("dispatch_preflight_failed", agent=logical_id, attempt=attempt_id,
+                       stage="before-intent", input_kind=exc.input_kind,
+                       path=exc.path, reason=str(exc))
+            raise Escalation(
+                f"Dispatch {logical_id}/{attempt_id} rejected before launch "
+                f"({exc.input_kind}): {exc}"
+            ) from exc
         info.pop("process", None)
         info.pop("process_attempt_id", None)
         info.update(status="running", role=role, attempt=attempt, attempt_id=attempt_id,
@@ -290,6 +421,24 @@ class Engine:
             self.check_approval()
             raise
         except Exception as exc:
+            preflight = _preflight_failure(exc)
+            if preflight is not None:
+                # The adapter rejects unusable inputs before probing, building
+                # a command or creating a process. That is a durable, proven
+                # prelaunch failure: no ownership uncertainty exists to keep.
+                info.update(status="preflight_failed", activity=timestamp(),
+                            preflight_error={"kind": preflight.input_kind,
+                                             "path": preflight.path,
+                                             "message": str(preflight)})
+                self.save()
+                self.event("dispatch_preflight_failed", agent=logical_id, attempt=attempt_id,
+                           stage="adapter", input_kind=preflight.input_kind,
+                           path=preflight.path, reason=str(preflight))
+                self.check_approval()
+                raise Escalation(
+                    f"Dispatch {logical_id}/{attempt_id} rejected before launch "
+                    f"({preflight.input_kind}): {preflight}"
+                ) from exc
             attempt_started = any(
                 event.get("kind") == "process_started"
                 and event.get("agent") == logical_id
@@ -375,6 +524,39 @@ class Engine:
         await self.checks(workspace.path, worker.id)
         return changes
 
+    def previous_handover_evidence(self, worker, info):
+        """Return a previous attempt's real handover, never its intended output.
+
+        ``workers.<id>.handover`` records where the last attempt was asked to
+        write. It becomes optional evidence only when a validated handover
+        exists there, stays inside this run's directory, and belongs to the
+        same worker. Missing or invalid paths are journaled and omitted; no
+        handover is ever fabricated to satisfy validation.
+        """
+        raw = info.get("handover")
+        if not raw:
+            return None
+        path = Path(raw)
+
+        def skip(reason):
+            self.event("handover_evidence_skipped", agent=worker.id, path=str(raw), reason=reason)
+
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
+            return skip("path does not exist")
+        if path.suffix.lower() != ".md" or path.is_symlink() or not resolved.is_file():
+            return skip("not a regular Markdown file")
+        if not resolved.is_relative_to(self.run_dir.resolve()):
+            return skip("outside this run directory")
+        try:
+            handover, _ = read_markdown(resolved, Handover)
+        except (ContractError, OSError) as exc:
+            return skip(f"invalid handover: {exc}")
+        if handover.agent != worker.id:
+            return skip("handover identity does not match this worker")
+        return resolved
+
     async def run_worker(self, worker):
         workspace = self.record.workers[worker.id]
         info = self.state.workers.setdefault(worker.id, {})
@@ -419,8 +601,9 @@ class Engine:
             attempt = int(info.get("attempt", 0)) + 1
             output = self.run_dir / f"round-{self.state.round}" / "handover" / f"{worker.id}-{attempt}.md"
             inputs = [within(self.plan, worker.instruction)]
-            if info.get("handover"):
-                inputs.append(Path(info["handover"]))
+            previous = self.previous_handover_evidence(worker, info)
+            if previous is not None:
+                inputs.append(previous)
             if info.get("feedback"):
                 inputs.append(Path(info["feedback"]))
             inputs.append(self.run_dir / "issues.md")
@@ -593,7 +776,6 @@ class Engine:
         for index, source in enumerate(context):
             text = source.read_text(encoding="utf-8")
             # Omit fenced snippets rather than supplying implementation excerpts to this role.
-            import re
             text = re.sub(r"(?ms)^\s*```.*?^\s*```[^\n]*\n?", "[Code block omitted]\n", text)
             atomic_write(destination / f"{index:03d}-{source.name}", text)
         return destination
@@ -747,7 +929,14 @@ class Engine:
                 atomic_write(destination / source.relative_to(self.run_dir), source.read_text(encoding="utf-8"))
         write_report(report_state, self.store.events(self.state.run_id), self.run_dir, self.plan)
         if self.feature.commit_plan:
+            from orch.git_ops import head
+
             self.git.commit_plan(self.plan, message=f"orch: {phase.lower()} report")
+            # The report commit advances the owned feature branch. Persist the
+            # new head so a later resume builds and promotes from actual
+            # history instead of failing the reviewed-candidate head check.
+            self.state.workspace["feature_head"] = head(self.record.feature_path)
+            self.save()
         url = os.environ.get(self.config.webhook_env) if self.config.webhook_env else None
         result = await asyncio.to_thread(notify, f"Orchestrator: {self.state.slug}",
                                          f"{phase}; report: {self.plan / 'report.md'}", url)
@@ -850,8 +1039,7 @@ class Engine:
                     if not isinstance(event_attempt, str):
                         continue
                     related = attempt_events(name, event_attempt)
-                    if not any(e.get("kind") in {"agent_completed", "agent_failed", "agent_interrupted"}
-                               for e in related):
+                    if not any(e.get("kind") in _ATTEMPT_TERMINAL_EVENTS for e in related):
                         open_intents.append(event_attempt)
                 if open_intents:
                     attempt = open_intents[-1]
@@ -860,8 +1048,7 @@ class Engine:
             related = attempt_events(name, attempt) if attempt else []
             intent_exists = any(event.get("kind") == "dispatch_intent" for event in related)
             process_started = any(event.get("kind") == "process_started" for event in related)
-            terminal = any(event.get("kind") in {"agent_completed", "agent_failed", "agent_interrupted"}
-                           for event in related)
+            terminal = any(event.get("kind") in _ATTEMPT_TERMINAL_EVENTS for event in related)
             if intent_exists and not process_started and not terminal:
                 raise Escalation(
                     f"Dispatch {name}/{attempt} may have launched but has no durable process identity; "

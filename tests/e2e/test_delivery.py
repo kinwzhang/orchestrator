@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from orch.contracts import (
+    ContractError,
     Discussion,
     FeatureSpec,
     Handover,
@@ -21,7 +22,13 @@ from orch.contracts import (
 )
 from orch.git_ops import GitWorkspace, git, head
 from orch.store import StateStore, atomic_write
-from orch.workflow import ApprovalRequired, Engine, Escalation, approval_hashes
+from orch.workflow import (
+    ApprovalRequired,
+    Engine,
+    Escalation,
+    approval_hashes,
+    resolve_uncertain_dispatch,
+)
 
 
 class FakeAgents:
@@ -864,3 +871,288 @@ def test_sibling_worker_cancellation_and_exception_group_message(delivery):
     assert "precise worker failure detail" in result.error
     assert "unhandled errors in a TaskGroup" not in result.error
     assert result.workers["w2"]["status"] == "interrupted"
+
+
+class FailingWithoutHandover:
+    """Provider-style failure that never writes the requested handover."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def run(self, request, on_event=None):
+        self.calls.append(request)
+        return SimpleNamespace(exit_code=1, duration_seconds=0.01, reason="provider quota",
+                               usage=None, adapter_version="fake")
+
+
+def _resume_state(store, state):
+    resumed = store.load(state.run_id)
+    resumed.phase = "RUNNING"
+    resumed.error = None
+    return store.save(resumed)
+
+
+def test_resume_after_corrected_config_skips_absent_previous_handover(delivery):
+    store, state, feature, manifest, plan = delivery
+    failing = FailingWithoutHandover()
+    engine = Engine(store, state, feature, manifest, plan, adapters={"opencode": failing})
+    with pytest.raises(Escalation, match="provider quota"):
+        asyncio.run(engine.run())
+
+    escalated = store.load(state.run_id)
+    assert escalated.phase == "ESCALATED"
+    assert escalated.workers["w1"]["status"] == "failed"
+    assert escalated.workers["w1"]["infrastructure_retries"] == 2
+    assert len(failing.calls) == 3
+    absent = Path(escalated.workers["w1"]["handover"])
+    assert not absent.exists()
+    # The escalated report commit is recorded as the new owned feature head.
+    assert escalated.workspace["feature_head"] == head(Path(escalated.workspace["feature_path"]))
+
+    # Operator corrects the provider/model configuration and approves again.
+    feature.models.worker = ModelSpec(model="fake/corrected")
+    escalated.approved_hashes = approval_hashes(plan, manifest, feature)
+    store.save(escalated)
+
+    success = FakeAgents()
+    resumed = Engine(store, _resume_state(store, escalated), feature, manifest, plan,
+                     adapters={"opencode": success})
+    asyncio.run(resumed.run())
+
+    final = store.load(state.run_id)
+    assert final.phase == "AWAITING_TEST"
+    worker_call = next(call for call in success.calls if call.role == "worker")
+    assert absent not in {Path(path) for path in worker_call.input_files}
+    assert all(Path(path).is_file() for path in worker_call.input_files)
+    assert Path(worker_call.output_file) != absent
+    assert final.workers["w1"]["attempt"] == 4
+    assert final.workers["w1"]["infrastructure_retries"] == 0
+    events = store.events(state.run_id)
+    assert any(event["kind"] == "handover_evidence_skipped"
+               and event.get("path") == str(absent) for event in events)
+
+
+def test_missing_mandatory_input_fails_before_launch_intent(delivery):
+    store, state, feature, manifest, plan = delivery
+    adapter = FakeAgents()
+    engine = Engine(store, state, feature, manifest, plan, adapters={"opencode": adapter})
+    instruction = plan / "workers/w1.md"
+    missing = store.run_dir(state.run_id) / "round-1" / "feedback" / "missing.md"
+    output = store.run_dir(state.run_id) / "round-1" / "handover" / "w1-1.md"
+
+    with pytest.raises(Escalation) as failure:
+        asyncio.run(engine.dispatch(
+            "worker", "w1", instruction, output, Path(state.workspace["feature_path"]),
+            inputs=(instruction, missing),
+        ))
+
+    assert "missing" in str(failure.value)
+    assert str(missing) in str(failure.value)
+    assert not adapter.calls
+    events = store.events(state.run_id)
+    assert not any(event["kind"] == "dispatch_intent" for event in events)
+    rejected = [event for event in events if event["kind"] == "dispatch_preflight_failed"]
+    assert len(rejected) == 1
+    assert rejected[0]["input_kind"] == "input"
+    assert rejected[0]["path"] == str(missing)
+    saved = store.load(state.run_id)
+    assert saved.workers["w1"]["status"] == "preflight_failed"
+    assert "uncertain_attempt_id" not in saved.workers["w1"]
+    # No possibly-launched intent exists, so recovery may proceed immediately.
+    asyncio.run(Engine(store, saved, feature, manifest, plan,
+                       adapters={"opencode": adapter}).reconcile_processes())
+    assert not adapter.calls
+
+
+def test_adapter_preflight_rejection_after_intent_is_not_uncertain(delivery):
+    from orch.agents import PreflightError
+
+    store, state, feature, manifest, plan = delivery
+
+    class RacingPreflight:
+        async def run(self, request, on_event=None):
+            raise PreflightError("input is missing: raced.md", input_kind="input",
+                                 path=request.instruction_file / "raced.md")
+
+    engine = Engine(store, state, feature, manifest, plan,
+                    adapters={"opencode": RacingPreflight()})
+    instruction = plan / "workers/w1.md"
+    output = store.run_dir(state.run_id) / "round-1" / "handover" / "w1-1.md"
+    with pytest.raises(Escalation, match="rejected before launch"):
+        asyncio.run(engine.dispatch("worker", "w1", instruction, output,
+                                    Path(state.workspace["feature_path"]),
+                                    inputs=(instruction,)))
+
+    saved = store.load(state.run_id)
+    assert saved.workers["w1"]["status"] == "preflight_failed"
+    assert "uncertain_attempt_id" not in saved.workers["w1"]
+    events = store.events(state.run_id)
+    assert any(event["kind"] == "dispatch_intent" for event in events)
+    assert not any(event["kind"] == "agent_launch_uncertain" for event in events)
+    rejected = [event for event in events if event["kind"] == "dispatch_preflight_failed"]
+    assert rejected[0]["stage"] == "adapter"
+
+    asyncio.run(Engine(store, saved, feature, manifest, plan,
+                       adapters={"opencode": FakeAgents()}).reconcile_processes())
+
+    # The next attempt is allowed and refreshes the intended output.
+    success = FakeAgents()
+    retried = Engine(store, saved, feature, manifest, plan, adapters={"opencode": success})
+    asyncio.run(retried.dispatch("worker", "w1", instruction, output,
+                                 Path(state.workspace["feature_path"]), inputs=(instruction,)))
+    assert len(success.calls) == 1
+    assert store.load(state.run_id).workers["w1"]["status"] == "done"
+
+
+def test_partial_handover_is_retained_and_supplied_on_resume(delivery):
+    store, state, feature, manifest, plan = delivery
+
+    class PartialThenFail:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, request, on_event=None):
+            self.calls.append(request)
+            (request.cwd / "app.py").write_text("answer = 42\n")
+            write_markdown(request.output_file, Handover(
+                agent="w1", round=1, status="partial", files_changed=["app.py"],
+                docs_changed=[], checks_run=[]),
+                "## Interfaces and contracts\n\nPartial work retained.\n")
+            return SimpleNamespace(exit_code=1, duration_seconds=0.01, reason="interrupted",
+                                   usage=None, adapter_version="fake")
+
+    failing = PartialThenFail()
+    engine = Engine(store, state, feature, manifest, plan, adapters={"opencode": failing})
+    with pytest.raises(Escalation):
+        asyncio.run(engine.run())
+
+    escalated = store.load(state.run_id)
+    partial = Path(escalated.workers["w1"]["handover"])
+    assert partial.is_file()
+    assert escalated.workers["w1"]["attempt"] == 3
+
+    success = FakeAgents()
+    resumed = Engine(store, _resume_state(store, escalated), feature, manifest, plan,
+                     adapters={"opencode": success})
+    asyncio.run(resumed.run())
+
+    worker_call = next(call for call in success.calls if call.role == "worker")
+    assert partial in {Path(path) for path in worker_call.input_files}
+    assert Path(worker_call.output_file) != partial
+    assert partial.is_file()
+    final = store.load(state.run_id)
+    assert final.phase == "AWAITING_TEST"
+    assert final.workers["w1"]["attempt"] == 4
+
+
+def _legacy_uncertain_attempt(store, state):
+    run_dir = store.run_dir(state.run_id)
+    intended = run_dir / "round-1" / "handover" / "w1-1-4.md"
+    state.phase = "ESCALATED"
+    state.error = "Dispatch w1/w1-1-4 failed without durable process identity"
+    state.workers["w1"] = {
+        "status": "uncertain", "attempt": 4, "attempt_id": "w1-1-4",
+        "handover": str(intended), "infrastructure_retries": 2,
+        "uncertain_attempt_id": "w1-1-4",
+    }
+    state = store.save(state)
+    store.event(state.run_id, "dispatch_intent", agent="w1", attempt="w1-1-4")
+    store.event(state.run_id, "agent_launch_uncertain", agent="w1", attempt="w1-1-4",
+                error="Agent inputs must be existing Markdown files")
+    return state, intended
+
+
+def test_audited_recovery_requires_evidence_and_preserves_budgets(delivery):
+    store, state, feature, manifest, plan = delivery
+    _, intended = _legacy_uncertain_attempt(store, state)
+    assert not intended.exists()
+
+    event = resolve_uncertain_dispatch(
+        store, state.run_id, "w1-1-4", operator="reviewer",
+        reason="Reviewed w1-1-4: validation failed before log-dir creation; no process evidence.",
+    )
+    assert event["kind"] == "uncertain_attempt_resolved"
+
+    saved = store.load(state.run_id)
+    info = saved.workers["w1"]
+    assert "uncertain_attempt_id" not in info
+    assert info["status"] == "interrupted"
+    assert info["attempt"] == 4
+    assert info["infrastructure_retries"] == 2
+    assert info["uncertain_attempt_resolutions"][0]["operator"] == "reviewer"
+    audit = [item for item in store.events(state.run_id)
+             if item["kind"] == "uncertain_attempt_resolved"]
+    assert audit[0]["process_identity_events"] == 0
+    assert audit[0]["evidence_event_ids"]
+
+    with pytest.raises(ContractError, match="No single recorded uncertain"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="reviewer",
+                                   reason="second attempt")
+    with pytest.raises(ContractError, match="operator and reason"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-5", operator=" ", reason=" ")
+
+    # The resolved attempt can now resume without the absent optional handover.
+    success = FakeAgents()
+    resumed = Engine(store, _resume_state(store, saved), feature, manifest, plan,
+                     adapters={"opencode": success})
+    asyncio.run(resumed.run())
+    final = store.load(state.run_id)
+    assert final.phase == "AWAITING_TEST"
+    worker_call = next(call for call in success.calls if call.role == "worker")
+    assert worker_call.attempt_id == "w1-1-5"
+    assert intended not in {Path(path) for path in worker_call.input_files}
+    assert all(Path(path).is_file() for path in worker_call.input_files)
+
+
+def test_audited_recovery_refuses_recorded_process_identity(delivery):
+    store, state, _, _, _ = delivery
+    _legacy_uncertain_attempt(store, state)
+    store.event(state.run_id, "process_started", agent="w1", attempt="w1-1-4",
+                pid=987654321, create_time=1.0)
+
+    with pytest.raises(ContractError, match="process identity"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="reviewer",
+                                   reason="attempting recovery anyway")
+    assert store.load(state.run_id).workers["w1"]["uncertain_attempt_id"] == "w1-1-4"
+
+
+def test_audited_recovery_refuses_running_phase(delivery):
+    store, state, _, _, _ = delivery
+    _legacy_uncertain_attempt(store, state)
+    running = store.load(state.run_id)
+    running.phase = "RUNNING"
+    store.save(running)
+    with pytest.raises(ContractError, match="does not permit audited recovery"):
+        resolve_uncertain_dispatch(store, state.run_id, "w1-1-4", operator="reviewer",
+                                   reason="not paused")
+
+
+def test_stale_or_invalid_previous_handover_is_not_supplied(delivery):
+    store, state, feature, manifest, plan = delivery
+    engine = Engine(store, state, feature, manifest, plan, adapters={"opencode": FakeAgents()})
+    handovers = store.run_dir(state.run_id) / "round-1" / "handover"
+    stale = handovers / "w1-0.md"
+    write_markdown(stale, Handover(agent="w2", round=1, status="partial", files_changed=[],
+                                   docs_changed=[], checks_run=[]),
+                   "## Interfaces and contracts\n\nBelongs to another worker.\n")
+    state.workers["w1"] = {"handover": str(stale), "attempt": 1}
+    assert engine.previous_handover_evidence(manifest.workers[0], state.workers["w1"]) is None
+
+    invalid = handovers / "w1-0-invalid.md"
+    atomic_write(invalid, "not a handover")
+    state.workers["w1"]["handover"] = str(invalid)
+    assert engine.previous_handover_evidence(manifest.workers[0], state.workers["w1"]) is None
+
+    outside = store.run_dir(state.run_id).parent / "outside-handover.md"
+    write_markdown(outside, Handover(agent="w1", round=1, status="partial", files_changed=[],
+                                     docs_changed=[], checks_run=[]),
+                   "## Interfaces and contracts\n\nOutside the run.\n")
+    state.workers["w1"]["handover"] = str(outside)
+    assert engine.previous_handover_evidence(manifest.workers[0], state.workers["w1"]) is None
+
+    events = store.events(state.run_id)
+    skipped = [event for event in events if event["kind"] == "handover_evidence_skipped"]
+    assert len(skipped) == 3
+    assert "identity" in skipped[0]["reason"]
+    assert "invalid" in skipped[1]["reason"]
+    assert "outside" in skipped[2]["reason"]
