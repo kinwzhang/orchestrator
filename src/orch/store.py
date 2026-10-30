@@ -76,6 +76,34 @@ def _one_line(value: object) -> str:
     return " ".join(str(value).split())
 
 
+def issues_markdown(state: RunState, *, include_ownership: bool = True) -> str:
+    """Render the issue register without duplicating state.
+
+    ``include_ownership=False`` reproduces the pre-ownership format used to
+    verify a legacy pre-batch register snapshot during audited recovery.
+    """
+    issues = [f"# Issue register ({state.slug})", ""]
+    if not state.issues:
+        issues.append("_No issues recorded._")
+    for issue in state.issues.values():
+        parent = issue.parent_issue_id or "none"
+        ownership = (f"; role={issue.owner_role}"
+                     if include_ownership and issue.owner_role else "")
+        issues.append(f"- **{issue.id}** — status={issue.status}; depth={issue.depth}; "
+                      f"owner={issue.worker}; root={issue.root_issue_id}; parent={parent}; "
+                      f"attempt={issue.attempt}; reassignments={issue.reassignments}"
+                      f"{ownership}")
+        for number, assignment in enumerate(issue.assignments, start=1):
+            issues.append(f"  - assignment {number}: repairs={assignment.repairs}; "
+                          f"failed={assignment.failed_repairs}; "
+                          f"review_rounds={assignment.review_rounds}")
+        if issue.summary:
+            issues.append(f"  - summary: {_one_line(issue.summary)}")
+        for link in issue.evidence:
+            issues.append(f"  - evidence: {link}")
+    return "\n".join(issues) + "\n"
+
+
 class StateStore:
     def __init__(self, data_dir: Path):
         self.data_dir = Path(data_dir).resolve()
@@ -224,25 +252,17 @@ class StateStore:
                 fields.append(f"blocker={_one_line(info['error'])}")
             done = "x" if status in {"done", "resolved"} else " "
             lines.append(f"- [{done}] {agent}: " + "; ".join(fields))
+        if state.review_results:
+            lines.extend(["", "## Review results", ""])
+            for key, result in sorted(state.review_results.items()):
+                lines.append(
+                    f"- {result.role}: {result.result}; candidate={result.candidate_sha}; "
+                    f"attempt={result.attempt_id}; evidence={result.evidence_digest[:12]}; "
+                    f"transaction={result.transaction}"
+                )
         if state.error:
             lines.extend(["", f"Blocker: {_one_line(state.error)}"])
         atomic_write(self.run_dir(state.run_id) / "checklist.md", "\n".join(lines) + "\n")
 
-        issues = [f"# Issue register ({state.slug})", ""]
-        if not state.issues:
-            issues.append("_No issues recorded._")
-        for issue in state.issues.values():
-            parent = issue.parent_issue_id or "none"
-            issues.append(f"- **{issue.id}** — status={issue.status}; depth={issue.depth}; "
-                          f"owner={issue.worker}; root={issue.root_issue_id}; parent={parent}; "
-                          f"attempt={issue.attempt}; reassignments={issue.reassignments}")
-            for number, assignment in enumerate(issue.assignments, start=1):
-                issues.append(f"  - assignment {number}: repairs={assignment.repairs}; "
-                              f"failed={assignment.failed_repairs}; "
-                              f"review_rounds={assignment.review_rounds}")
-            if issue.summary:
-                issues.append(f"  - summary: {_one_line(issue.summary)}")
-            for link in issue.evidence:
-                issues.append(f"  - evidence: {link}")
-        atomic_write(self.run_dir(state.run_id) / "issues.md", "\n".join(issues) + "\n")
+        atomic_write(self.run_dir(state.run_id) / "issues.md", issues_markdown(state))
         self.render_log(state.run_id)

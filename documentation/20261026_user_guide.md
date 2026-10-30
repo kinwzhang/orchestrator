@@ -150,6 +150,11 @@ orch validate handover <file.md>
 orch validate verdict <file.md>
 ```
 
+`orch recover-review <slug> --operator <name> --reason <evidence> [--dry-run]` is the
+audited recovery command for the legacy cross-role review batch described in
+`documentation/20261030_independent_review_routing.md`. It is not a general
+substitute for re-review or approval.
+
 ## Safety and platform boundaries
 
 The orchestrator does not push, deploy, send arbitrary external messages, or

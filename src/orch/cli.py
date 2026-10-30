@@ -28,7 +28,13 @@ from orch.contracts import (
     write_markdown,
 )
 from orch.store import StateStore, atomic_write, timestamp
-from orch.workflow import Engine, approval_hashes, next_action, validate_plan
+from orch.workflow import (
+    Engine,
+    approval_hashes,
+    next_action,
+    recover_review_batch,
+    validate_plan,
+)
 
 
 def parser():
@@ -51,6 +57,14 @@ def parser():
     reopen = commands.add_parser("reopen")
     reopen.add_argument("slug")
     reopen.add_argument("notes_file", type=Path)
+    recover = commands.add_parser(
+        "recover-review",
+        help="Audited recovery of a partially applied legacy cross-role review batch",
+    )
+    recover.add_argument("slug")
+    recover.add_argument("--operator", required=True)
+    recover.add_argument("--reason", required=True)
+    recover.add_argument("--dry-run", action="store_true")
     validate = commands.add_parser("validate", help="Validate a Markdown contract")
     validate.add_argument("kind", choices=["feature", "manifest", "discussion", "handover", "verdict"])
     validate.add_argument("file", type=Path)
@@ -587,6 +601,20 @@ def run_command(args):
     entry, feature, state = context(store, args.slug)
     if args.command in {"pause", "abort"}:
         control(store, state, args.command)
+        return 0
+    if args.command == "recover-review":
+        with store.lock(f"feature-{state.slug}"):
+            manifest, _ = read_markdown(Path(entry["plan"]) / "manifest.md", Manifest)
+            feature.limits = manifest.limits
+            summary = recover_review_batch(
+                store, feature, manifest, Path(entry["plan"]), state.run_id,
+                operator=args.operator, reason=args.reason, dry_run=args.dry_run,
+            )
+        for name in sorted(summary):
+            value = summary[name]
+            if isinstance(value, list):
+                value = ", ".join(str(item) for item in value) or "none"
+            print(f"{name}: {value}")
         return 0
     with store.lock(f"feature-{state.slug}"):
         command = args.command

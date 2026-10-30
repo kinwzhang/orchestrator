@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -20,9 +21,11 @@ from orch.contracts import (
     ContractError,
     Discussion,
     FeatureSpec,
+    Finding,
     Handover,
     IssueState,
     Manifest,
+    ReviewResult,
     RunState,
     Verdict,
     approval_hashes,
@@ -31,7 +34,7 @@ from orch.contracts import (
     within,
 )
 from orch.reporting import write_report
-from orch.store import StateStore, atomic_write, timestamp
+from orch.store import StateStore, atomic_write, issues_markdown, timestamp
 
 
 class ApprovalRequired(ApprovalRequiredError):
@@ -146,27 +149,107 @@ def next_action(state: RunState) -> str:
             "DONE": "NONE", "ABORTED": "NONE"}[state.phase]
 
 
-def route_verdicts(state: RunState, verdicts: list[Verdict], manifest: Manifest) -> set[str]:
-    """Update issue lineage/counters; code quality is entirely the reviewers' decision."""
+_REVIEW_ROLES = ("code", "docs")
+_REVIEW_RESULT_PREFIX = "review-result:"
+_REVIEW_BATCH_RECOVERY_PREFIX = "review-batch-recovery:"
+_LEGACY_REVIEW_CONFLICT = "Issue is simultaneously resolved and open"
+_SYSTEM_ISSUE_TEMPLATES = ("check-{}", "post-check-{}", "integration-check-{}")
+
+
+def system_issue_identity(identity: str, manifest: Manifest) -> bool:
+    """Return whether the workflow itself owns this exact generated issue ID."""
+    return any(identity == template.format(worker.id)
+               for worker in manifest.workers for template in _SYSTEM_ISSUE_TEMPLATES)
+
+
+@dataclass
+class ReviewRoleOutcome:
+    role: str
+    result: ReviewResult | None = None
+    error: str | None = None
+    reused: bool = False
+
+
+@dataclass
+class RoleRoutingPlan:
+    """A pure, fully validated routing result for one reviewer role.
+
+    Nothing in the caller's issue register is mutated while this plan is built.
+    ``escalation`` records a reviewer-requested or exhausted budget boundary
+    that must be committed with the accepted result before being re-raised.
+    """
+
+    issues: dict[str, IssueState]
+    findings: dict[str, Finding]
+    resolved: list[str]
+    touched: list[str]
+    affected_workers: list[str]
+    escalation: str | None = None
+
+
+def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
+                      manifest: Manifest, role: str) -> RoleRoutingPlan:
+    """Validate one role's verdict and compute its issue changes without mutating state.
+
+    Ownership, lineage, within-role pass completeness and budgets are checked
+    here. A rejected verdict therefore never has to be rolled back because no
+    counter or status was changed before the whole plan validated.
+    """
+    if role not in _REVIEW_ROLES:
+        raise ContractError(f"Unknown reviewer role: {role!r}")
+    if verdict.reviewer != role:
+        raise ContractError(f"Verdict identity {verdict.reviewer!r} does not match role {role!r}")
     workers = {w.id for w in manifest.workers}
-    findings = {}
-    for verdict in verdicts:
-        if verdict.result == "escalate":
-            raise Escalation(f"{verdict.reviewer} reviewer requested escalation")
-        for finding in verdict.findings:
-            if finding.worker not in workers or not set(finding.related_workers) <= workers:
-                raise ContractError(f"Unknown finding owner: {finding.worker}")
-            if finding.id in findings and findings[finding.id] != finding:
-                raise ContractError(f"Reviewers disagree on identity of {finding.id}")
-            findings[finding.id] = finding
+    work = {identity: issue.model_copy(deep=True) for identity, issue in issues.items()}
+    findings: dict[str, Finding] = {}
+    for finding in verdict.findings:
+        if finding.worker not in workers or not set(finding.related_workers) <= workers:
+            raise ContractError(f"Unknown finding owner: {finding.worker}")
+        existing = work.get(finding.id)
+        if existing is not None:
+            if existing.owner_role is None:
+                raise ContractError(
+                    f"Issue {finding.id} has no validated owner; resolve legacy ownership first"
+                )
+            if existing.owner_role != role:
+                raise ContractError(
+                    f"{role} reviewer may not report {finding.id}; it is owned by {existing.owner_role}"
+                )
+        if finding.id in findings and findings[finding.id] != finding:
+            raise ContractError(f"Reviewers disagree on identity of {finding.id}")
+        findings[finding.id] = finding
+
+    resolved = list(dict.fromkeys(verdict.resolved))
+    for identity in resolved:
+        issue = work.get(identity)
+        if issue is None:
+            raise ContractError(f"Unknown resolved issue: {identity}")
+        if issue.owner_role is None:
+            raise ContractError(
+                f"Issue {identity} has no validated owner; resolve legacy ownership first"
+            )
+        if issue.owner_role != role:
+            raise ContractError(
+                f"{role} reviewer may not resolve {identity}; it is owned by {issue.owner_role}"
+            )
+    if set(resolved) & set(findings):
+        raise ContractError("Issue is simultaneously resolved and open")
+    if verdict.result == "pass":
+        missing = sorted(issue.id for issue in work.values()
+                         if issue.owner_role == role and issue.status == "open"
+                         and issue.id not in resolved)
+        if missing:
+            raise ContractError("Passing verdict must explicitly resolve " + ", ".join(missing))
+
+    touched: set[str] = set()
     remaining = dict(findings)
     while remaining:
         progress = False
         for identity, finding in list(remaining.items()):
-            previous = state.issues.get(identity)
-            if finding.parent_issue_id and finding.parent_issue_id not in state.issues:
+            previous = work.get(identity)
+            if finding.parent_issue_id and finding.parent_issue_id not in work:
                 continue
-            parent = state.issues.get(finding.parent_issue_id)
+            parent = work.get(finding.parent_issue_id)
             depth = parent.depth + 1 if parent else 0
             root = parent.root_issue_id if parent else identity
             if finding.root_issue_id != root:
@@ -182,14 +265,25 @@ def route_verdicts(state: RunState, verdicts: list[Verdict], manifest: Manifest)
             else:
                 previous = IssueState(id=identity, worker=finding.worker, root_issue_id=root,
                                       parent_issue_id=finding.parent_issue_id, depth=depth,
-                                      summary=finding.summary)
-                state.issues[identity] = previous
+                                      summary=finding.summary, owner_role=role)
+                work[identity] = previous
+            touched.add(identity)
             if depth > manifest.limits.max_issue_depth:
-                state.issues[root].status = "escalated"
-                raise Escalation(f"Derived issue {identity} exceeds depth limit; escalate root {root}")
+                work[root].status = "escalated"
+                touched.add(root)
+                return RoleRoutingPlan(
+                    issues=work, findings=findings, resolved=[], touched=sorted(touched),
+                    affected_workers=sorted({f.worker for f in findings.values()}),
+                    escalation=(f"Derived issue {identity} exceeds depth limit; "
+                                f"escalate root {root}"),
+                )
             if finding.action == "escalate":
                 previous.status = "escalated"
-                raise Escalation(f"Issue {identity} requires escalation")
+                return RoleRoutingPlan(
+                    issues=work, findings=findings, resolved=[], touched=sorted(touched),
+                    affected_workers=sorted({f.worker for f in findings.values()}),
+                    escalation=f"Issue {identity} requires escalation",
+                )
             current = previous.assignments[-1]
             exhausted = (current.failed_repairs >= manifest.limits.max_failed_repairs_per_assignment
                          or current.repairs >= manifest.limits.max_repair_attempts
@@ -197,24 +291,783 @@ def route_verdicts(state: RunState, verdicts: list[Verdict], manifest: Manifest)
             if exhausted or finding.action == "reassign":
                 if len(previous.assignments) - 1 >= manifest.limits.max_reassignments:
                     previous.status = "escalated"
-                    raise Escalation(f"Issue {identity} exhausted replacement allowance")
+                    return RoleRoutingPlan(
+                        issues=work, findings=findings, resolved=[], touched=sorted(touched),
+                        affected_workers=sorted({f.worker for f in findings.values()}),
+                        escalation=f"Issue {identity} exhausted replacement allowance",
+                    )
                 previous.assignments.append(AssignmentState())
             del remaining[identity]
             progress = True
         if not progress:
             raise ContractError("Issue lineage has missing parents or a cycle")
-    resolved = {identity for v in verdicts for identity in v.resolved}
-    if resolved & findings.keys():
-        raise ContractError("Issue is simultaneously resolved and open")
+
     for identity in resolved:
-        if identity not in state.issues:
-            raise ContractError(f"Unknown resolved issue: {identity}")
-        state.issues[identity].status = "resolved"
-    if all(v.result == "pass" for v in verdicts):
-        for issue in state.issues.values():
-            if issue.status == "open" and issue.id not in resolved:
-                raise ContractError(f"Passing verdict must explicitly resolve {issue.id}")
-    return {f.worker for f in findings.values()}
+        work[identity].status = "resolved"
+        touched.add(identity)
+    return RoleRoutingPlan(
+        issues=work, findings=findings, resolved=resolved, touched=sorted(touched),
+        affected_workers=sorted({f.worker for f in findings.values()}),
+    )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _issues_digest(issues: dict[str, IssueState]) -> str:
+    payload = {identity: issue.model_dump(mode="json") for identity, issue in issues.items()}
+    return _sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def review_operation_key(role: str, candidate_sha: str, evidence_digest: str) -> str:
+    return f"{_REVIEW_RESULT_PREFIX}{role}:{candidate_sha}:{evidence_digest}"
+
+
+def _review_acceptance_events(events: list[dict], key: str) -> list[dict]:
+    return [event for event in events
+            if event.get("kind") == "review_result_accepted"
+            and event.get("transaction") == key]
+
+
+def _finish_review_operation(store: StateStore, state: RunState, key: str,
+                             operation: dict, manifest: Manifest) -> tuple[RunState, ReviewResult]:
+    """Commit or replay one role acceptance from its recorded durable decision.
+
+    The intent contains the complete pre-routing issue register and the exact
+    normalized verdict. Replay recomputes the same plan from that base instead
+    of from whatever the live register now says, so a crash between intent,
+    issue commit, audit event and completion cannot double-charge a counter.
+    """
+    if not isinstance(operation, dict):
+        raise ContractError(f"Review transaction {key} is malformed")
+    status = operation.get("status")
+    if status not in {"intent", "completed"}:
+        raise ContractError(f"Review transaction {key} has unknown status {status!r}")
+    role = operation.get("role")
+    candidate_sha = operation.get("candidate_sha")
+    evidence_digest = operation.get("evidence_digest")
+    if role not in _REVIEW_ROLES or not isinstance(candidate_sha, str) or not isinstance(evidence_digest, str):
+        raise ContractError(f"Review transaction {key} has incomplete identity")
+    recorded = operation.get("verdict")
+    if not isinstance(recorded, dict):
+        raise ContractError(f"Review transaction {key} has no recorded verdict")
+    verdict = Verdict.model_validate(recorded)
+    if verdict.reviewer != role:
+        raise ContractError(f"Review transaction {key} records the wrong reviewer identity")
+    if status == "completed":
+        result = state.review_results.get(key)
+        if result is None:
+            raise ContractError(f"Completed review transaction {key} has no persisted role result")
+        if result.verdict_sha256 != operation.get("verdict_sha256"):
+            raise ContractError(f"Completed review transaction {key} has a conflicting verdict digest")
+        return state, result
+
+    base = operation.get("base_issues")
+    if not isinstance(base, dict):
+        raise ContractError(f"Review transaction {key} has no pre-routing issue snapshot")
+    base_issues = {identity: IssueState.model_validate(value) for identity, value in base.items()}
+    plan = plan_role_routing(base_issues, verdict, manifest, role)
+    result = ReviewResult(
+        role=role,
+        candidate_sha=candidate_sha,
+        evidence_digest=evidence_digest,
+        attempt_id=str(operation.get("attempt_id")),
+        verdict_sha256=str(operation.get("verdict_sha256")),
+        verdict_path=str(operation.get("verdict_path")),
+        result=verdict.result,
+        findings=sorted(plan.findings),
+        resolved=list(plan.resolved),
+        affected_workers=list(plan.affected_workers),
+        binding=operation.get("binding") if operation.get("binding") in {"candidate-sha", "legacy-attempt"}
+        else "candidate-sha",
+        accepted_at=str(operation.get("recorded_at")),
+        transaction=key,
+        escalation=plan.escalation,
+    )
+    merged = dict(state.issues)
+    for identity in plan.touched:
+        merged[identity] = plan.issues[identity].model_copy(deep=True)
+    state.issues = merged
+    state.review_results[key] = result
+    state = store.save(state)
+
+    events = store.events(state.run_id)
+    matching = _review_acceptance_events(events, key)
+    if len(matching) > 1:
+        raise ContractError(f"Review transaction {key} has multiple acceptance events")
+    if matching:
+        event = matching[0]
+    else:
+        event = store.event(
+            state.run_id, "review_result_accepted", transaction=key, role=role,
+            candidate_sha=candidate_sha, evidence_digest=evidence_digest,
+            attempt_id=result.attempt_id, verdict_sha256=result.verdict_sha256,
+            verdict_path=result.verdict_path, result=result.result,
+            findings=result.findings, resolved=result.resolved,
+            affected_workers=result.affected_workers, escalation=result.escalation,
+            binding=result.binding,
+        )
+    state = store.record_operation(state, key, {
+        "status": "completed", "event_id": event["id"],
+        "after_issues_digest": _issues_digest(state.issues),
+        "completed_at": timestamp(),
+    })
+    return state, state.review_results[key]
+
+
+def accept_review_result(store: StateStore, state: RunState, *, role: str,
+                         candidate_sha: str, evidence_digest: str, attempt_id: str,
+                         verdict: Verdict, verdict_path: Path, manifest: Manifest,
+                         require_candidate_binding: bool = True) -> tuple[RunState, ReviewResult]:
+    """Validate and transactionally accept exactly one reviewer role result.
+
+    Validation is complete before a durable intent exists. A conflicting
+    verdict for evidence already decided is refused rather than applied; an
+    identical replay returns the recorded result without charging counters.
+    """
+    if role not in _REVIEW_ROLES:
+        raise ContractError(f"Unknown reviewer role: {role!r}")
+    if verdict.reviewer != role:
+        raise ContractError(f"Verdict identity {verdict.reviewer!r} does not match role {role!r}")
+    if verdict.candidate_sha is not None and verdict.candidate_sha != candidate_sha:
+        raise ContractError(
+            f"{role} verdict names candidate {verdict.candidate_sha}, "
+            f"not the reviewed candidate {candidate_sha}"
+        )
+    if require_candidate_binding and verdict.candidate_sha != candidate_sha:
+        raise ContractError(
+            f"{role} verdict must name the reviewed candidate; include candidate_sha: {candidate_sha}"
+        )
+    if verdict.result == "escalate":
+        raise ContractError("An escalate verdict is not an accepted role result")
+    path = Path(verdict_path)
+    if not path.is_file():
+        raise ContractError(f"Verdict evidence is missing: {path}")
+    digest = _file_sha256(path)
+    key = review_operation_key(role, candidate_sha, evidence_digest)
+    operation = state.operations.get(key)
+    if operation is not None:
+        if not isinstance(operation, dict):
+            raise ContractError(f"Review transaction {key} is malformed")
+        if operation.get("verdict_sha256") != digest:
+            raise ContractError(
+                f"{role} role produced conflicting verdicts for unchanged candidate/evidence; "
+                "refusing to charge or apply the later feedback"
+            )
+        return _finish_review_operation(store, state, key, operation, manifest)
+
+    # Raises on any ownership, lineage, consistency or budget-shape problem
+    # before the first durable write for this role result.
+    plan_role_routing(state.issues, verdict, manifest, role)
+    binding = "candidate-sha" if require_candidate_binding else "legacy-attempt"
+    operation = {
+        "status": "intent",
+        "role": role,
+        "candidate_sha": candidate_sha,
+        "evidence_digest": evidence_digest,
+        "attempt_id": attempt_id,
+        "verdict_sha256": digest,
+        "verdict_path": str(path),
+        "binding": binding,
+        "recorded_at": timestamp(),
+        "verdict": verdict.model_dump(mode="json"),
+        "base_issues": {identity: issue.model_dump(mode="json")
+                        for identity, issue in state.issues.items()},
+    }
+    state = store.record_operation(state, key, operation)
+    return _finish_review_operation(store, state, key, state.operations[key], manifest)
+
+
+def review_transaction_gaps(state: RunState, events: list[dict]) -> list[str]:
+    """Report incomplete or unaudited role transactions that block review."""
+    gaps: list[str] = []
+    for key, operation in state.operations.items():
+        if not key.startswith(_REVIEW_RESULT_PREFIX):
+            continue
+        if not isinstance(operation, dict):
+            gaps.append(f"{key} (malformed review operation)")
+            continue
+        status = operation.get("status")
+        if status != "completed":
+            gaps.append(f"{key} (transaction status {status or 'unknown'})")
+            continue
+        result = state.review_results.get(key)
+        if result is None:
+            gaps.append(f"{key} (persisted role result missing)")
+            continue
+        if result.verdict_sha256 != operation.get("verdict_sha256"):
+            gaps.append(f"{key} (role result and operation disagree)")
+        accepted = _review_acceptance_events(events, key)
+        if len(accepted) != 1:
+            gaps.append(f"{key} (acceptance audit event missing or duplicated)")
+    for key in state.review_results:
+        operation = state.operations.get(key)
+        if not isinstance(operation, dict) or operation.get("status") != "completed":
+            gaps.append(f"{key} (role result has no completed transaction)")
+    return sorted(set(gaps))
+
+
+def resolve_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) -> list[dict]:
+    """Assign legacy issue ownership from immutable verdict evidence.
+
+    Reviewer ownership is never guessed from an ID prefix. Workflow-generated
+    check issues are recognised by their exact generated identity. Any other
+    unowned issue must be declared as a finding by exactly one reviewer role in
+    a retained verdict; a resolved-list mention is not authority. Ambiguous or
+    missing evidence refuses migration instead of choosing a role.
+    """
+    claims: dict[str, dict[str, list[str]]] = {}
+    mentions: dict[str, dict[str, list[str]]] = {}
+    for path in sorted(run_dir.glob("round-*/verdict-*.md")):
+        stem = path.stem.removeprefix("verdict-")
+        role = stem.split("-", 1)[0]
+        if role not in _REVIEW_ROLES:
+            continue
+        try:
+            verdict, _ = read_markdown(path, Verdict)
+        except (ContractError, OSError):
+            continue
+        if verdict.reviewer != role:
+            continue
+        for finding in verdict.findings:
+            claims.setdefault(finding.id, {}).setdefault(role, []).append(str(path))
+        for identity in verdict.resolved:
+            mentions.setdefault(identity, {}).setdefault(role, []).append(str(path))
+
+    entries: list[dict] = []
+    for identity, issue in state.issues.items():
+        if issue.owner_role is not None:
+            continue
+        if system_issue_identity(identity, manifest):
+            issue.owner_role = "system"
+            entries.append({"issue": identity, "role": "system",
+                            "evidence": ["workflow-generated issue identity"]})
+            continue
+        owners = sorted(claims.get(identity, {}))
+        if len(owners) == 1:
+            issue.owner_role = owners[0]
+            entries.append({"issue": identity, "role": owners[0],
+                            "evidence": claims[identity][owners[0]]})
+        elif len(owners) > 1:
+            raise ContractError(
+                f"Cannot determine owner of {identity}: declared as a finding by "
+                + ", ".join(owners) + " in retained verdicts"
+            )
+        else:
+            listed = sorted(mentions.get(identity, {}))
+            detail = (f"; it appears only in the {', '.join(listed)} resolved list(s), "
+                      "which do not establish ownership" if listed else "")
+            raise ContractError(
+                f"Cannot determine owner of {identity}: no retained verdict declares it "
+                f"as a finding{detail}. Preserve the run and review the evidence."
+            )
+    return entries
+
+
+def _same_run_artefact(recorded: str, output: Path, run_id: str) -> bool:
+    """Compare an artifact path literally or by its run-relative location.
+
+    A preserved run directory may be copied for audited inspection. Its records
+    legitimately keep the original absolute prefix; binding the run ID plus the
+    relative path keeps the evidence check meaningful without rewriting it.
+    """
+    recorded_path = Path(recorded)
+    try:
+        if recorded_path.resolve() == output.resolve():
+            return True
+    except OSError:
+        pass
+
+    def run_relative(path: Path) -> Path | None:
+        parts = path.parts
+        for index in range(len(parts) - 1):
+            if parts[index] == "runs" and parts[index + 1] == run_id:
+                return Path(*parts[index + 2:])
+        return None
+
+    original = run_relative(recorded_path)
+    return original is not None and original == run_relative(output.resolve())
+
+
+def _legacy_review_attempt(store: StateStore, state: RunState, logical: str,
+                           output: Path) -> tuple[str, dict]:
+    """Verify a legacy verdict was produced by the current round's recorded attempt."""
+    info = state.workers.get(logical) or {}
+    attempt = info.get("attempt_id")
+    if not isinstance(attempt, str) or not attempt:
+        raise ContractError(f"No recorded attempt identity for {logical}")
+    recorded = info.get("output")
+    if not recorded or not _same_run_artefact(str(recorded), output, state.run_id):
+        raise ContractError(
+            f"{logical} recorded output {recorded!r} does not match {output}"
+        )
+    events = store.events(state.run_id)
+    related = _attempt_events(events, logical, attempt)
+    intents = [event for event in related if event.get("kind") == "dispatch_intent"]
+    completed = [event for event in related if event.get("kind") == "agent_completed"]
+    if len(intents) != 1 or len(completed) != 1:
+        raise ContractError(
+            f"{logical}/{attempt} must have exactly one launch intent and completion; "
+            f"found {len(intents)} intent(s) and {len(completed)} completion(s)"
+        )
+    intent_output = intents[0].get("output")
+    if intent_output and not _same_run_artefact(str(intent_output), output, state.run_id):
+        raise ContractError(f"{logical}/{attempt} launch intent wrote a different verdict path")
+    if any(event.get("kind") in _UNCERTAINTY_EVENTS for event in related):
+        raise ContractError(f"{logical}/{attempt} has uncertain launch evidence")
+    transitions = [event for event in events
+                   if event.get("kind") == "transition"
+                   and event.get("stage") == "REVIEW"
+                   and event.get("cycle") == state.round]
+    if not transitions:
+        raise ContractError(f"No transition into REVIEW cycle {state.round} is recorded")
+    if str(transitions[0].get("time")) > str(intents[0].get("time")):
+        raise ContractError(f"{logical}/{attempt} was dispatched before this REVIEW cycle")
+    return attempt, {"intent": intents[0]["id"], "completed": completed[0]["id"]}
+
+
+def _legacy_pre_batch(state: RunState, verdicts: list[Verdict],
+                      pre_ids: set[str]) -> tuple[dict[str, IssueState], list[str], list[str]]:
+    """Invert exactly the rejected legacy combined-routing batch.
+
+    The old router mutated finding counters and created new findings before it
+    detected that a docs pass resolved the same IDs. Inverting one review-round
+    increment and one failed-repair increment (only where a repair was already
+    charged) reconstructs the pre-batch register. Finding IDs absent from the
+    independently generated pre-batch snapshot are the batch's new findings and
+    are removed. The caller must additionally verify the rendered register.
+    """
+    pre = {identity: issue.model_copy(deep=True) for identity, issue in state.issues.items()}
+    finding_ids = sorted({finding.id for verdict in verdicts for finding in verdict.findings})
+    resolved_ids = sorted({identity for verdict in verdicts for identity in verdict.resolved})
+    removed: list[str] = []
+    restored: list[str] = []
+    for identity in finding_ids:
+        issue = pre.get(identity)
+        if identity not in pre_ids:
+            if issue is None:
+                raise ContractError(f"Batch-created finding {identity} is missing from state")
+            if issue.owner_role == "system":
+                raise ContractError(f"Workflow-owned issue {identity} was changed by a review batch")
+            removed.append(identity)
+            continue
+        if issue is None:
+            raise ContractError(f"Pre-batch issue {identity} is missing from state")
+        if issue.owner_role == "system":
+            raise ContractError(f"Workflow-owned issue {identity} was changed by a review batch")
+        if issue.status != "open":
+            raise ContractError(
+                f"Issue {identity} is {issue.status}, not open; this is not the expected "
+                "partially applied review batch"
+            )
+        assignment = issue.assignments[-1]
+        if assignment.review_rounds < 1:
+            raise ContractError(f"Issue {identity} has no review round to roll back")
+        assignment.review_rounds -= 1
+        if assignment.repairs:
+            if assignment.failed_repairs < 1:
+                raise ContractError(f"Issue {identity} has no failed repair to roll back")
+            assignment.failed_repairs -= 1
+        elif assignment.failed_repairs != 0:
+            raise ContractError(
+                f"Issue {identity} has failed repairs without a charged repair; refusing"
+            )
+        restored.append(identity)
+    for identity in resolved_ids:
+        if identity not in pre_ids:
+            raise ContractError(
+                f"Resolved issue {identity} is absent from the pre-batch register"
+            )
+        issue = pre.get(identity)
+        if issue is None:
+            raise ContractError(f"Resolved issue {identity} is missing from the register")
+        if issue.status != "open":
+            raise ContractError(
+                f"Issue {identity} is already {issue.status}; resolutions from this batch "
+                "were applied, so the generic batch recovery does not apply"
+            )
+        if issue.owner_role is None:
+            raise ContractError(f"Issue {identity} has no validated owner")
+    unexpected = sorted(set(pre) - pre_ids - set(removed))
+    if unexpected:
+        raise ContractError(
+            "Issues appeared after the pre-batch snapshot: " + ", ".join(unexpected)
+        )
+    missing = sorted(pre_ids - set(pre))
+    if missing:
+        raise ContractError(
+            "Issues from the pre-batch snapshot are missing: " + ", ".join(missing)
+        )
+    for identity in removed:
+        pre.pop(identity, None)
+    return pre, removed, sorted(set(restored))
+
+
+def _snapshot_issue_ids(snapshot: Path) -> set[str]:
+    """Read only issue IDs from the retained pre-batch register snapshot."""
+    return set(re.findall(r"^- \*\*(.+?)\*\* — status=", snapshot.read_text(encoding="utf-8"),
+                          flags=re.MULTILINE))
+
+
+def _last_escalation_time(events: list[dict]) -> str | None:
+    times = [str(event.get("time")) for event in events if event.get("kind") == "escalated"]
+    return times[-1] if times else None
+
+
+def _review_recovery_event(events: list[dict], key: str) -> dict | None:
+    matches = [event for event in events
+               if event.get("kind") == "review_batch_recovered"
+               and event.get("transaction") == key]
+    if len(matches) > 1:
+        raise ContractError(f"Review batch recovery {key} has multiple audit events")
+    return matches[0] if matches else None
+
+
+def _audit_ownership_entries(store: StateStore, run_id: str, entries: list[dict]) -> None:
+    if not entries:
+        return
+    existing = {
+        (event.get("issue"), event.get("role"))
+        for event in store.events(run_id)
+        if event.get("kind") == "issue_ownership_resolved"
+    }
+    for entry in entries:
+        if (entry.get("issue"), entry.get("role")) not in existing:
+            store.event(run_id, "issue_ownership_resolved", **entry)
+
+
+def _completed_review_recovery(state: RunState, events: list[dict], key: str,
+                               operation: dict) -> dict:
+    if not isinstance(operation, dict) or operation.get("status") != "completed":
+        raise ContractError(f"Review batch recovery {key} is not complete")
+    event = _review_recovery_event(events, key)
+    if event is None:
+        raise ContractError(f"Review batch recovery {key} has no audit event")
+    accepted = operation.get("accepted_transaction")
+    if not isinstance(accepted, str) or accepted not in state.review_results:
+        raise ContractError(f"Review batch recovery {key} has no persisted accepted role result")
+    return {
+        "status": "already-recovered",
+        "transaction": key,
+        "audit_event": event["id"],
+        "accepted_transaction": accepted,
+        "accepted_role": "code",
+        "rejected_role": "docs",
+        "restored": list(operation.get("restored_ids") or []),
+        "removed": list(operation.get("removed_ids") or []),
+        "operator": operation.get("operator"),
+        "reason": operation.get("reason"),
+    }
+
+
+def recover_review_batch(store: StateStore, feature, manifest: Manifest, plan: Path,
+                         run_id: str, *, operator: str, reason: str,
+                         dry_run: bool = False) -> dict:
+    """Audited recovery of the exact partially applied legacy review batch.
+
+    The helper never resets counters by guesswork. It inverts only the rejected
+    batch's known mutations, requires the reconstruction to equal the
+    independent pre-batch issue-register copy written before that routing call,
+    accepts the valid code role through the normal transaction, and records the
+    docs role as rejected without mutating its findings. Re-entry replays the
+    recorded decision and completes the same operation.
+    """
+    operator, reason = operator.strip(), reason.strip()
+    if not operator or not reason:
+        raise ContractError("Review batch recovery requires a non-empty operator and reason")
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(store.lock("active", timeout=0))
+        except portalocker.exceptions.LockException as exc:
+            raise ContractError(
+                "A live engine holds this run; pause it and wait for the process to exit "
+                "before review batch recovery"
+            ) from exc
+        state = store.load(run_id)
+        working = state.model_copy(deep=True) if dry_run else state
+        engine = Engine(store, working, feature, manifest, plan)
+        engine.state = working
+        round_no = working.round
+        candidate_data = working.candidate or {}
+        candidate_sha = candidate_data.get("sha")
+        if not isinstance(candidate_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", candidate_sha):
+            raise ContractError("The run has no immutable candidate SHA; recovery does not apply")
+        code_path = engine.run_dir / f"round-{round_no}" / "verdict-code.md"
+        docs_path = engine.run_dir / f"round-{round_no}" / "verdict-docs.md"
+        for path in (code_path, docs_path):
+            if not path.is_file():
+                raise ContractError(f"Round-{round_no} verdict evidence is missing: {path}")
+        code_verdict, _ = read_markdown(code_path, Verdict)
+        docs_verdict, _ = read_markdown(docs_path, Verdict)
+        if code_verdict.reviewer != "code" or docs_verdict.reviewer != "docs":
+            raise ContractError("Round verdict reviewer identities are wrong")
+        for verdict, sha in ((code_verdict, candidate_sha), (docs_verdict, candidate_sha)):
+            if verdict.candidate_sha is not None and verdict.candidate_sha != sha:
+                raise ContractError("A round verdict names a different candidate")
+        if approval_hashes(plan, manifest, feature) != working.approved_hashes:
+            raise ContractError(
+                "Approved inputs changed since this candidate was reviewed; run orch approve "
+                "and review the candidate again instead of recovering this batch"
+            )
+        docs_digest = _file_sha256(docs_path)
+        key = f"{_REVIEW_BATCH_RECOVERY_PREFIX}{round_no}:{candidate_sha}:{docs_digest}"
+        existing = working.operations.get(key)
+        if existing is not None:
+            if not isinstance(existing, dict):
+                raise ContractError(f"Review batch recovery {key} is malformed")
+            status = existing.get("status")
+            if status == "completed":
+                return _completed_review_recovery(working, store.events(run_id), key, existing)
+            if status != "intent":
+                raise ContractError(f"Review batch recovery {key} has unknown status {status!r}")
+            if working.phase not in {"ESCALATED", "PAUSED"}:
+                raise ContractError(
+                    f"Run phase {working.phase} does not permit review batch recovery replay"
+                )
+            if (existing.get("candidate_sha") != candidate_sha
+                    or existing.get("docs_verdict_sha256") != docs_digest):
+                raise ContractError(f"Review batch recovery {key} conflicts with current evidence")
+            if _file_sha256(code_path) != existing.get("code_verdict_sha256"):
+                raise ContractError("The code verdict changed after the recovery decision")
+            snapshot_path = Path(str(existing.get("snapshot_path")))
+            if not snapshot_path.is_file() or _file_sha256(snapshot_path) != existing.get("snapshot_sha256"):
+                raise ContractError("The pre-batch issue-register snapshot changed or is missing")
+            try:
+                pre = {identity: IssueState.model_validate(value)
+                       for identity, value in (existing.get("pre_issues") or {}).items()}
+            except (ValueError, TypeError) as exc:
+                raise ContractError(f"Recorded pre-batch issue snapshot is malformed: {exc}") from exc
+            removed = list(existing.get("removed_ids") or [])
+            restored = list(existing.get("restored_ids") or [])
+            invalid_resolved = list(existing.get("invalid_resolved") or [])
+            operator = str(existing.get("operator"))
+            reason = str(existing.get("reason"))
+            summary = {
+                "status": "replayed",
+                "transaction": key,
+                "operator": existing.get("operator"),
+                "reason": existing.get("reason"),
+                "round": round_no,
+                "candidate_sha": candidate_sha,
+                "accepted_role": "code",
+                "rejected_role": "docs",
+                "restored": restored,
+                "removed": removed,
+                "invalid_resolved": invalid_resolved,
+                "snapshot": str(snapshot_path),
+                "code_attempt": existing.get("code_attempt"),
+                "docs_attempt": existing.get("docs_attempt"),
+                "ownership_resolved": list(existing.get("ownership_resolved") or []),
+            }
+            if dry_run:
+                summary["status"] = "dry-run"
+                return summary
+        else:
+            if working.phase != "ESCALATED" or working.stage != "REVIEW":
+                raise ContractError(
+                    f"Review batch recovery requires an escalated REVIEW stage, "
+                    f"not {working.phase}/{working.stage}"
+                )
+            if working.error != _LEGACY_REVIEW_CONFLICT:
+                raise ContractError(
+                    f"Review batch recovery requires the recorded cross-role conflict; "
+                    f"found {working.error!r}"
+                )
+            if working.pending_control:
+                raise ContractError("A pending control request blocks review batch recovery")
+            from orch.git_ops import Candidate
+            candidate = Candidate(**{**candidate_data, "path": Path(candidate_data["path"])})
+            engine.verify_candidate(candidate)
+            code_attempt, code_evidence_ids = _legacy_review_attempt(
+                store, working, "review-code", code_path
+            )
+            docs_attempt, docs_evidence_ids = _legacy_review_attempt(
+                store, working, "review-docs", docs_path
+            )
+            ownership_entries = engine.settle_issue_ownership(persist=False)
+            plan_role_routing(working.issues, code_verdict, manifest, "code")
+            try:
+                plan_role_routing(working.issues, docs_verdict, manifest, "docs")
+            except ContractError as exc:
+                docs_error = str(exc)
+            else:
+                raise ContractError(
+                    "The documentation verdict is valid; this recovery handles only a "
+                    "cross-role resolution rejection"
+                )
+            if docs_verdict.result != "pass" or "may not resolve" not in docs_error:
+                raise ContractError(
+                    f"The documentation verdict is not the expected cross-role rejection: {docs_error}"
+                )
+            invalid_resolved = sorted(
+                identity for identity in docs_verdict.resolved
+                if (working.issues.get(identity) is not None
+                    and working.issues[identity].owner_role != "docs")
+            )
+            if not invalid_resolved:
+                raise ContractError("No cross-role resolutions were found to reject")
+
+            snapshots = sorted((engine.run_dir / f"round-{round_no}" / "docs-review")
+                               .glob("*-issues.md"))
+            if len(snapshots) != 1:
+                raise ContractError(
+                    "Expected exactly one pre-batch issue-register snapshot in "
+                    f"round-{round_no}/docs-review"
+                )
+            snapshot = snapshots[0]
+            pre, removed, restored = _legacy_pre_batch(
+                working, [code_verdict, docs_verdict], _snapshot_issue_ids(snapshot)
+            )
+            snapshot_state = working.model_copy(deep=True)
+            snapshot_state.issues = pre
+            expected = issues_markdown(snapshot_state, include_ownership=False)
+            if snapshot.read_text(encoding="utf-8") != expected:
+                raise ContractError(
+                    "The reconstructed pre-batch issue register does not match "
+                    f"{snapshot}; refusing recovery"
+                )
+            escalation_time = _last_escalation_time(store.events(run_id))
+            if escalation_time is None:
+                raise ContractError("No escalation event records the rejected batch time")
+            snapshot_time = datetime.fromtimestamp(snapshot.stat().st_mtime, UTC)
+            if snapshot_time.timestamp() > datetime.fromisoformat(escalation_time).timestamp() + 2:
+                raise ContractError("The issue-register snapshot postdates the rejected batch")
+            summary = {
+                "status": "dry-run" if dry_run else "recovered",
+                "transaction": key,
+                "operator": operator,
+                "reason": reason,
+                "round": round_no,
+                "candidate_sha": candidate_sha,
+                "accepted_role": "code",
+                "rejected_role": "docs",
+                "restored": restored,
+                "removed": removed,
+                "invalid_resolved": invalid_resolved,
+                "snapshot": str(snapshot),
+                "code_attempt": code_attempt,
+                "docs_attempt": docs_attempt,
+                "code_evidence_events": code_evidence_ids,
+                "docs_evidence_events": docs_evidence_ids,
+            }
+            if dry_run:
+                return summary
+
+            operation = {
+                "status": "intent",
+                "operator": operator,
+                "reason": reason,
+                "round": round_no,
+                "candidate_sha": candidate_sha,
+                "pre_issues": {identity: issue.model_dump(mode="json")
+                               for identity, issue in pre.items()},
+                "removed_ids": removed,
+                "restored_ids": restored,
+                "snapshot_path": str(snapshot),
+                "snapshot_sha256": _file_sha256(snapshot),
+                "code_verdict_path": str(code_path),
+                "code_verdict_sha256": _file_sha256(code_path),
+                "docs_verdict_path": str(docs_path),
+                "docs_verdict_sha256": docs_digest,
+                "invalid_resolved": invalid_resolved,
+                "code_attempt": code_attempt,
+                "docs_attempt": docs_attempt,
+                "ownership_resolved": ownership_entries,
+                "recorded_at": timestamp(),
+            }
+            working = store.record_operation(working, key, operation)
+            engine.state = working
+            _audit_ownership_entries(store, working.run_id, ownership_entries)
+            summary["ownership_resolved"] = ownership_entries
+
+        # Common completion path. Prefer the engine's normal evidence digest so
+        # the resumed reviewer computes the same key and reuses the result.
+        from orch.git_ops import Candidate
+        candidate = Candidate(**{**candidate_data, "path": Path(candidate_data["path"])})
+        engine.verify_candidate(candidate)
+        _cwd, inputs, _ = engine.review_context("code", candidate)
+        evidence_digest = engine.review_evidence_digest("code", candidate, inputs)
+        code_key = review_operation_key("code", candidate_sha, evidence_digest)
+        code_operation = working.operations.get(code_key)
+        if (isinstance(code_operation, dict)
+                and code_operation.get("status") == "completed"):
+            if _issues_digest(working.issues) != code_operation.get("after_issues_digest"):
+                raise ContractError(
+                    "The accepted code result does not match the current issue register; "
+                    "refusing to complete review batch recovery"
+                )
+        else:
+            if dry_run:
+                summary["planned_transaction"] = code_key
+                return summary
+            for identity in removed:
+                working.issues.pop(identity, None)
+            for identity in restored:
+                if identity in pre:
+                    working.issues[identity] = pre[identity].model_copy(deep=True)
+            working = store.save(working)
+            engine.state = working
+
+        if summary.get("ownership_resolved"):
+            _audit_ownership_entries(store, run_id, summary["ownership_resolved"])
+        events = store.events(run_id)
+        rejections = [event for event in events
+                      if event.get("kind") == "review_result_rejected"
+                      and event.get("recovery") == key and event.get("role") == "docs"]
+        if len(rejections) > 1:
+            raise ContractError(f"Review batch recovery {key} has duplicate rejection events")
+        if not rejections:
+            store.event(
+                run_id, "review_result_rejected", role="docs", recovery=key,
+                attempt_id=str(summary.get("docs_attempt")),
+                verdict_path=str(docs_path), verdict_sha256=docs_digest,
+                reason=(
+                    "Documentation verdict resolved code-owned findings and cannot be "
+                    "accepted; no issue state or counter was changed for this role"
+                ),
+                invalid_resolved=invalid_resolved,
+            )
+
+        working, code_result = accept_review_result(
+            store, working, role="code", candidate_sha=candidate_sha,
+            evidence_digest=evidence_digest,
+            attempt_id=str(summary.get("code_attempt")),
+            verdict=code_verdict, verdict_path=code_path, manifest=manifest,
+            require_candidate_binding=False,
+        )
+        engine.state = working
+        events = store.events(run_id)
+        event = _review_recovery_event(events, key)
+        if event is None:
+            event = store.event(
+                run_id, "review_batch_recovered", transaction=key, operator=operator,
+                reason=reason, round=round_no, candidate_sha=candidate_sha,
+                accepted_transaction=code_result.transaction,
+                rejected_role="docs", rejected_verdict_sha256=docs_digest,
+                restored=restored, removed=removed,
+                invalid_resolved=invalid_resolved,
+                snapshot=str(summary.get("snapshot")),
+                snapshot_sha256=working.operations[key].get("snapshot_sha256"),
+            )
+        working.error = None
+        working = store.record_operation(working, key, {
+            "status": "completed", "event_id": event["id"],
+            "accepted_transaction": code_result.transaction,
+            "completed_at": timestamp(),
+        })
+        summary.update({
+            "status": "recovered",
+            "audit_event": event["id"],
+            "accepted_transaction": code_result.transaction,
+            "code_result": code_result.result,
+            "docs_result": "rejected; pending retry",
+        })
+        return summary
 
 
 def _attempt_events(events: list[dict], agent: str, attempt: str) -> list[dict]:
@@ -515,6 +1368,120 @@ class Engine:
 
     def event(self, kind, **details):
         self.store.event(self.state.run_id, kind, **details)
+
+    def settle_issue_ownership(self, persist: bool = True) -> list[dict]:
+        """Resolve legacy ownership from retained verdict evidence.
+
+        Ownership is persisted before review validation can rely on it. Events
+        are written after the state and de-duplicated by issue/role so an
+        interrupted migration does not append the same audit note twice.
+        """
+        entries = resolve_issue_ownership(self.state, self.run_dir, self.manifest)
+        if entries and persist:
+            self.save()
+            existing = {
+                (event.get("issue"), event.get("role"))
+                for event in self.store.events(self.state.run_id)
+                if event.get("kind") == "issue_ownership_resolved"
+            }
+            for entry in entries:
+                if (entry["issue"], entry["role"]) not in existing:
+                    self.event("issue_ownership_resolved", **entry)
+        return entries
+
+    def verify_candidate(self, candidate):
+        """Refuse to trust a mutable candidate while or after a reviewer reads it."""
+        from orch.git_ops import git, head
+
+        if head(candidate.path) != candidate.sha or git(candidate.path, "status", "--porcelain").strip():
+            raise Escalation("Reviewer changed the candidate; verdicts invalidated")
+
+    def review_context(self, role, candidate):
+        """Return the role-isolated working directory, inputs and authority text."""
+        if role == "docs":
+            cwd = self.docs_inputs()
+            inputs = sorted(cwd.glob("*.md"))
+            extra = (
+                "Measure relevance of subagent documentation and handovers only. Read no code, "
+                "source diffs, source checkout or logs. Use only supplied Markdown files. "
+                "Resolve only findings that the issue register marks with role=docs. Never list "
+                "a code- or system-owned issue in resolved, and never treat a worker's statement "
+                "that code findings are fixed as authority to resolve them. Code implementation, "
+                "acceptance and platform evidence remain code-owned."
+            )
+        else:
+            cwd = Path(candidate.path)
+            inputs = [self.plan / self.manifest.reviewers.code, self.plan / "requirement.md",
+                      self.plan / "plan.md", self.run_dir / "issues.md"]
+            inputs += [Path(self.state.workers[w.id]["handover"]) for w in self.manifest.workers]
+            extra = (
+                "Review integration implementation against requirements and acceptance criteria. "
+                "Resolve only findings that the issue register marks with role=code. Never resolve "
+                "docs- or system-owned issues. If an acceptance criterion needs evidence this "
+                "environment cannot produce (for example native Windows ACL, reparse-point or "
+                "locking behaviour), use action: escalate and name the exact human prerequisite "
+                "instead of requesting another same-platform repair. Never claim an unverified "
+                "platform passed."
+            )
+        return cwd, inputs, extra
+
+    def _review_evidence_name(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(self.run_dir.resolve()))
+        except (ValueError, OSError):
+            return str(path.resolve())
+
+    def review_evidence_digest(self, role, candidate, inputs) -> str:
+        """Stable digest of the role's immutable review evidence.
+
+        The rendered issue register is deliberately excluded: it is a routing
+        projection that a role's own acceptance mutates, so including it would
+        make every accepted result self-invalidating on resume.
+        """
+        entries = []
+        for path in inputs:
+            if path.name == "issues.md" or path.stem.endswith("-issues"):
+                continue
+            entries.append((self._review_evidence_name(path), _file_sha256(path)))
+        reviewer = within(self.plan, self.manifest.reviewers.code if role == "code"
+                          else self.manifest.reviewers.docs)
+        payload = {
+            "role": role,
+            "candidate_sha": candidate.sha,
+            "approved_hashes": sorted(self.state.approved_hashes.items()),
+            "reviewer_instruction": _file_sha256(reviewer),
+            "inputs": sorted(entries),
+        }
+        return _sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                                       ensure_ascii=False))
+
+    def finalize_review_transactions(self, candidate) -> None:
+        """Complete or refuse role transactions recorded before an interruption."""
+        for key, operation in list(self.state.operations.items()):
+            if not key.startswith(_REVIEW_RESULT_PREFIX):
+                continue
+            if not isinstance(operation, dict):
+                raise Escalation(f"Review transaction {key} is malformed; refusing resume")
+            recorded_sha = operation.get("candidate_sha")
+            if recorded_sha != candidate.sha:
+                if operation.get("status") == "completed":
+                    continue  # historical evidence for an earlier immutable candidate
+                raise Escalation(
+                    f"Review transaction {key} belongs to candidate {recorded_sha}, "
+                    "not the current candidate; refusing to apply it"
+                )
+            if operation.get("status") == "intent":
+                self.state, result = _finish_review_operation(
+                    self.store, self.state, key, operation, self.manifest
+                )
+                self.event("review_transaction_replayed", transaction=key,
+                           role=result.role, result=result.result)
+        gaps = review_transaction_gaps(self.state, self.store.events(self.state.run_id))
+        if gaps:
+            raise Escalation(
+                "Review role transactions are incomplete or unaudited: "
+                + "; ".join(gaps)
+            )
 
     def transition(self, *, phase=None, stage=None):
         if phase:
@@ -874,7 +1841,7 @@ class Engine:
                 key = f"check-{worker.id}"
                 if key not in self.state.issues:
                     self.state.issues[key] = IssueState(id=key, worker=worker.id, root_issue_id=key,
-                                                      summary=str(exc))
+                                                      summary=str(exc), owner_role="system")
                 issue = self.state.issues[key]
                 current = issue.assignments[-1]
                 if current.repairs:
@@ -940,6 +1907,7 @@ class Engine:
                 self.state.issues[issue_id] = IssueState(
                     id=issue_id, worker=worker_id, root_issue_id=issue_id,
                     summary="Worker worktree changed after its successful CHECK; revalidate retained changes.",
+                    owner_role="system",
                 )
             feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"{worker_id}.md"
             atomic_write(
@@ -994,34 +1962,115 @@ class Engine:
             atomic_write(destination / f"{index:03d}-{source.name}", text)
         return destination
 
-    async def reviewer(self, role, candidate):
+    async def review_role(self, role, candidate) -> ReviewRoleOutcome:
+        """Run, validate and checkpoint exactly one independent reviewer role."""
         logical = "review-code" if role == "code" else "review-docs"
-        output = self.run_dir / f"round-{self.state.round}" / f"verdict-{role}.md"
-        if role == "docs":
-            cwd = self.docs_inputs()
-            inputs = sorted(cwd.glob("*.md"))
-            extra = "Measure relevance of subagent documentation and handovers only. Read no code, source diffs, source checkout or logs. Use only supplied Markdown files."
-        else:
-            cwd = Path(candidate.path)
-            inputs = [self.plan / self.manifest.reviewers.code, self.plan / "requirement.md", self.plan / "plan.md", self.run_dir / "issues.md"]
-            inputs += [Path(self.state.workers[w.id]["handover"]) for w in self.manifest.workers]
-            extra = "Review integration implementation against requirements and acceptance criteria."
-        extra += f"\nCandidate SHA: {candidate.sha}. Write strict {role} verdict to {output}. Preserve existing issue IDs; identify new issue parent/root IDs and explicitly list resolved IDs."
+        cwd, inputs, base_extra = self.review_context(role, candidate)
+        evidence_digest = self.review_evidence_digest(role, candidate, inputs)
+        key = review_operation_key(role, candidate.sha, evidence_digest)
+
+        operation = self.state.operations.get(key)
+        if operation is not None:
+            updated, result = _finish_review_operation(
+                self.store, self.state, key, operation, self.manifest
+            )
+            self._adopt_review_state(updated)
+            self._verify_review_result_evidence(result, candidate, evidence_digest)
+            return ReviewRoleOutcome(role=role, result=result, reused=True)
+        result = self.state.review_results.get(key)
+        if result is not None:
+            self._verify_review_result_evidence(result, candidate, evidence_digest)
+            return ReviewRoleOutcome(role=role, result=result, reused=True)
+
+        extra = (
+            base_extra
+            + f"\nCandidate SHA: {candidate.sha}. Write the strict {role} verdict to the "
+              "instructed output path. "
+              f"Include `reviewer: {role}` and `candidate_sha: {candidate.sha}` in the front "
+              "matter. Preserve existing issue IDs; identify new issue parent/root IDs and "
+              "explicitly list resolved IDs. List only your own role's issues in resolved."
+        )
+        base_attempt = int(self.state.workers.get(logical, {}).get("attempt", 0))
         for attempt in range(2):
-            instruction = self.input_file(f"{logical}-{attempt}", "Review candidate", inputs, extra)
+            # Attempt-specific filenames preserve every rejected or repaired
+            # verdict; a later independent retry never overwrites evidence that
+            # an audited recovery or acceptance still references.
+            output = (self.run_dir / f"round-{self.state.round}"
+                      / f"verdict-{role}-{base_attempt + attempt + 1}.md")
+            attempt_extra = extra + f"\nWrite the verdict to {output}."
+            instruction = self.input_file(f"{logical}-{attempt}", "Review candidate", inputs,
+                                          attempt_extra)
             await self.dispatch("code_reviewer" if role == "code" else "docs_reviewer", logical,
                                 instruction, output, cwd, inputs)
             try:
                 verdict, _ = read_markdown(output, Verdict)
                 if verdict.reviewer != role:
                     raise ContractError("Wrong reviewer identity")
-                return verdict
+                if verdict.result == "escalate":
+                    self.event("review_role_escalated", role=role,
+                               attempt_id=self.state.workers.get(logical, {}).get("attempt_id"),
+                               verdict=str(output))
+                    return ReviewRoleOutcome(
+                        role=role,
+                        error=f"{role} reviewer requested escalation",
+                    )
+                updated, result = accept_review_result(
+                    self.store, self.state, role=role, candidate_sha=candidate.sha,
+                    evidence_digest=evidence_digest,
+                    attempt_id=str(self.state.workers[logical].get("attempt_id")),
+                    verdict=verdict, verdict_path=output, manifest=self.manifest,
+                )
+                self._adopt_review_state(updated)
+                if result.escalation is None:
+                    self.event("review_role_completed", role=role, result=result.result,
+                               transaction=result.transaction,
+                               attempt_id=result.attempt_id)
+                return ReviewRoleOutcome(role=role, result=result)
             except (ContractError, OSError) as exc:
+                attempt_id = self.state.workers.get(logical, {}).get("attempt_id")
+                self.event("review_result_rejected", role=role, attempt_id=attempt_id,
+                           reason=str(exc), verdict=str(output),
+                           repairable=attempt == 0)
                 if attempt:
-                    raise Escalation(f"Malformed {role} verdict after one repair: {exc}") from exc
-                self.event("verdict_repair", agent=logical, error=str(exc))
-                extra += f"\nYour previous verdict was invalid: {exc}. Repair it once."
+                    return ReviewRoleOutcome(role=role, error=str(exc))
+                extra = (
+                    base_extra
+                    + f"\nCandidate SHA: {candidate.sha}. Include `reviewer: {role}` and "
+                      f"`candidate_sha: {candidate.sha}` in the front matter. Your previous verdict "
+                      f"was invalid: {exc}. Repair it once. Resolve only findings you own; do not "
+                      "resolve the other role's findings."
+                )
         raise AssertionError("unreachable")
+
+    def _adopt_review_state(self, updated: RunState) -> None:
+        """Adopt routing changes without replacing an in-flight dispatch's state.
+
+        Another independent reviewer may still be waiting on its process while
+        this role commits. Replacing ``self.state`` wholesale would detach the
+        nested worker dictionary that its dispatch callbacks update; this keeps
+        the object identity for unrelated fields while taking the committed
+        issue/transaction revision forward.
+        """
+        current = self.state
+        current.issues = updated.issues
+        current.review_results = updated.review_results
+        current.operations = updated.operations
+        current.revision = updated.revision
+        current.updated_at = updated.updated_at
+
+    def _verify_review_result_evidence(self, result: ReviewResult, candidate, evidence_digest):
+        if result.candidate_sha != candidate.sha:
+            raise ContractError(
+                f"Accepted {result.role} result is bound to candidate {result.candidate_sha}, "
+                f"not {candidate.sha}"
+            )
+        if result.evidence_digest != evidence_digest:
+            raise ContractError(f"Accepted {result.role} result has different input evidence")
+        path = Path(result.verdict_path)
+        if not path.is_file() or _file_sha256(path) != result.verdict_sha256:
+            raise ContractError(
+                f"Accepted {result.role} verdict evidence changed or is missing: {path}"
+            )
 
     async def stage(self):
         from orch.git_ops import Candidate, GitConflict
@@ -1059,7 +2108,8 @@ class Engine:
                     key = f"integration-check-{worker.id}"
                     issue = self.state.issues.get(key)
                     if issue is None:
-                        issue = IssueState(id=key, worker=worker.id, root_issue_id=key, summary=str(exc))
+                        issue = IssueState(id=key, worker=worker.id, root_issue_id=key,
+                                           summary=str(exc), owner_role="system")
                         self.state.issues[key] = issue
                     else:
                         current = issue.assignments[-1]
@@ -1084,23 +2134,56 @@ class Engine:
                 "sha": candidate.sha, "path": str(candidate.path), "source_shas": candidate.source_shas, "branch": candidate.branch}
             self.transition(stage="REVIEW")
         elif stage == "REVIEW":
+            self.check_approval()
+            self.settle_issue_ownership()
             candidate = Candidate(**{**self.state.candidate, "path": Path(self.state.candidate["path"])})
+            self.verify_candidate(candidate)
+            self.finalize_review_transactions(candidate)
+            roles = ("code", "docs")
             if self.manifest.limits.concurrency > 1:
-                async with asyncio.TaskGroup() as group:
-                    code = group.create_task(self.reviewer("code", candidate))
-                    docs = group.create_task(self.reviewer("docs", candidate))
-                verdicts = [code.result(), docs.result()]
+                outcomes = await asyncio.gather(
+                    *(self.review_role(role, candidate) for role in roles),
+                    return_exceptions=True,
+                )
             else:
-                verdicts = [await self.reviewer("code", candidate),
-                            await self.reviewer("docs", candidate)]
-            from orch.git_ops import git, head
-            if head(candidate.path) != candidate.sha or git(candidate.path, "status", "--porcelain").strip():
-                raise Escalation("Reviewer changed the candidate; verdicts invalidated")
-            affected = route_verdicts(self.state, verdicts, self.manifest)
-            if affected:
-                # Invalidate transitive dependents; they must see updated dependency code.
+                outcomes = []
+                for role in roles:
+                    try:
+                        outcomes.append(await self.review_role(role, candidate))
+                    except (ContractError, OSError, RuntimeError) as exc:
+                        # Keep the other independent role runnable; approval and
+                        # cancellation boundaries still propagate unwrapped.
+                        outcomes.append(exc)
+            self.verify_candidate(candidate)
+            accepted: dict[str, ReviewResult] = {}
+            failures: list[str] = []
+            for role, outcome in zip(roles, outcomes):
+                if isinstance(outcome, BaseException):
+                    failures.append(f"{role}: {_failure_message(outcome)}")
+                elif outcome.error:
+                    failures.append(f"{role}: {outcome.error}")
+                elif outcome.result is not None:
+                    accepted[role] = outcome.result
+                else:
+                    failures.append(f"{role}: no accepted role result")
+            escalations = [f"{result.role}: {result.escalation}"
+                           for result in accepted.values() if result.escalation]
+            if failures or escalations:
+                details = failures + escalations
+                raise Escalation("Independent review role failure: " + "; ".join(details))
+            if set(accepted) != set(roles):
+                raise Escalation("Promotion requires one accepted result from each independent role")
+            for result in accepted.values():
+                if result.candidate_sha != candidate.sha:
+                    raise Escalation(
+                        f"{result.role} result is bound to a different candidate; refusing promotion"
+                    )
+            rework = [result for result in accepted.values() if result.result == "rework"]
+            if rework:
+                affected = {worker for result in rework for worker in result.affected_workers}
                 while True:
-                    expanded = affected | {w.id for w in self.manifest.workers if set(w.depends_on) & affected}
+                    expanded = affected | {w.id for w in self.manifest.workers
+                                           if set(w.depends_on) & affected}
                     if expanded == affected:
                         break
                     affected = expanded
@@ -1110,12 +2193,22 @@ class Engine:
                     info["status"] = "rework"
                     feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"{worker}.md"
                     atomic_write(feedback, "# Review feedback\n\n" + "\n".join(
-                        f"Read {self.run_dir / f'round-{self.state.round}' / f'verdict-{v.reviewer}.md'}" for v in verdicts))
+                        f"Read {result.verdict_path}" for result in rework
+                        if worker in result.affected_workers))
                     info["feedback"] = str(feedback)
-                self.event("rework_issued", agents=sorted(affected))
+                self.event("rework_issued", agents=sorted(affected),
+                           transactions=[result.transaction for result in rework])
                 self.state.round += 1
                 self.transition(stage="WORK")
             else:
+                system_open = sorted(issue.id for issue in self.state.issues.values()
+                                     if issue.owner_role == "system" and issue.status == "open")
+                if system_open:
+                    raise Escalation(
+                        "Open workflow-owned issue blocks promotion: " + ", ".join(system_open)
+                    )
+                self.event("dual_role_review_passed", candidate_sha=candidate.sha,
+                           transactions=sorted(result.transaction for result in accepted.values()))
                 self.transition(stage="MERGE")
         elif stage == "MERGE":
             candidate = Candidate(**{**self.state.candidate, "path": Path(self.state.candidate["path"])})
@@ -1209,6 +2302,22 @@ class Engine:
                     f"{_RECOVERY_OPERATION_PREFIX}{attempt_id}") or {}
                 if operation.get("status") != "completed":
                     gaps.add(f"{attempt_id} (resolution history is not audited)")
+        for key, operation in self.state.operations.items():
+            if not key.startswith(_REVIEW_BATCH_RECOVERY_PREFIX):
+                continue
+            if not isinstance(operation, dict) or operation.get("status") != "completed":
+                gaps.add(f"{key} (incomplete review batch recovery)")
+                continue
+            event_id = operation.get("event_id")
+            audit = [event for event in events
+                     if event.get("id") == event_id
+                     and event.get("kind") == "review_batch_recovered"
+                     and event.get("transaction") == key]
+            if len(audit) != 1:
+                gaps.add(f"{key} (review batch recovery audit event missing or conflicting)")
+            accepted = operation.get("accepted_transaction")
+            if not isinstance(accepted, str) or accepted not in self.state.review_results:
+                gaps.add(f"{key} (accepted role result missing)")
         return sorted(gaps)
 
     def check_recovery_audit(self):

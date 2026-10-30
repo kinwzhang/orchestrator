@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -36,6 +37,13 @@ class FakeAgents:
     def __init__(self):
         self.calls = []
 
+    @staticmethod
+    def candidate_sha(request):
+        text = request.instruction_file.read_text(encoding="utf-8")
+        match = re.search(r"candidate_sha: ([0-9a-f]{40})", text)
+        assert match, "review instruction must bind the candidate SHA"
+        return match.group(1)
+
     async def run(self, request, on_event=None):
         self.calls.append(request)
         if request.role in {"worker", "replacement"}:
@@ -49,7 +57,9 @@ class FakeAgents:
             if role == "docs":
                 assert not (request.cwd / "app.py").exists()
                 assert all(p.suffix == ".md" for p in request.cwd.iterdir())
-            write_markdown(request.output_file, Verdict(reviewer=role, result="pass"), "## Summary\n\nPass.\n")
+            write_markdown(request.output_file, Verdict(
+                reviewer=role, result="pass", candidate_sha=self.candidate_sha(request)),
+                "## Summary\n\nPass.\n")
         return SimpleNamespace(exit_code=0, duration_seconds=0.01, reason=None,
                                usage=None, adapter_version="fake-1")
 
@@ -98,6 +108,10 @@ def test_complete_delivery_reviews_candidate_leaves_main_untouched(delivery):
     assert result.phase == "AWAITING_TEST"
     assert head(feature.target_project) == original
     assert (Path(result.workspace["feature_path"]) / "app.py").exists()
+    accepted = list(result.review_results.values())
+    assert {entry.role for entry in accepted} == {"code", "docs"}
+    assert {entry.candidate_sha for entry in accepted} == {result.candidate["sha"]}
+    assert {entry.result for entry in accepted} == {"pass"}
     assert len(fake.calls) == 3
     assert (store.run_dir(state.run_id) / "checklist.md").exists()
     assert "dispatch_intent" in (store.run_dir(state.run_id) / "activity_log.md").read_text()
@@ -219,9 +233,11 @@ class ReworkAgents(FakeAgents):
                 self.rejected = True
                 write_markdown(request.output_file, Verdict(reviewer="docs", result="rework", findings=[
                     Finding(id="docs-relevance", worker="w1", root_issue_id="docs-relevance", severity="major",
-                            action="rework_same_worker", summary="Make handover relevant")]), "## Findings\n\nExplain the assigned task.\n")
+                            action="rework_same_worker", summary="Make handover relevant")],
+                    candidate_sha=self.candidate_sha(request)), "## Findings\n\nExplain the assigned task.\n")
             else:
                 write_markdown(request.output_file, Verdict(reviewer=role, result="pass",
+                    candidate_sha=self.candidate_sha(request),
                     resolved=["docs-relevance"] if cycle > 1 and role == "docs" else []))
         return SimpleNamespace(exit_code=0, duration_seconds=0, usage=None, adapter_version="fake")
 

@@ -429,6 +429,11 @@ class Finding(StrictModel):
 class Verdict(StrictModel):
     reviewer: Literal["code", "docs"]
     result: Literal["pass", "rework", "escalate"]
+    # New reviewers bind their verdict to the immutable candidate they read.
+    # It stays optional so historical verdicts remain parseable; acceptance
+    # requires the binding unless an audited legacy recovery verifies the
+    # attempt/candidate relationship from the dispatch journal instead.
+    candidate_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     findings: list[Finding] = Field(default_factory=list)
     resolved: list[str] = Field(default_factory=list)
 
@@ -468,11 +473,35 @@ class IssueState(StrictModel):
     attempt: int = Field(default=1, ge=1)
     evidence: list[str] = Field(default_factory=list)
     summary: str = ""
+    # Reviewer ownership is recorded when a finding is accepted, not inferred
+    # from an issue-name prefix. ``system`` covers workflow-created check issues.
+    # ``None`` is a legacy record that must be resolved from durable verdict
+    # evidence before a reviewer may report or resolve it.
+    owner_role: Literal["code", "docs", "system"] | None = None
 
     @property
     def reassignments(self) -> int:
         """Issue-level reassignment count; maximum one per issue (Q6)."""
         return len(self.assignments) - 1
+
+
+class ReviewResult(StrictModel):
+    """One accepted reviewer-role result bound to candidate and input evidence."""
+
+    role: Literal["code", "docs"]
+    candidate_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    attempt_id: str = Field(min_length=1)
+    verdict_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verdict_path: str = Field(min_length=1)
+    result: Literal["pass", "rework"]
+    findings: list[str] = Field(default_factory=list)
+    resolved: list[str] = Field(default_factory=list)
+    affected_workers: list[str] = Field(default_factory=list)
+    binding: Literal["candidate-sha", "legacy-attempt"] = "candidate-sha"
+    accepted_at: str = Field(min_length=1)
+    transaction: str = Field(min_length=1)
+    escalation: str | None = None
 
 
 Phase = Literal["DRAFT", "DISCUSSING", "PLAN_READY", "APPROVED", "RUNNING", "AWAITING_TEST", "DONE", "ESCALATED", "PAUSED", "ABORTED"]
@@ -491,6 +520,8 @@ class RunState(StrictModel):
     workers: dict[str, dict] = Field(default_factory=dict)
     issues: dict[str, IssueState] = Field(default_factory=dict)
     operations: dict[str, dict] = Field(default_factory=dict)
+    # Accepted role results keyed by role, candidate SHA and input-evidence digest.
+    review_results: dict[str, ReviewResult] = Field(default_factory=dict)
     workspace: dict = Field(default_factory=dict)
     candidate: dict = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)
