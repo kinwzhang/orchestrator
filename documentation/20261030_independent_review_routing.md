@@ -37,7 +37,11 @@ validation, from retained verdict evidence:
 - appearing only in another role's `resolved` list does not establish ownership;
 - missing or ambiguous evidence refuses migration and escalates the run.
 
-`issue_ownership_resolved` records each migrated decision once.
+`issue_ownership_resolved` records each migrated decision once. Migration
+validates every pending issue before changing any owner, so a refused entry
+leaves the whole register untouched. The audit event is written before the
+ownership state so an interrupted migration can finish on re-entry without
+losing the resolution note or writing it twice.
 
 Platform evidence follows the same authority boundary. The orchestrator does not
 infer whether a native platform is available and never marks unverified evidence
@@ -92,7 +96,9 @@ silently.
 Each completed role is checkpointed immediately. Rework is queued only after
 both roles have reached a terminal result for the same candidate, so worker
 worktrees are never mutated while another reviewer is still reading the
-candidate. Promotion requires both accepted results to be `pass` and bound to
+candidate. A worker invalidated only because a dependency was reworked receives
+the upstream finding, its verdict evidence and the dependency chain in its
+feedback; no affected worker is dispatched with an empty feedback body. Promotion requires both accepted results to be `pass` and bound to
 the same immutable candidate SHA. A missing or invalid role result leaves the
 other role's accepted result intact, and resume retries only the incomplete
 role for unchanged evidence.

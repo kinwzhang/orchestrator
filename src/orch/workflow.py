@@ -311,6 +311,116 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
     )
 
 
+def _worker_ancestors(manifest: Manifest, worker_id: str) -> set[str]:
+    by_id = {worker.id: worker for worker in manifest.workers}
+    seen: set[str] = set()
+    stack = list(by_id[worker_id].depends_on)
+    while stack:
+        dependency = stack.pop()
+        if dependency in seen or dependency not in by_id:
+            continue
+        seen.add(dependency)
+        stack.extend(by_id[dependency].depends_on)
+    return seen
+
+
+def _dependency_chain(manifest: Manifest, root: str, worker_id: str) -> list[str] | None:
+    """Return one root-to-worker dependency path through dependents."""
+    by_id = {worker.id: worker for worker in manifest.workers}
+    queue: list[list[str]] = [[root]]
+    while queue:
+        path = queue.pop(0)
+        node = path[-1]
+        if node == worker_id:
+            return path
+        for candidate in by_id.values():
+            if node in candidate.depends_on and candidate.id not in path:
+                queue.append([*path, candidate.id])
+    return None
+
+
+def _verdict_findings(result) -> list[Finding]:
+    try:
+        verdict, _ = read_markdown(Path(result.verdict_path), Verdict)
+    except (ContractError, OSError, TypeError):
+        return []
+    return list(verdict.findings)
+
+
+def build_rework_feedback(worker_id: str, manifest: Manifest, affected: set[str],
+                          results: list) -> str:
+    """Render useful evidence for a directly reviewed or dependency-expanded worker.
+
+    A worker invalidated only because a dependency was reworked never appears in
+    any role's ``affected_workers``. It still needs the upstream findings, the
+    verdict paths and the dependency chain that invalidated its checked result;
+    an empty feedback body would waste a repair attempt.
+    """
+    by_id = {worker.id: worker for worker in manifest.workers}
+    ancestors = _worker_ancestors(manifest, worker_id)
+    resolved = [(result, _verdict_findings(result)) for result in results]
+    own = [(result, finding) for result, findings in resolved
+           for finding in findings if finding.worker == worker_id]
+    upstream = [(result, finding) for result, findings in resolved
+                for finding in findings if finding.worker in ancestors]
+    direct_dependencies = sorted(dependency for dependency in by_id[worker_id].depends_on
+                                 if dependency in affected)
+
+    lines = ["# Review feedback", ""]
+    if own:
+        lines.extend(["## Findings for your work", ""])
+        for result, finding in own:
+            lines.append(f"- {finding.id} ({finding.severity}): {finding.summary}")
+            lines.append(f"  - evidence: {result.verdict_path}")
+    if direct_dependencies:
+        lines.extend([
+            "## Dependency rework",
+            "",
+            ("Your previous CHECK and review evidence no longer covers the updated "
+             f"dependency {', '.join(direct_dependencies)} that review returned for rework. "
+             "Revalidate your work after the dependency changes are available; do not treat "
+             "the earlier result as current."),
+        ])
+        roots = sorted({finding.worker for _result, finding in upstream
+                        if finding.worker in affected})
+        chains: list[list[str]] = []
+        for root in roots:
+            chain = _dependency_chain(manifest, root, worker_id)
+            if chain and chain not in chains:
+                chains.append(chain)
+        if chains:
+            lines.extend(["", "Dependency chain(s):"])
+            lines.extend(f"- {' -> '.join(chain)}" for chain in chains)
+        if upstream:
+            lines.extend(["", "Upstream findings:"])
+            for result, finding in upstream:
+                lines.append(
+                    f"- {finding.id} ({finding.severity}) for {finding.worker}: "
+                    f"{finding.summary}"
+                )
+                lines.append(f"  - evidence: {result.verdict_path}")
+        elif not own:
+            lines.extend(["", "Upstream review evidence:"])
+            lines.extend(f"- Read {result.verdict_path}" for result, _findings in resolved)
+    if not own and not direct_dependencies:
+        lines.extend([
+            "## Upstream review evidence",
+            "",
+            ("Your checked result was invalidated by review rework. Read the verdict evidence "
+             "before continuing:"),
+        ])
+        lines.extend(f"- Read {result.verdict_path}" for result, _findings in resolved)
+    if len(lines) <= 2:
+        lines.extend([
+            "## Upstream review evidence",
+            "",
+            ("Review requested rework that affects this work. Preserve the existing worktree and "
+             "revalidate before continuing."),
+        ])
+        lines.extend(f"- Read {result.verdict_path}" for result, _findings in resolved)
+    return "\n".join(lines) + "\n"
+
+
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -512,14 +622,14 @@ def review_transaction_gaps(state: RunState, events: list[dict]) -> list[str]:
     return sorted(set(gaps))
 
 
-def resolve_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) -> list[dict]:
-    """Assign legacy issue ownership from immutable verdict evidence.
+def plan_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) -> list[dict]:
+    """Compute every legacy ownership assignment without mutating the register.
 
     Reviewer ownership is never guessed from an ID prefix. Workflow-generated
     check issues are recognised by their exact generated identity. Any other
     unowned issue must be declared as a finding by exactly one reviewer role in
     a retained verdict; a resolved-list mention is not authority. Ambiguous or
-    missing evidence refuses migration instead of choosing a role.
+    missing evidence refuses the entire migration instead of choosing a role.
     """
     claims: dict[str, dict[str, list[str]]] = {}
     mentions: dict[str, dict[str, list[str]]] = {}
@@ -544,13 +654,11 @@ def resolve_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) 
         if issue.owner_role is not None:
             continue
         if system_issue_identity(identity, manifest):
-            issue.owner_role = "system"
             entries.append({"issue": identity, "role": "system",
                             "evidence": ["workflow-generated issue identity"]})
             continue
         owners = sorted(claims.get(identity, {}))
         if len(owners) == 1:
-            issue.owner_role = owners[0]
             entries.append({"issue": identity, "role": owners[0],
                             "evidence": claims[identity][owners[0]]})
         elif len(owners) > 1:
@@ -567,6 +675,52 @@ def resolve_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) 
                 f"as a finding{detail}. Preserve the run and review the evidence."
             )
     return entries
+
+
+def apply_issue_ownership(state: RunState, entries: list[dict]) -> None:
+    for entry in entries:
+        state.issues[entry["issue"]].owner_role = entry["role"]
+
+
+def resolve_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) -> list[dict]:
+    """Validate the whole migration, then assign ownership in memory."""
+    entries = plan_issue_ownership(state, run_dir, manifest)
+    apply_issue_ownership(state, entries)
+    return entries
+
+
+def persist_issue_ownership(store: StateStore, state: RunState, run_dir: Path,
+                            manifest: Manifest) -> tuple[list[dict], RunState]:
+    """Persist a complete ownership migration with crash-recoverable audit evidence.
+
+    Every entry is validated before any issue changes. Audit events are written
+    before the ownership state, so an interruption between the two cannot lose a
+    resolution permanently: re-entry recomputes the same entries, sees the
+    retained event and completes the save. Existing conflicting audit evidence
+    refuses rather than overwriting it.
+    """
+    entries = plan_issue_ownership(state, run_dir, manifest)
+    if not entries:
+        return [], state
+    recorded: dict[str, set[str]] = {}
+    for event in store.events(state.run_id):
+        if event.get("kind") != "issue_ownership_resolved":
+            continue
+        issue, role = event.get("issue"), event.get("role")
+        if isinstance(issue, str) and isinstance(role, str):
+            recorded.setdefault(issue, set()).add(role)
+    for entry in entries:
+        previous = recorded.get(entry["issue"], set())
+        if previous and entry["role"] not in previous:
+            raise ContractError(
+                f"Ownership audit for {entry['issue']} records {', '.join(sorted(previous))}, "
+                f"but current evidence resolves {entry['role']}; refusing to overwrite it"
+            )
+    for entry in entries:
+        if entry["role"] not in recorded.get(entry["issue"], set()):
+            store.event(state.run_id, "issue_ownership_resolved", **entry)
+    apply_issue_ownership(state, entries)
+    return entries, store.save(state)
 
 
 def _same_run_artefact(recorded: str, output: Path, run_id: str) -> bool:
@@ -1372,21 +1526,17 @@ class Engine:
     def settle_issue_ownership(self, persist: bool = True) -> list[dict]:
         """Resolve legacy ownership from retained verdict evidence.
 
-        Ownership is persisted before review validation can rely on it. Events
-        are written after the state and de-duplicated by issue/role so an
-        interrupted migration does not append the same audit note twice.
+        A non-persisting call validates the whole migration and applies it only
+        in memory. A persisting call writes the complete audit evidence before
+        ownership state, so re-entry after an interruption can finish the same
+        migration without losing or duplicating resolution events.
         """
-        entries = resolve_issue_ownership(self.state, self.run_dir, self.manifest)
-        if entries and persist:
-            self.save()
-            existing = {
-                (event.get("issue"), event.get("role"))
-                for event in self.store.events(self.state.run_id)
-                if event.get("kind") == "issue_ownership_resolved"
-            }
-            for entry in entries:
-                if (entry["issue"], entry["role"]) not in existing:
-                    self.event("issue_ownership_resolved", **entry)
+        if not persist:
+            return resolve_issue_ownership(self.state, self.run_dir, self.manifest)
+        entries, saved = persist_issue_ownership(
+            self.store, self.state, self.run_dir, self.manifest)
+        if entries:
+            self.state = saved
         return entries
 
     def verify_candidate(self, candidate):
@@ -2192,9 +2342,8 @@ class Engine:
                     info["checked"] = False
                     info["status"] = "rework"
                     feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"{worker}.md"
-                    atomic_write(feedback, "# Review feedback\n\n" + "\n".join(
-                        f"Read {result.verdict_path}" for result in rework
-                        if worker in result.affected_workers))
+                    atomic_write(feedback, build_rework_feedback(
+                        worker, self.manifest, affected, rework))
                     info["feedback"] = str(feedback)
                 self.event("rework_issued", agents=sorted(affected),
                            transactions=[result.transaction for result in rework])

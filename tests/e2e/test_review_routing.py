@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from orch.contracts import (
+    ContractError,
     Discussion,
     FeatureSpec,
     Finding,
@@ -271,6 +272,32 @@ def test_concurrency_one_serializes_reviews_and_checkpoints_code_first(routing):
     assert stub.max_active == 1
     assert stub.docs_saw_code_result is True
     assert {entry.role for entry in result.review_results.values()} == {"code", "docs"}
+
+
+def test_ambiguous_legacy_ownership_escalates_without_partial_migration(routing):
+    store, state, feature, manifest, plan = routing
+    state.issues = {
+        "legacy-1": IssueState(id="legacy-1", worker="w1", root_issue_id="legacy-1"),
+        "legacy-unknown": IssueState(id="legacy-unknown", worker="w1",
+                                     root_issue_id="legacy-unknown"),
+    }
+    state = store.save(state)
+    evidence = store.run_dir(state.run_id) / "round-0" / "verdict-code.md"
+    write_markdown(evidence, Verdict(
+        reviewer="code", result="rework", candidate_sha=LIVE_CANDIDATE,
+        findings=[Finding(id="legacy-1", worker="w1", severity="major",
+                          action="rework_same_worker", root_issue_id="legacy-1",
+                          summary="legacy evidence")],
+    ), "## Body\n")
+    stub = ReviewStub(code_script=["pass"], docs_script=["pass"])
+    engine = Engine(store, state, feature, manifest, plan, adapters={"opencode": stub})
+    with pytest.raises(ContractError, match="Cannot determine owner of legacy-unknown"):
+        asyncio.run(engine.run())
+    rejected = store.load(state.run_id)
+    assert rejected.phase == "ESCALATED"
+    assert all(issue.owner_role is None for issue in rejected.issues.values())
+    assert not any(event.get("kind") == "issue_ownership_resolved"
+                   for event in store.events(state.run_id))
 
 
 def _copy_live_evidence(store: StateStore, run_id: str) -> Path:

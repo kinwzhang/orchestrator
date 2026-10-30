@@ -15,6 +15,7 @@ from orch.contracts import (
 from orch.store import StateStore
 from orch.workflow import (
     accept_review_result,
+    persist_issue_ownership,
     resolve_issue_ownership,
     review_operation_key,
     review_transaction_gaps,
@@ -229,3 +230,69 @@ def test_workflow_generated_issue_is_system_owned(tmp_path):
                                                root_issue_id="check-w1")})
     resolve_issue_ownership(state, tmp_path, manifest())
     assert state.issues["check-w1"].owner_role == "system"
+
+
+def test_ownership_migration_refusal_leaves_every_issue_untouched(tmp_path):
+    state = state_with({
+        "declared": IssueState(id="declared", worker="w1", root_issue_id="declared"),
+        "unknown": IssueState(id="unknown", worker="w1", root_issue_id="unknown"),
+    })
+    _verdict(tmp_path, "code", findings=[finding("declared")])
+    before = copy.deepcopy(state.issues)
+    with pytest.raises(ContractError, match="Cannot determine owner of unknown"):
+        resolve_issue_ownership(state, tmp_path, manifest())
+    assert state.issues == before
+    assert all(issue.owner_role is None for issue in state.issues.values())
+
+
+def test_ownership_audit_survives_state_save_interruption_without_duplicates(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({"legacy": IssueState(id="legacy", worker="w1", root_issue_id="legacy")})
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("legacy")])
+    def interrupted_save(current, *args, **kwargs):
+        raise RuntimeError("crash after audit event before ownership save")
+
+    monkeypatch.setattr(store, "save", interrupted_save)
+    with pytest.raises(RuntimeError):
+        persist_issue_ownership(store, state, run_dir, manifest())
+    monkeypatch.undo()
+
+    events = [event for event in store.events("run")
+              if event.get("kind") == "issue_ownership_resolved"]
+    assert len(events) == 1
+    assert events[0]["issue"] == "legacy" and events[0]["role"] == "code"
+    assert store.load("run").issues["legacy"].owner_role is None
+
+    reloaded = store.load("run")
+    entries, saved = persist_issue_ownership(store, reloaded, run_dir, manifest())
+    assert entries == [{"issue": "legacy", "role": "code",
+                        "evidence": [str(run_dir / "round-1" / "verdict-code.md")]}]
+    assert saved.issues["legacy"].owner_role == "code"
+    assert store.load("run").issues["legacy"].owner_role == "code"
+    assert len([event for event in store.events("run")
+                if event.get("kind") == "issue_ownership_resolved"]) == 1
+
+    entries, saved = persist_issue_ownership(store, store.load("run"), run_dir, manifest())
+    assert entries == []
+    assert len([event for event in store.events("run")
+                if event.get("kind") == "issue_ownership_resolved"]) == 1
+
+
+def test_conflicting_ownership_audit_refuses_without_overwriting(tmp_path):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({"legacy": IssueState(id="legacy", worker="w1", root_issue_id="legacy")})
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("legacy")])
+    store.event("run", "issue_ownership_resolved", issue="legacy", role="docs",
+                evidence=["conflicting record"])
+    before = store.load("run")
+    with pytest.raises(ContractError, match="refusing to overwrite"):
+        persist_issue_ownership(store, before, run_dir, manifest())
+    after = store.load("run")
+    assert after.issues["legacy"].owner_role is None
+    events = [event for event in store.events("run")
+              if event.get("kind") == "issue_ownership_resolved"]
+    assert len(events) == 1 and events[0]["role"] == "docs"
