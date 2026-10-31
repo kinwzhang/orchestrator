@@ -41,7 +41,13 @@ validation, from retained verdict evidence:
 validates every pending issue before changing any owner, so a refused entry
 leaves the whole register untouched. The audit event is written before the
 ownership state so an interrupted migration can finish on re-entry without
-losing the resolution note or writing it twice.
+losing the resolution note or writing it twice. Retained audit for one issue must
+name either no role or exactly one role. Multiple distinct roles are a conflict
+regardless of journal order; repeating the same role is accepted under the
+replay policy. Ordinary migration, audited recovery and recovery replay validate
+the complete journal and every proposed entry before appending or applying
+anything, so a conflict cannot leave earlier ownership changes partially
+applied.
 
 Platform evidence follows the same authority boundary. The orchestrator does not
 infer whether a native platform is available and never marks unverified evidence

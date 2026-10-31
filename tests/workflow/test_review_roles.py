@@ -296,3 +296,102 @@ def test_conflicting_ownership_audit_refuses_without_overwriting(tmp_path):
     events = [event for event in store.events("run")
               if event.get("kind") == "issue_ownership_resolved"]
     assert len(events) == 1 and events[0]["role"] == "docs"
+
+
+@pytest.mark.parametrize("order", [("docs", "code"), ("code", "docs")])
+def test_multiple_owner_roles_are_refused_in_either_journal_order(tmp_path, order):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({"legacy": IssueState(id="legacy", worker="w1", root_issue_id="legacy")})
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("legacy")])
+    for role in order:
+        store.event("run", "issue_ownership_resolved", issue="legacy", role=role,
+                    evidence=[f"retained {role} evidence"])
+    before = store.load("run")
+    before_events = store.events("run")
+    with pytest.raises(ContractError, match="Conflicting ownership audit for legacy"):
+        persist_issue_ownership(store, before, run_dir, manifest())
+    after = store.load("run")
+    assert after.issues["legacy"].owner_role is None
+    assert after.revision == before.revision
+    assert store.events("run") == before_events
+
+
+@pytest.mark.parametrize("order", [("docs", "code"), ("code", "docs")])
+def test_conflict_next_to_matching_evidence_still_refuses(tmp_path, order):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({"legacy": IssueState(id="legacy", worker="w1", root_issue_id="legacy")})
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("legacy")])
+    for role in order:
+        store.event("run", "issue_ownership_resolved", issue="legacy", role=role,
+                    evidence=[f"retained {role} evidence"])
+    before_events = store.events("run")
+    with pytest.raises(ContractError, match="Conflicting ownership audit for legacy"):
+        persist_issue_ownership(store, store.load("run"), run_dir, manifest())
+    assert store.events("run") == before_events
+    assert store.load("run").issues["legacy"].owner_role is None
+
+
+def test_same_role_duplicate_audit_is_idempotent_and_adds_no_event(tmp_path):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({"legacy": IssueState(id="legacy", worker="w1", root_issue_id="legacy")})
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("legacy")])
+    for evidence in ("first retained copy", "second retained copy"):
+        store.event("run", "issue_ownership_resolved", issue="legacy", role="code",
+                    evidence=[evidence])
+    entries, saved = persist_issue_ownership(store, store.load("run"), run_dir, manifest())
+    assert entries == [{"issue": "legacy", "role": "code",
+                        "evidence": [str(run_dir / "round-1" / "verdict-code.md")]}]
+    assert saved.issues["legacy"].owner_role == "code"
+    events = [event for event in store.events("run")
+              if event.get("kind") == "issue_ownership_resolved"]
+    assert len(events) == 2
+    entries, _ = persist_issue_ownership(store, store.load("run"), run_dir, manifest())
+    assert entries == []
+    assert len([event for event in store.events("run")
+                if event.get("kind") == "issue_ownership_resolved"]) == 2
+
+
+@pytest.mark.parametrize("role,evidence,match", [
+    ("worker", ["label"], "unsupported role"),
+    ("code", [], "malformed evidence"),
+    ("code", "not-a-list", "malformed evidence"),
+])
+def test_malformed_ownership_audit_is_refused(tmp_path, role, evidence, match):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({"legacy": IssueState(id="legacy", worker="w1", root_issue_id="legacy")})
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("legacy")])
+    store.event("run", "issue_ownership_resolved", issue="legacy", role=role,
+                evidence=evidence)
+    before = store.load("run")
+    with pytest.raises(ContractError, match=match):
+        persist_issue_ownership(store, before, run_dir, manifest())
+    assert store.load("run").issues["legacy"].owner_role is None
+
+
+def test_later_ownership_conflict_does_not_apply_earlier_entries(tmp_path):
+    store = StateStore(tmp_path / "state")
+    run_dir = store.run_dir("run")
+    state = state_with({
+        "first": IssueState(id="first", worker="w1", root_issue_id="first"),
+        "last": IssueState(id="last", worker="w1", root_issue_id="last"),
+    })
+    state = store.save(state)
+    _verdict(run_dir, "code", findings=[finding("first"), finding("last")])
+    store.event("run", "issue_ownership_resolved", issue="last", role="docs",
+                evidence=["conflicting late record"])
+    before = store.load("run")
+    before_events = store.events("run")
+    with pytest.raises(ContractError, match="Ownership audit for last records docs"):
+        persist_issue_ownership(store, before, run_dir, manifest())
+    after = store.load("run")
+    assert after.issues["first"].owner_role is None
+    assert after.issues["last"].owner_role is None
+    assert store.events("run") == before_events

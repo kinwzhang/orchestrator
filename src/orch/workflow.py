@@ -689,35 +689,107 @@ def resolve_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) 
     return entries
 
 
+_OWNERSHIP_ROLES = frozenset({"code", "docs", "system"})
+
+
+def retained_ownership_evidence(events: list[dict]) -> dict[str, str]:
+    """Validate all retained ownership audit and return issue -> single role.
+
+    The check is order-independent and considers the complete role set. One
+    issue carrying two distinct roles is contradictory regardless of which event
+    came first or whether one role matches a proposed owner. Malformed or
+    unsupported records refuse with the offending issue/event named. Repeated
+    events for the same role are accepted under the documented replay policy.
+    """
+    recorded: dict[str, dict] = {}
+    for event in events:
+        if event.get("kind") != "issue_ownership_resolved":
+            continue
+        issue = event.get("issue")
+        role = event.get("role")
+        evidence = event.get("evidence")
+        event_id = event.get("id")
+        if not isinstance(issue, str) or not issue:
+            raise ContractError(
+                f"Ownership audit event {event_id} has no usable issue identity"
+            )
+        if role not in _OWNERSHIP_ROLES:
+            raise ContractError(
+                f"Ownership audit for {issue} event {event_id} has unsupported role "
+                f"{role!r}; expected code, docs or system"
+            )
+        if (not isinstance(evidence, list) or not evidence
+                or not all(isinstance(item, str) and item for item in evidence)):
+            raise ContractError(
+                f"Ownership audit for {issue} event {event_id} has malformed evidence"
+            )
+        item = recorded.setdefault(issue, {"roles": set(), "events": []})
+        item["roles"].add(role)
+        item["events"].append(event_id)
+    resolved: dict[str, str] = {}
+    for issue, item in recorded.items():
+        if len(item["roles"]) > 1:
+            raise ContractError(
+                f"Conflicting ownership audit for {issue}: events "
+                f"{', '.join(str(value) for value in item['events'])} record roles "
+                f"{', '.join(sorted(item['roles']))}; refusing to choose one"
+            )
+        resolved[issue] = next(iter(item["roles"]))
+    return resolved
+
+
+def validate_ownership_audit(events: list[dict], entries: list[dict]) -> dict[str, str]:
+    """Validate the complete retained audit and every proposed ownership entry."""
+    retained = retained_ownership_evidence(events)
+    if not isinstance(entries, list):
+        raise ContractError("Proposed ownership evidence is not a list")
+    proposed: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ContractError("Proposed ownership entry is not a mapping")
+        issue, role = entry.get("issue"), entry.get("role")
+        evidence = entry.get("evidence")
+        if not isinstance(issue, str) or not issue:
+            raise ContractError("Proposed ownership entry has no usable issue identity")
+        if role not in _OWNERSHIP_ROLES:
+            raise ContractError(
+                f"Proposed ownership for {issue} has unsupported role {role!r}"
+            )
+        if (not isinstance(evidence, list) or not evidence
+                or not all(isinstance(item, str) and item for item in evidence)):
+            raise ContractError(f"Proposed ownership for {issue} has malformed evidence")
+        if issue in proposed and proposed[issue] != role:
+            raise ContractError(
+                f"Proposed ownership for {issue} names both {proposed[issue]} and {role}"
+            )
+        proposed[issue] = role
+    for issue, role in proposed.items():
+        previous = retained.get(issue)
+        if previous is not None and previous != role:
+            raise ContractError(
+                f"Ownership audit for {issue} records {previous}, but current evidence "
+                f"resolves {role}; refusing to overwrite or extend it"
+            )
+    return retained
+
+
 def persist_issue_ownership(store: StateStore, state: RunState, run_dir: Path,
                             manifest: Manifest) -> tuple[list[dict], RunState]:
     """Persist a complete ownership migration with crash-recoverable audit evidence.
 
-    Every entry is validated before any issue changes. Audit events are written
-    before the ownership state, so an interruption between the two cannot lose a
-    resolution permanently: re-entry recomputes the same entries, sees the
-    retained event and completes the save. Existing conflicting audit evidence
-    refuses rather than overwriting it.
+    The complete retained audit and every proposed entry are validated before
+    any issue, event or state mutation. Audit events are written before the
+    ownership state, so an interruption between the two cannot lose a resolution
+    permanently: re-entry recomputes the same entries, sees the retained event
+    and completes the save. Contradictory audit is never repaired by appending a
+    second role.
     """
     entries = plan_issue_ownership(state, run_dir, manifest)
+    retained = validate_ownership_audit(store.events(state.run_id), entries)
     if not entries:
         return [], state
-    recorded: dict[str, set[str]] = {}
-    for event in store.events(state.run_id):
-        if event.get("kind") != "issue_ownership_resolved":
-            continue
-        issue, role = event.get("issue"), event.get("role")
-        if isinstance(issue, str) and isinstance(role, str):
-            recorded.setdefault(issue, set()).add(role)
     for entry in entries:
-        previous = recorded.get(entry["issue"], set())
-        if previous and entry["role"] not in previous:
-            raise ContractError(
-                f"Ownership audit for {entry['issue']} records {', '.join(sorted(previous))}, "
-                f"but current evidence resolves {entry['role']}; refusing to overwrite it"
-            )
-    for entry in entries:
-        if entry["role"] not in recorded.get(entry["issue"], set()):
+        if entry["issue"] not in retained:
             store.event(state.run_id, "issue_ownership_resolved", **entry)
     apply_issue_ownership(state, entries)
     return entries, store.save(state)
@@ -883,15 +955,10 @@ def _review_recovery_event(events: list[dict], key: str) -> dict | None:
 
 
 def _audit_ownership_entries(store: StateStore, run_id: str, entries: list[dict]) -> None:
-    if not entries:
-        return
-    existing = {
-        (event.get("issue"), event.get("role"))
-        for event in store.events(run_id)
-        if event.get("kind") == "issue_ownership_resolved"
-    }
+    """Validate all retained and proposed ownership audit, then append only missing roles."""
+    retained = validate_ownership_audit(store.events(run_id), entries)
     for entry in entries:
-        if (entry.get("issue"), entry.get("role")) not in existing:
+        if entry["issue"] not in retained:
             store.event(run_id, "issue_ownership_resolved", **entry)
 
 
@@ -899,6 +966,7 @@ def _completed_review_recovery(state: RunState, events: list[dict], key: str,
                                operation: dict) -> dict:
     if not isinstance(operation, dict) or operation.get("status") != "completed":
         raise ContractError(f"Review batch recovery {key} is not complete")
+    validate_ownership_audit(events, operation.get("ownership_resolved") or [])
     event = _review_recovery_event(events, key)
     if event is None:
         raise ContractError(f"Review batch recovery {key} has no audit event")
@@ -1044,6 +1112,7 @@ def recover_review_batch(store: StateStore, feature, manifest: Manifest, plan: P
                 store, working, "review-docs", docs_path
             )
             ownership_entries = engine.settle_issue_ownership(persist=False)
+            validate_ownership_audit(store.events(run_id), ownership_entries)
             plan_role_routing(working.issues, code_verdict, manifest, "code")
             try:
                 plan_role_routing(working.issues, docs_verdict, manifest, "docs")
@@ -1147,6 +1216,8 @@ def recover_review_batch(store: StateStore, feature, manifest: Manifest, plan: P
         _cwd, inputs, _ = engine.review_context("code", candidate)
         evidence_digest = engine.review_evidence_digest("code", candidate, inputs)
         code_key = review_operation_key("code", candidate_sha, evidence_digest)
+        validate_ownership_audit(store.events(run_id),
+                                 summary.get("ownership_resolved") or [])
         code_operation = working.operations.get(code_key)
         if (isinstance(code_operation, dict)
                 and code_operation.get("status") == "completed"):

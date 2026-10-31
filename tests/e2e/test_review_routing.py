@@ -403,6 +403,10 @@ def test_exact_live_partial_batch_recovery_is_audited_and_idempotent(tmp_path, m
     assert len([event for event in events if event.get("kind") == "review_batch_recovered"]) == 1
     assert len([event for event in events if event.get("kind") == "review_result_rejected"
                 and event.get("role") == "docs"]) == 1
+    ownership_events = [event for event in events
+                        if event.get("kind") == "issue_ownership_resolved"]
+    assert len(ownership_events) == 5
+    assert len({event["issue"] for event in ownership_events}) == 5
     assert recovered.operations[key]["status"] == "completed"
 
     revision = recovered.revision
@@ -412,5 +416,71 @@ def test_exact_live_partial_batch_recovery_is_audited_and_idempotent(tmp_path, m
     )
     assert again["status"] == "already-recovered"
     assert store.load(state.run_id).revision == revision
+    assert len([event for event in store.events(state.run_id)
+                if event.get("kind") == "issue_ownership_resolved"]) == 5
     assert hashlib.sha256(live_state.read_bytes()).hexdigest() == live_state_hash
     assert hashlib.sha256((LIVE_RUN / "events.jsonl").read_bytes()).hexdigest() == live_events_hash
+
+
+@pytest.mark.skipif(
+    not (LIVE_RUN / "state.json").exists()
+    or not Path("/home/zwj808/PycharmProjects/orc2610_bootstrap_workspaces/feature").exists(),
+    reason="live model-preferences-cli evidence is not present on this machine",
+)
+@pytest.mark.parametrize("retained_roles,error", [
+    (["docs"], "records docs"),
+    (["docs", "code"], "Conflicting ownership audit"),
+    (["code", "docs"], "Conflicting ownership audit"),
+])
+def test_legacy_recovery_refuses_conflicting_ownership_without_writes(
+        tmp_path, retained_roles, error):
+    from orch.config import effective_feature, load_config
+    from orch.contracts import FeatureSpec as Feature
+
+    candidate = LIVE_RUN / "worktrees" / "integration-2"
+    if head(candidate) != LIVE_CANDIDATE or git(candidate, "status", "--porcelain").strip():
+        pytest.skip("live candidate worktree is not clean at the reviewed SHA")
+    store = StateStore(tmp_path / "state")
+    run_dir = _copy_live_evidence(store, "model-preferences-cli-5ec7f5ee")
+    state = store.load("model-preferences-cli-5ec7f5ee")
+    plan = Path(state.workspace["feature_path"]) / ".plans" / state.slug
+    feature_source = plan / "feature.md"
+    feature, _ = read_markdown(feature_source, Feature)
+    feature = effective_feature(
+        feature, load_config(Path(state.workspace["repo"])), feature_source)
+    manifest, _ = read_markdown(plan / "manifest.md", Manifest)
+    feature.limits = manifest.limits
+
+    for role in retained_roles:
+        store.event(
+            state.run_id, "issue_ownership_resolved", issue="code-w01-05", role=role,
+            evidence=["temporary copied-journal injection"],
+        )
+    state_bytes = (run_dir / "state.json").read_bytes()
+    journal_bytes = (run_dir / "events.jsonl").read_bytes()
+    counters = {
+        identity: issue.assignments[0].model_dump()
+        for identity, issue in state.issues.items()
+    }
+
+    with pytest.raises(ContractError, match=error):
+        recover_review_batch(
+            store, feature, manifest, plan, state.run_id,
+            operator="conflict-test", reason="dry-run conflict", dry_run=True,
+        )
+    assert (run_dir / "state.json").read_bytes() == state_bytes
+    assert (run_dir / "events.jsonl").read_bytes() == journal_bytes
+
+    with pytest.raises(ContractError, match=error):
+        recover_review_batch(
+            store, feature, manifest, plan, state.run_id,
+            operator="conflict-test", reason="refused conflict",
+        )
+    after = store.load(state.run_id)
+    assert (run_dir / "state.json").read_bytes() == state_bytes
+    assert (run_dir / "events.jsonl").read_bytes() == journal_bytes
+    assert {identity: issue.assignments[0].model_dump()
+            for identity, issue in after.issues.items()} == counters
+    assert not any(key.startswith("review-batch-recovery:") for key in after.operations)
+    assert len([event for event in store.events(state.run_id)
+                if event.get("kind") == "issue_ownership_resolved"]) == len(retained_roles)
