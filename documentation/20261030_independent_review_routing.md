@@ -101,15 +101,17 @@ The provenance field is additive and optional. State written before it existed
 loads with no value. Routing derives a missing mark from completed review
 transactions: each transaction retains the complete pre-routing register and the
 accepted verdict, so the repair ordinal a review actually assessed is durable
-evidence. The derived mark is accepted only when the distinct unsuccessful
-outcomes in that evidence agree with the failure counter and the assessed ordinal
-does not exceed the repair counter. Counters alone never prove an assessment: a
-history with no completed review evidence, a duplicate charge for the same
-repair, an understated failure count, or explicit provenance that disagrees with
-retained evidence is refused with an actionable error. Legacy counters are
-preserved; the run is not silently granted or charged another allowance. Audit
-the retained transactions and use an approved recovery when the evidence is
-contradictory.
+evidence. Ordinal zero is initial work before any repair; a finding there records
+an assessment of that initial work and can establish a mark of zero, but it never
+counts as an unsuccessful repair. The derived mark is accepted only when the
+distinct unsuccessful actual-repair outcomes in that evidence agree with the
+failure counter and the assessed ordinal does not exceed the repair counter.
+Counters alone never prove an assessment: a history with no completed review
+evidence, a duplicate charge for the same repair, an understated failure count,
+or explicit provenance that disagrees with retained evidence is refused with an
+actionable error. Legacy counters are preserved; the run is not silently granted
+or charged another allowance. Audit the retained transactions and use an
+approved recovery when the evidence is contradictory.
 
 ## Validation and transactions
 

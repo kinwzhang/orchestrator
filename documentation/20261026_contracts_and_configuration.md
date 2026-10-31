@@ -143,7 +143,9 @@ a fresh verdict for the current inputs without charging a second failed repair
 for unchanged worker work. The per-assignment assessment mark records the repair
 outcome already judged; a missing mark is derived from completed review
 transactions and retained evidence, and ambiguous or contradictory histories are
-refused rather than reinterpreted from counters. A root issue can have child
+refused rather than reinterpreted from counters. A finding recorded before the
+first repair establishes an initial-work assessment but does not consume a
+failed-repair allowance. A root issue can have child
 and grandchild issues; discovering a great-grandchild escalates the root
 without dispatching its fix. A malformed verdict gets one repair call before
 escalation.

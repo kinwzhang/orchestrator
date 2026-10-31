@@ -746,3 +746,165 @@ def test_reconstructed_batch_reacceptance_is_crash_safe(tmp_path, monkeypatch, b
     assert len([event for event in store.events("run")
                 if event.get("kind") == "review_result_accepted"]) == 1
     assert review_transaction_gaps(replay, store.events("run")) == []
+
+
+@pytest.mark.parametrize("missing_mark", [False, True])
+def test_initial_ordinal_zero_finding_then_first_repair_charges_once(tmp_path, missing_mark):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    state = state_with({"code-1": _charged_issue(
+        repairs=0, failed_repairs=0, review_rounds=0, assessed_repairs=None)})
+    state = store.save(state)
+
+    state, _ = _accept_with_evidence(store, state, tmp_path, "code", verdict, "a" * 64)
+    after_first = store.load("run")
+    assignment = after_first.issues["code-1"].assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (0, 0, 0, 0)
+
+    # The worker performs the first actual repair.
+    after_first.issues["code-1"].assignments[-1].repairs = 1
+    if missing_mark:
+        after_first.issues["code-1"].assignments[-1].assessed_repairs = None
+    after_first = store.save(after_first)
+
+    state, _ = _accept_with_evidence(store, after_first, tmp_path, "code", verdict, "b" * 64)
+    after_second = store.load("run")
+    issue = after_second.issues["code-1"]
+    assert len(issue.assignments) == 1
+    assignment = issue.assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)
+
+    # Revalidating the first actual repair does not charge it again.
+    _, third = _accept_with_evidence(store, state, tmp_path, "code", verdict, "c" * 64)
+    after_third = store.load("run")
+    assignment = after_third.issues["code-1"].assignments[-1]
+    assert (assignment.failed_repairs, assignment.review_rounds) == (1, 1)
+    _, replay = _accept_with_evidence(store, after_third, tmp_path, "code", verdict, "c" * 64)
+    assert replay == third
+    assert len(store.load("run").issues["code-1"].assignments) == 1
+
+    # A genuinely new second unsuccessful repair still exhausts the allowance.
+    repaired = store.load("run")
+    repaired.issues["code-1"].assignments[-1].repairs = 2
+    repaired = store.save(repaired)
+    state, _ = _accept_with_evidence(store, repaired, tmp_path, "code", verdict, "d" * 64)
+    after_fourth = store.load("run")
+    issue = after_fourth.issues["code-1"]
+    assert len(issue.assignments) == 2
+    assert (issue.assignments[0].failed_repairs,
+            issue.assignments[0].review_rounds) == (2, 2)
+
+
+def test_repeated_approval_revalidation_of_unrepaired_work_does_not_charge(tmp_path):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    state = state_with({"code-1": _charged_issue(
+        repairs=0, failed_repairs=0, review_rounds=0, assessed_repairs=None)})
+    state = store.save(state)
+    for evidence in ("a" * 64, "b" * 64, "c" * 64):
+        state, _ = _accept_with_evidence(store, state, tmp_path, "code", verdict, evidence)
+        assignment = store.load("run").issues["code-1"].assignments[-1]
+        assert (assignment.repairs, assignment.failed_repairs,
+                assignment.review_rounds, assignment.assessed_repairs) == (0, 0, 0, 0)
+    after = store.load("run")
+    assert len(after.issues["code-1"].assignments) == 1
+    assert len([result for result in after.review_results.values()
+                if result.role == "code"]) == 3
+
+
+def test_ordinal_zero_finding_does_not_mask_a_failed_counter(tmp_path):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    base = _charged_issue(repairs=0, failed_repairs=0, review_rounds=0,
+                          assessed_repairs=0)
+    key, operation = _completed_review_operation(verdict, base, "a" * 64)
+    issue = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                           assessed_repairs=None)
+    state = state_with({"code-1": issue})
+    state.operations = {key: operation}
+    state = store.save(state)
+    before = store.load("run")
+
+    with pytest.raises(ContractError, match="only 0 distinct unsuccessful"):
+        _accept_with_evidence(store, store.load("run"), tmp_path, "code", verdict,
+                              "b" * 64)
+    after = store.load("run")
+    assert after.model_dump(mode="json") == before.model_dump(mode="json")
+    assert store.events("run") == []
+
+
+def test_ordinal_zero_evidence_still_validates_explicit_assessment(tmp_path):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    base = _charged_issue(repairs=0, failed_repairs=0, review_rounds=0,
+                          assessed_repairs=0)
+    key, operation = _completed_review_operation(verdict, base, "a" * 64)
+    issue = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                           assessed_repairs=1)
+    state = state_with({"code-1": issue})
+    state.operations = {key: operation}
+    state = store.save(state)
+    before = store.load("run")
+
+    with pytest.raises(ContractError, match="retained reviews assessed outcome 0"):
+        _accept_with_evidence(store, store.load("run"), tmp_path, "code", verdict,
+                              "b" * 64)
+    after = store.load("run")
+    assert after.model_dump(mode="json") == before.model_dump(mode="json")
+    assert store.events("run") == []
+
+
+def test_missing_mark_with_ordinal_zero_evidence_revalidates_without_charge(tmp_path):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    base = _charged_issue(repairs=0, failed_repairs=0, review_rounds=0,
+                          assessed_repairs=0)
+    key, operation = _completed_review_operation(verdict, base, "a" * 64)
+    issue = _charged_issue(repairs=0, failed_repairs=0, review_rounds=0,
+                           assessed_repairs=None)
+    state = state_with({"code-1": issue})
+    state.operations = {key: operation}
+    state = store.save(state)
+
+    state, first = _accept_with_evidence(store, state, tmp_path, "code", verdict, "b" * 64)
+    assignment = store.load("run").issues["code-1"].assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (0, 0, 0, 0)
+    _, second = _accept_with_evidence(store, state, tmp_path, "code", verdict, "c" * 64)
+    assignment = store.load("run").issues["code-1"].assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (0, 0, 0, 0)
+    assert first.transaction != second.transaction
+
+
+def test_live_shaped_ordinal_zero_then_first_repair_review(tmp_path):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-w01-05")])
+    state = state_with({"code-w01-05": _charged_issue(
+        identity="code-w01-05", repairs=0, failed_repairs=0, review_rounds=0,
+        assessed_repairs=None)})
+    state = store.save(state)
+
+    state, _ = _accept_with_evidence(store, state, tmp_path, "code", verdict, "a" * 64)
+    assignment = store.load("run").issues["code-w01-05"].assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (0, 0, 0, 0)
+
+    repaired = store.load("run")
+    repaired.issues["code-w01-05"].assignments[-1].repairs = 1
+    repaired = store.save(repaired)
+    state, _ = _accept_with_evidence(store, repaired, tmp_path, "code", verdict, "b" * 64)
+    after = store.load("run")
+    issue = after.issues["code-w01-05"]
+    assert len(issue.assignments) == 1
+    assignment = issue.assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)

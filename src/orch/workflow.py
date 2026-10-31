@@ -278,6 +278,17 @@ def repair_assessment_evidence(
     return evidence
 
 
+def _failed_repair_ordinals(records: dict[int, dict[str, list[str]]]) -> set[int]:
+    """Return repair ordinals assessed as unsuccessful actual repairs.
+
+    Ordinal zero is initial work before any repair has been dispatched. A
+    finding there is valid assessment provenance and establishes a mark of zero,
+    but it never consumes a failed-repair allowance because no repair happened.
+    """
+    return {ordinal for ordinal, record in records.items()
+            if ordinal > 0 and record["findings"]}
+
+
 def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
                              records: dict[int, dict[str, list[str]]]) -> int:
     """Derive an assessment mark from completed-review evidence or refuse."""
@@ -293,7 +304,7 @@ def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
         # An open issue with no failure charge, no review round and no completed
         # review evidence has not had a repair outcome assessed yet.
         return 0
-    failure_ordinals = {ordinal for ordinal, record in records.items() if record["findings"]}
+    failure_ordinals = _failed_repair_ordinals(records)
     if assignment.failed_repairs > len(failure_ordinals):
         raise ContractError(
             f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
@@ -356,8 +367,7 @@ def derive_repair_assessment(
                 f"as assessed but retained reviews assessed outcome {evidence_mark}. "
                 "Explicit provenance disagrees with the retained evidence; refusing to continue."
             )
-        failure_ordinals = {ordinal for ordinal, record in records.items()
-                            if record["findings"]}
+        failure_ordinals = _failed_repair_ordinals(records)
         if assignment.failed_repairs != len(failure_ordinals):
             raise ContractError(
                 f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
