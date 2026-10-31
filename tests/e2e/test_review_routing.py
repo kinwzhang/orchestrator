@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from orch.contracts import (
+    AssignmentState,
     ContractError,
     Discussion,
     FeatureSpec,
@@ -27,7 +28,14 @@ from orch.contracts import (
 )
 from orch.git_ops import GitWorkspace, git, head
 from orch.store import StateStore, atomic_write
-from orch.workflow import Engine, Escalation, recover_review_batch
+from orch.workflow import (
+    ApprovalRequired,
+    Engine,
+    Escalation,
+    approval_hashes,
+    plan_role_routing,
+    recover_review_batch,
+)
 
 LIVE_RUN = Path("/home/zwj808/.local/state/orch/runs/model-preferences-cli-5ec7f5ee")
 LIVE_CANDIDATE = "4f134f315b9ab85e2058452b9895946f579355bd"
@@ -90,6 +98,13 @@ class ReviewStub:
                            findings=[Finding(id="code-1", worker="w1", severity="major",
                                              action="rework_same_worker", summary="fix",
                                              root_issue_id="code-1")])
+        if kind == "rework-live-shaped":
+            assert role == "code"
+            return Verdict(reviewer=role, result="rework", candidate_sha=candidate_sha,
+                           findings=[Finding(id=identity, worker="w1", severity="major",
+                                             action="rework_same_worker", summary="fix",
+                                             root_issue_id=identity)
+                                     for identity in ("code-w01-02", "code-w01-03")])
         raise AssertionError(f"unknown stub verdict {kind}")
 
 
@@ -274,6 +289,86 @@ def test_concurrency_one_serializes_reviews_and_checkpoints_code_first(routing):
     assert {entry.role for entry in result.review_results.values()} == {"code", "docs"}
 
 
+def _round_two_review_state(store, state, feature, manifest, plan, issues):
+    """Prepare an immutable REVIEW checkpoint with retained issue counters."""
+    feature_path = Path(state.workspace["feature_path"])
+    sha = head(feature_path)
+    handover = store.run_dir(state.run_id) / "round-2" / "handover" / "w1-6.md"
+    write_markdown(handover, Handover(
+        agent="w1", round=2, status="done", files_changed=[], docs_changed=[],
+        checks_run=[]), "## Interfaces and contracts\n\nRetained evidence.\n")
+    state.stage = "REVIEW"
+    state.phase = "APPROVED"
+    state.round = 2
+    state.error = None
+    state.candidate = {
+        "sha": sha, "path": str(feature_path), "source_shas": [sha],
+        "branch": state.workspace["feature_branch"],
+    }
+    state.workers = {"w1": {
+        "attempt": 6, "handover": str(handover), "status": "done", "checked": True,
+        "sha": sha, "attempt_id": "worker-w1-6", "infrastructure_retries": 0,
+    }}
+    state.issues = issues
+    state.approved_hashes = approval_hashes(plan, manifest, feature)
+    return store.save(state), sha
+
+
+def test_approval_only_runtime_extension_revalidates_without_recharging(routing):
+    store, state, feature, manifest, plan = routing
+    issues = {
+        identity: IssueState(
+            id=identity, worker="w1", root_issue_id=identity, owner_role="code",
+            status="open",
+            assignments=[AssignmentState(
+                repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=None)])
+        for identity in ("code-w01-02", "code-w01-03")
+    }
+    state, sha = _round_two_review_state(store, state, feature, manifest, plan, issues)
+    retained_approval = dict(state.approved_hashes)
+
+    # The operator extends only this run's runtime budget. The approved inputs
+    # change, so the workflow must refuse to continue before any dispatch.
+    extended = feature.model_copy(deep=True)
+    extended.limits = extended.limits.model_copy(update={"max_runtime_min": 2880})
+    stub = ReviewStub(code_script=["rework-live-shaped"], docs_script=["pass"])
+    engine = Engine(store, state, extended, manifest, plan, adapters={"opencode": stub})
+    with pytest.raises(ApprovalRequired):
+        asyncio.run(engine.run(one_stage=True))
+    assert stub.calls == []
+    invalidated = store.load(state.run_id)
+    assert invalidated.phase == "PLAN_READY"
+    assert invalidated.approved_hashes == retained_approval
+    for identity in issues:
+        assert invalidated.issues[identity].assignments[-1].failed_repairs == 1
+
+    # Reapproval covers only the changed inputs. The retained verdict is not
+    # rebound: a fresh reviewer run is still required against the new approval.
+    invalidated.approved_hashes = approval_hashes(plan, manifest, extended)
+    invalidated.phase = "APPROVED"
+    invalidated.error = None
+    invalidated.stage = "REVIEW"
+    invalidated = store.save(invalidated)
+    stub = ReviewStub(code_script=["rework-live-shaped"], docs_script=["pass"])
+    engine = Engine(store, invalidated, extended, manifest, plan, adapters={"opencode": stub})
+    asyncio.run(engine.run(one_stage=True))
+
+    result = store.load(state.run_id)
+    assert [call.role for call in stub.calls].count("code_reviewer") == 1
+    assert result.candidate["sha"] == sha
+    assert result.workers["w1"]["attempt"] == 6
+    code_results = [entry for entry in result.review_results.values() if entry.role == "code"]
+    assert len(code_results) == 1
+    assert (result.approved_hashes["effective_configuration"]
+            != retained_approval["effective_configuration"])
+    for identity in issues:
+        issue = result.issues[identity]
+        assert len(issue.assignments) == 1
+        assignment = issue.assignments[-1]
+        assert (assignment.repairs, assignment.failed_repairs,
+                assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)
+
+
 def test_ambiguous_legacy_ownership_escalates_without_partial_migration(routing):
     store, state, feature, manifest, plan = routing
     state.issues = {
@@ -319,6 +414,50 @@ def _copy_live_evidence(store: StateStore, run_id: str) -> Path:
     or not Path("/home/zwj808/PycharmProjects/orc2610_bootstrap_workspaces/feature").exists(),
     reason="live model-preferences-cli evidence is not present on this machine",
 )
+def test_retained_live_round_two_revalidation_keeps_repair_counters(tmp_path):
+    store = StateStore(tmp_path / "state")
+    run_id = "model-preferences-cli-5ec7f5ee"
+    run_dir = _copy_live_evidence(store, run_id)
+    state = store.load(run_id)
+    live_state_hash = hashlib.sha256((LIVE_RUN / "state.json").read_bytes()).hexdigest()
+    live_events_hash = hashlib.sha256((LIVE_RUN / "events.jsonl").read_bytes()).hexdigest()
+    for identity in ("code-w01-02", "code-w01-03"):
+        issue = state.issues.get(identity)
+        if issue is None:
+            pytest.skip("live issue evidence has advanced")
+        assignment = issue.assignments[-1]
+        if (assignment.repairs, assignment.failed_repairs,
+                assignment.review_rounds) != (1, 1, 1):
+            pytest.skip("live repair counters have advanced")
+    verdict_path = run_dir / "round-2" / "verdict-code.md"
+    verdict, _ = read_markdown(verdict_path, Verdict)
+    manifest = Manifest(slug="model-preferences-cli", branch=state.workspace["feature_branch"],
+                        workers=[{"id": "w01", "title": "live worker",
+                                  "instruction": "workers/w01.md",
+                                  "allowed_paths": ["src/**", "tests/**"]}])
+    before = state.model_dump(mode="json")
+    plan = plan_role_routing(state.issues, verdict, manifest, "code")
+    assert plan.escalation is None
+    for identity in ("code-w01-02", "code-w01-03"):
+        issue = plan.issues[identity]
+        assert len(issue.assignments) == 1
+        assignment = issue.assignments[-1]
+        assert (assignment.repairs, assignment.failed_repairs,
+                assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)
+        assert issue.status == "open"
+    assert plan.issues["code-w01-05"].assignments[-1].review_rounds == 1
+    assert plan.issues["code-w01-05"].assignments[-1].failed_repairs == 0
+    assert state.model_dump(mode="json") == before
+    assert store.load(run_id).model_dump(mode="json") == before
+    assert hashlib.sha256((LIVE_RUN / "state.json").read_bytes()).hexdigest() == live_state_hash
+    assert hashlib.sha256((LIVE_RUN / "events.jsonl").read_bytes()).hexdigest() == live_events_hash
+
+
+@pytest.mark.skipif(
+    not (LIVE_RUN / "state.json").exists()
+    or not Path("/home/zwj808/PycharmProjects/orc2610_bootstrap_workspaces/feature").exists(),
+    reason="live model-preferences-cli evidence is not present on this machine",
+)
 def test_exact_live_partial_batch_recovery_is_audited_and_idempotent(tmp_path, monkeypatch):
     from orch.config import effective_feature, load_config
     from orch.contracts import FeatureSpec as Feature
@@ -339,6 +478,40 @@ def test_exact_live_partial_batch_recovery_is_audited_and_idempotent(tmp_path, m
         feature, load_config(Path(state.workspace["repo"])), feature_source)
     manifest, _ = read_markdown(plan / "manifest.md", Manifest)
     feature.limits = manifest.limits
+
+    completed_recovery = [
+        key for key, operation in state.operations.items()
+        if key.startswith("review-batch-recovery:")
+        and isinstance(operation, dict) and operation.get("status") == "completed"
+    ]
+    if completed_recovery:
+        # The operator has since completed the audited recovery and extended the
+        # runtime budget. The pre-batch inversion is no longer applicable, so
+        # verify that the recorded decision replays idempotently and that the
+        # live evidence was never mutated by this test.
+        assert len(completed_recovery) == 1
+        key = completed_recovery[0]
+        recorded = state.operations[key]
+        before_state = (run_dir / "state.json").read_bytes()
+        summary = recover_review_batch(
+            store, feature, manifest, plan, state.run_id,
+            operator="repair-test", reason="dry run after completed recovery",
+            dry_run=True,
+        )
+        assert summary["status"] == "already-recovered"
+        assert summary["transaction"] == key
+        assert summary["accepted_transaction"] == recorded["accepted_transaction"]
+        assert recorded["accepted_transaction"] in state.review_results
+        assert store.load(state.run_id).model_dump(mode="json") == state.model_dump(mode="json")
+        assert (run_dir / "state.json").read_bytes() == before_state
+        for identity in ("code-w01-02", "code-w01-03"):
+            assignment = state.issues[identity].assignments[0]
+            assert (assignment.repairs, assignment.failed_repairs,
+                    assignment.review_rounds) == (1, 1, 1)
+        assert state.issues["code-w01-05"].owner_role == "code"
+        assert hashlib.sha256(live_state.read_bytes()).hexdigest() == live_state_hash
+        assert hashlib.sha256((LIVE_RUN / "events.jsonl").read_bytes()).hexdigest() == live_events_hash
+        return
 
     before_state = (run_dir / "state.json").read_bytes()
     summary = recover_review_batch(
@@ -456,14 +629,21 @@ def test_legacy_recovery_refuses_conflicting_ownership_without_writes(
             state.run_id, "issue_ownership_resolved", issue="code-w01-05", role=role,
             evidence=["temporary copied-journal injection"],
         )
+    expected_error = error
+    retained_owner = state.issues["code-w01-05"].owner_role
+    if retained_owner is not None and any(role != retained_owner for role in retained_roles):
+        expected_error = "Conflicting ownership audit"
     state_bytes = (run_dir / "state.json").read_bytes()
     journal_bytes = (run_dir / "events.jsonl").read_bytes()
     counters = {
         identity: issue.assignments[0].model_dump()
         for identity, issue in state.issues.items()
     }
+    operations_before = set(store.load(state.run_id).operations)
+    ownership_events_before = len([event for event in store.events(state.run_id)
+                                   if event.get("kind") == "issue_ownership_resolved"])
 
-    with pytest.raises(ContractError, match=error):
+    with pytest.raises(ContractError, match=expected_error):
         recover_review_batch(
             store, feature, manifest, plan, state.run_id,
             operator="conflict-test", reason="dry-run conflict", dry_run=True,
@@ -471,7 +651,7 @@ def test_legacy_recovery_refuses_conflicting_ownership_without_writes(
     assert (run_dir / "state.json").read_bytes() == state_bytes
     assert (run_dir / "events.jsonl").read_bytes() == journal_bytes
 
-    with pytest.raises(ContractError, match=error):
+    with pytest.raises(ContractError, match=expected_error):
         recover_review_batch(
             store, feature, manifest, plan, state.run_id,
             operator="conflict-test", reason="refused conflict",
@@ -481,6 +661,6 @@ def test_legacy_recovery_refuses_conflicting_ownership_without_writes(
     assert (run_dir / "events.jsonl").read_bytes() == journal_bytes
     assert {identity: issue.assignments[0].model_dump()
             for identity, issue in after.issues.items()} == counters
-    assert not any(key.startswith("review-batch-recovery:") for key in after.operations)
+    assert set(after.operations) == operations_before
     assert len([event for event in store.events(state.run_id)
-                if event.get("kind") == "issue_ownership_resolved"]) == len(retained_roles)
+                if event.get("kind") == "issue_ownership_resolved"]) == ownership_events_before

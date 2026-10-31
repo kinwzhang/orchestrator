@@ -187,6 +187,48 @@ class RoleRoutingPlan:
     escalation: str | None = None
 
 
+def _assess_repair_outcome(issue: IssueState, identity: str) -> bool:
+    """Return whether a finding assesses a distinct unsuccessful repair.
+
+    ``repairs`` counts worker dispatch attempts for the issue. ``assessed_repairs``
+    records the highest repair ordinal whose outcome a reviewer has already
+    judged, so each actual repair is charged at most once even when a changed
+    approval or a fresh reviewer run routes the same retained feedback again.
+    Legacy assignments without the provenance are normalised from their retained
+    counters; contradictory over-charged evidence is refused instead of guessed.
+
+    The caller owns a deep copy, so mutating the counters here cannot affect the
+    accepted register unless the whole plan validates.
+    """
+    current = issue.assignments[-1]
+    if current.repairs == 0:
+        # Reviewing work before any repair has been dispatched is a review round
+        # but cannot be an unsuccessful repair.
+        return False
+    if current.assessed_repairs is None:
+        if current.failed_repairs > current.repairs:
+            raise ContractError(
+                f"Issue {identity} records {current.failed_repairs} failed repairs for "
+                f"{current.repairs} repair attempt(s) without repair-assessment provenance. "
+                "The counters are already inconsistent, so it is ambiguous whether the "
+                "latest repair was charged. Refusing to guess or reset them; audit the "
+                "retained verdicts and use an approved recovery instead."
+            )
+        if current.failed_repairs == current.repairs:
+            # Every recorded repair already has a failure charge. Retained
+            # evidence therefore shows the current outcome was assessed.
+            current.assessed_repairs = current.repairs
+            return False
+        # At least one recorded repair has no failure charge, so this is the
+        # first assessment of a distinct unsuccessful repair.
+        current.assessed_repairs = current.repairs
+        return True
+    if current.repairs > current.assessed_repairs:
+        current.assessed_repairs = current.repairs
+        return True
+    return False
+
+
 def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
                       manifest: Manifest, role: str) -> RoleRoutingPlan:
     """Validate one role's verdict and compute its issue changes without mutating state.
@@ -258,9 +300,17 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
                 if (previous.parent_issue_id, previous.worker) != (finding.parent_issue_id, finding.worker):
                     raise ContractError(f"Issue identity changed: {identity}")
                 current = previous.assignments[-1]
-                current.review_rounds += 1
-                if current.repairs:
+                new_failed_repair = _assess_repair_outcome(previous, identity)
+                if new_failed_repair:
                     current.failed_repairs += 1
+                    current.review_rounds += 1
+                elif current.repairs == 0 and len(previous.assignments) == 1:
+                    # Preserve the historical review-call accounting for initial
+                    # work that has no repair outcome to deduplicate. A fresh
+                    # replacement with no repair yet is not initial work: a
+                    # repeated finding there is revalidation of the outcome that
+                    # caused the replacement.
+                    current.review_rounds += 1
                 previous.status = "open"
             else:
                 previous = IssueState(id=identity, worker=finding.worker, root_issue_id=root,
@@ -303,7 +353,14 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
             raise ContractError("Issue lineage has missing parents or a cycle")
 
     for identity in resolved:
-        work[identity].status = "resolved"
+        issue = work[identity]
+        issue.status = "resolved"
+        # A passing assessment covers the current repair outcome even though it
+        # is not a failure. Recording the mark stops a later revalidation of the
+        # same work from charging a repair that was already accepted.
+        current = issue.assignments[-1]
+        if current.assessed_repairs is None or current.repairs > current.assessed_repairs:
+            current.assessed_repairs = current.repairs
         touched.add(identity)
     return RoleRoutingPlan(
         issues=work, findings=findings, resolved=resolved, touched=sorted(touched),

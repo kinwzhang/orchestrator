@@ -73,6 +73,39 @@ issue register. The register is a projection of routing state that a role's own
 acceptance mutates; excluding it keeps an accepted result reusable on resume and
 avoids self-invalidation.
 
+## Repair-outcome versus review-round accounting
+
+The issue counters answer different questions and are charged separately:
+
+- `repairs` counts worker dispatch attempts for the issue in the current assignment.
+- `assessed_repairs` is the highest repair ordinal whose outcome a reviewer has
+  already judged.
+- `failed_repairs` counts distinct unsuccessful repairs, at most once per repair
+  ordinal.
+- `review_rounds` counts accepted reviewer assessments. A review of initial
+  work on a first assignment that has no dispatched repair still counts as a
+  round, but revalidating an already-assessed repair outcome does not add
+  another round, including on a replacement that has not been repaired yet.
+
+An approval-only change (for example a temporary runtime-limit extension)
+invalidates the approved-input digest and forces a fresh reviewer run and a new
+role-result transaction. It does not create a worker repair. If the candidate and
+the repair outcome are unchanged, the new verdict is validated and accepted
+against the current inputs, but the failed-repair and review-round counters stay
+put and no replacement is created. A genuinely new unsuccessful repair advances
+`repairs`; the next assessment charges `failed_repairs` once and records the new
+high-water mark, so the configured stopping and one-reassignment policy still
+applies. Replay of a partially committed transaction recomputes the same plan
+from the recorded base register and is therefore idempotent.
+
+The provenance field is additive and optional. State written before it existed
+loads with no value. Routing normalises such a record from retained counters:
+when every recorded repair already has a failure charge, the current outcome is
+treated as assessed; when an earlier repair is uncharged, the current finding
+charges once. A record with more failures than repairs has contradictory legacy
+evidence, so routing refuses with an actionable error instead of resetting
+counters or guessing whether another repair occurred.
+
 ## Validation and transactions
 
 A role verdict is fully validated before anything is written:
@@ -199,9 +232,11 @@ the helper refuses, preserve the run and review the evidence.
 
 ## Compatibility and limits
 
-- Existing state schema version 1 loads; `owner_role` and `review_results` are
-  optional additions. Older states simply have no accepted role results and no
-  ownership until migration.
+- Existing state schema version 1 loads; `owner_role`, `review_results` and the
+  per-assignment repair-assessment mark are optional additions. Older states
+  simply have no accepted role results, no ownership and no assessment mark
+  until the corresponding migration or normalisation runs. No schema version
+  bump or counter reset is required.
 - Older verdicts without `candidate_sha` remain parseable and are accepted only
   through the audited legacy recovery binding above.
 - Review verdict paths are attempt-specific for new runs. Historical

@@ -106,7 +106,9 @@ Markdown evidence), `git_ops.py` (owned git resources), `processes.py`/`agents.p
   two unsuccessful ones; each assignment gets three review rounds; an issue gets
   at most one reassignment; derived issues live at depth 0-2 and observing depth 3
   escalates the root immediately; a malformed verdict gets one repair attempt.
-  Preserve all historical counters.
+  Charge a failed repair once per actual worker repair outcome, never once per
+  review invocation: approval-only revalidation of unchanged work must not
+  consume a repair or replacement allowance. Preserve all historical counters.
 - Handovers use front matter (`agent`, `round`, `status`, `files_changed`,
   `docs_changed`, `checks_run` with name/outcome/evidence) and body sections:
   Work completed; Decisions; Interfaces and contracts; Documentation relevance;

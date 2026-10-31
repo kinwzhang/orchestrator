@@ -4,6 +4,7 @@ import copy
 import pytest
 
 from orch.contracts import (
+    AssignmentState,
     ContractError,
     Finding,
     IssueState,
@@ -395,3 +396,176 @@ def test_later_ownership_conflict_does_not_apply_earlier_entries(tmp_path):
     assert after.issues["first"].owner_role is None
     assert after.issues["last"].owner_role is None
     assert store.events("run") == before_events
+
+
+def _accept_with_evidence(store, state, tmp_path, role, verdict, evidence, name=None):
+    path = tmp_path / f"verdict-{role}-{name or evidence[:8]}.md"
+    write_markdown(path, verdict, "## Body\n\nEvidence.\n")
+    return accept_review_result(
+        store, state, role=role, candidate_sha=CANDIDATE, evidence_digest=evidence,
+        attempt_id=f"review-{role}-1-1", verdict=verdict, verdict_path=path,
+        manifest=manifest(),
+    )
+
+
+def _charged_issue(identity="code-1", repairs=1, failed_repairs=1, review_rounds=1,
+                   assessed_repairs=None):
+    return IssueState(
+        id=identity, worker="w1", root_issue_id=identity, owner_role="code",
+        status="open",
+        assignments=[AssignmentState(
+            repairs=repairs, failed_repairs=failed_repairs,
+            review_rounds=review_rounds, assessed_repairs=assessed_repairs,
+        )],
+    )
+
+
+def test_changed_approval_evidence_revalidates_without_recharging_repair(tmp_path):
+    store = StateStore(tmp_path / "state")
+    state = state_with({"code-1": _charged_issue()})
+    state = store.save(state)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+
+    state, first = _accept_with_evidence(store, state, tmp_path, "code", verdict, "a" * 64)
+    after_first = store.load("run")
+    assert after_first.issues["code-1"].assignments[-1].failed_repairs == 1
+    assert after_first.issues["code-1"].assignments[-1].review_rounds == 1
+
+    state, second = _accept_with_evidence(store, state, tmp_path, "code", verdict, "b" * 64)
+    after_second = store.load("run")
+    assignment = after_second.issues["code-1"].assignments[-1]
+    assert len(after_second.issues["code-1"].assignments) == 1
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)
+    assert first.transaction != second.transaction
+    assert set(after_second.review_results) == {first.transaction, second.transaction}
+    assert after_second.review_results[first.transaction] == first
+    assert review_transaction_gaps(after_second, store.events("run")) == []
+
+
+def test_new_worker_repair_charges_once_and_second_failure_reassigns(tmp_path):
+    store = StateStore(tmp_path / "state")
+    state = state_with({"code-1": _charged_issue()})
+    state = store.save(state)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+
+    state, _ = _accept_with_evidence(store, state, tmp_path, "code", verdict, "a" * 64)
+    # The worker performs a second, genuinely new repair.
+    state = store.load("run")
+    state.issues["code-1"].assignments[-1].repairs = 2
+    state = store.save(state)
+
+    state, _ = _accept_with_evidence(store, state, tmp_path, "code", verdict, "b" * 64)
+    after = store.load("run")
+    issue = after.issues["code-1"]
+    assert len(issue.assignments) == 2
+    assert (issue.assignments[0].failed_repairs, issue.assignments[0].review_rounds,
+            issue.assignments[0].assessed_repairs) == (2, 2, 2)
+    assert issue.assignments[-1].failed_repairs == 0
+
+    # Replaying the same accepted transaction after the reassignment is a reuse.
+    _, replay = _accept_with_evidence(store, after, tmp_path, "code", verdict, "b" * 64)
+    assert replay == after.review_results[
+        review_operation_key("code", CANDIDATE, "b" * 64)]
+    assert len(store.load("run").issues["code-1"].assignments) == 2
+
+
+@pytest.mark.parametrize("boundary", ["after-intent", "before-completion"])
+def test_revalidation_crash_replay_charges_a_new_repair_once(tmp_path, monkeypatch, boundary):
+    store = StateStore(tmp_path / "state")
+    state = state_with({"code-1": _charged_issue(
+        repairs=2, failed_repairs=1, review_rounds=1, assessed_repairs=1)})
+    state = store.save(state)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    original = store.record_operation
+
+    def interrupted(current, key, value):
+        if boundary == "after-intent":
+            if value.get("status") == "completed":
+                return original(current, key, value)
+            original(current, key, value)
+            raise RuntimeError("crash after intent")
+        if value.get("status") == "completed":
+            raise RuntimeError("crash before completion")
+        return original(current, key, value)
+
+    monkeypatch.setattr(store, "record_operation", interrupted)
+    with pytest.raises(RuntimeError):
+        _accept_with_evidence(store, state, tmp_path, "code", verdict, "c" * 64)
+    monkeypatch.undo()
+
+    saved = store.load("run")
+    if boundary == "before-completion":
+        # The plan was saved before the crash; replay must not apply it twice.
+        assert len(saved.issues["code-1"].assignments) == 2
+        assert saved.issues["code-1"].assignments[0].failed_repairs == 2
+    else:
+        # Only the intent is durable; no counter was applied yet.
+        assert len(saved.issues["code-1"].assignments) == 1
+        assert saved.issues["code-1"].assignments[0].failed_repairs == 1
+    saved, result = _accept_with_evidence(store, saved, tmp_path, "code", verdict, "c" * 64)
+    replay = store.load("run")
+    assignment = replay.issues["code-1"].assignments[0]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.assessed_repairs) == (2, 2, 2)
+    assert len(replay.issues["code-1"].assignments) == 2
+    assert replay.review_results[result.transaction] == result
+    assert len([event for event in store.events("run")
+                if event.get("kind") == "review_result_accepted"]) == 1
+    assert review_transaction_gaps(replay, store.events("run")) == []
+
+
+def test_contradictory_legacy_repair_evidence_refuses_before_writes(tmp_path):
+    store = StateStore(tmp_path / "state")
+    state = state_with({"code-1": _charged_issue(
+        repairs=1, failed_repairs=2, review_rounds=2)})
+    state = store.save(state)
+    before = store.load("run")
+    before_events = store.events("run")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    with pytest.raises(ContractError, match="ambiguous whether the latest repair"):
+        _accept_with_evidence(store, state, tmp_path, "code", verdict, "d" * 64)
+    after = store.load("run")
+    assert after.model_dump(mode="json") == before.model_dump(mode="json")
+    assert store.events("run") == before_events
+    assert not any(key.startswith("review-result:") for key in after.operations)
+
+
+def test_retained_legacy_result_is_not_rebound_to_changed_approval(tmp_path):
+    store = StateStore(tmp_path / "state")
+    state = state_with({"code-1": _charged_issue()})
+    state = store.save(state)
+    legacy_path = tmp_path / "verdict-code-legacy.md"
+    legacy = Verdict(reviewer="code", result="rework", findings=[finding("code-1")])
+    write_markdown(legacy_path, legacy, "## Body\n\nRetained legacy evidence.\n")
+    state, retained = accept_review_result(
+        store, state, role="code", candidate_sha=CANDIDATE, evidence_digest="a" * 64,
+        attempt_id="review-code-2-2", verdict=legacy, verdict_path=legacy_path,
+        manifest=manifest(), require_candidate_binding=False,
+    )
+    assert retained.binding == "legacy-attempt"
+    assert state.issues["code-1"].assignments[-1].failed_repairs == 1
+
+    # A later approval snapshot needs a new verdict bound to the candidate. It is
+    # a separate transaction; the retained result is never rewritten or rebound.
+    current_path = tmp_path / "verdict-code-current.md"
+    current = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    write_markdown(current_path, current, "## Body\n\nCurrent approval evidence.\n")
+    state, fresh = accept_review_result(
+        store, state, role="code", candidate_sha=CANDIDATE, evidence_digest="b" * 64,
+        attempt_id="review-code-2-3", verdict=current, verdict_path=current_path,
+        manifest=manifest(),
+    )
+    after = store.load("run")
+    assert fresh.binding == "candidate-sha"
+    assert fresh.transaction != retained.transaction
+    assert after.review_results[retained.transaction] == retained
+    assert after.review_results[fresh.transaction] == fresh
+    assignment = after.issues["code-1"].assignments[-1]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.assessed_repairs) == (1, 1, 1)

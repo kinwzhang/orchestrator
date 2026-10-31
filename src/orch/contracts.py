@@ -460,6 +460,12 @@ class AssignmentState(StrictModel):
     repairs: int = Field(default=0, ge=0)
     failed_repairs: int = Field(default=0, ge=0)
     review_rounds: int = Field(default=0, ge=0)
+    # Highest repair ordinal whose outcome has already been assessed by a
+    # reviewer. ``None`` marks a legacy record written before this provenance
+    # existed; routing normalises it from the retained counters instead of
+    # charging the same repair again. The high-water mark makes a failure
+    # charge idempotent across revalidation, replay and approval changes.
+    assessed_repairs: int | None = Field(default=None, ge=0)
 
 
 class IssueState(StrictModel):
