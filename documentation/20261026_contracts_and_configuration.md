@@ -145,7 +145,11 @@ outcome already judged; a missing mark is derived from completed review
 transactions and retained evidence, and ambiguous or contradictory histories are
 refused rather than reinterpreted from counters. A finding recorded before the
 first repair establishes an initial-work assessment but does not consume a
-failed-repair allowance. A root issue can have child
+failed-repair allowance. A valid reopening of the same issue and repair ordinal
+supersedes a premature pass: the exact repair is charged once as unsuccessful,
+the earlier pass remains in history, and the reopening does not create a repair
+attempt or another review round. Durable accounting decisions identify the issue,
+assignment and repair ordinal; findings alone do not imply another charge. A root issue can have child
 and grandchild issues; discovering a great-grandchild escalates the root
 without dispatching its fix. A malformed verdict gets one repair call before
 escalation.

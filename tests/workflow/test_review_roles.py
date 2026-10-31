@@ -17,7 +17,9 @@ from orch.store import StateStore
 from orch.workflow import (
     _legacy_pre_batch,
     accept_review_result,
+    derive_repair_assessment,
     persist_issue_ownership,
+    repair_assessment_evidence,
     resolve_issue_ownership,
     review_operation_key,
     review_transaction_gaps,
@@ -472,6 +474,274 @@ def test_new_worker_repair_charges_once_and_second_failure_reassigns(tmp_path):
     assert replay == after.review_results[
         review_operation_key("code", CANDIDATE, "b" * 64)]
     assert len(store.load("run").issues["code-1"].assignments) == 2
+
+
+def _successful_repair_then_pass(tmp_path, max_failed=3, max_rounds=3):
+    store = StateStore(tmp_path / "state")
+    limits = manifest()
+    limits.limits = limits.limits.model_copy(
+        update={"max_failed_repairs_per_assignment": max_failed,
+                "max_review_rounds": max_rounds})
+    issue = IssueState(
+        id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
+        assignments=[AssignmentState(repairs=1, assessed_repairs=0,
+                                     failed_repair_ordinals=[])],
+    )
+    state = store.save(state_with({"code-1": issue}))
+    failed = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                     findings=[finding("code-1", summary="repair one incomplete")])
+    state, _ = _accept_with_evidence(
+        store, state, tmp_path, "code", failed, "1" * 64,
+        manifest_override=limits,
+    )
+    state.issues["code-1"].assignments[0].repairs = 2
+    state = store.save(state)
+    passed = Verdict(reviewer="code", result="pass", candidate_sha=CANDIDATE,
+                     resolved=["code-1"])
+    state, _ = _accept_with_evidence(
+        store, state, tmp_path, "code", passed, "2" * 64,
+        manifest_override=limits,
+    )
+    return store, state, limits
+
+
+def test_successful_repair_reopening_supersedes_pass_once_and_keeps_round_budget(tmp_path):
+    store, state, limits = _successful_repair_then_pass(tmp_path, max_rounds=2)
+    before = state.issues["code-1"].assignments[0].model_copy(deep=True)
+    reopened = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                       findings=[finding("code-1", summary="same repair regressed")])
+    state, result = _accept_with_evidence(
+        store, state, tmp_path, "code", reopened, "3" * 64,
+        manifest_override=limits,
+    )
+    assignment = state.issues["code-1"].assignments[0]
+    assert state.issues["code-1"].status == "open"
+    assert (assignment.repairs, assignment.failed_repairs, assignment.review_rounds,
+            assignment.assessed_repairs, assignment.failed_repair_ordinals) == (
+                2, 2, before.review_rounds, 2, [1, 2])
+    decision = state.operations[result.transaction]["accounting_decisions"][0]
+    assert decision == {
+        "issue": "code-1", "assignment_index": 0, "repair_ordinal": 2,
+        "assessment": "superseding_failure", "failed_repair_charged": True,
+        "review_round_charged": False,
+    }
+
+    # A second valid finding for the same outcome is retained but cannot charge
+    # the outcome or review-round allowance a second time.
+    state, repeated = _accept_with_evidence(
+        store, state, tmp_path, "code", reopened, "4" * 64,
+        manifest_override=limits,
+    )
+    assignment = state.issues["code-1"].assignments[0]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.failed_repair_ordinals) == (2, before.review_rounds, [1, 2])
+    assert state.operations[repeated.transaction]["accounting_decisions"][0]["assessment"] == "already_charged"
+
+    # The next actual worker repair belongs to the same assignment and consumes
+    # its remaining genuine repair budget once; the configured limit then routes
+    # the replacement under the existing policy.
+    assignment.repairs = 3
+    state = store.save(state)
+    state, third = _accept_with_evidence(
+        store, state, tmp_path, "code", reopened, "5" * 64,
+        manifest_override=limits,
+    )
+    issue = state.issues["code-1"]
+    assert len(issue.assignments) == 2
+    assert (issue.assignments[0].failed_repairs,
+            issue.assignments[0].review_rounds,
+            issue.assignments[0].failed_repair_ordinals) == (3, 3, [1, 2, 3])
+    assert issue.assignments[1].failed_repairs == 0
+    assert state.operations[third.transaction]["accounting_decisions"][0]["assessment"] == "new_failure"
+    rebuilt = derive_repair_assessment(
+        state.issues, repair_assessment_evidence(state), {"code-1"})
+    assert rebuilt["code-1"].assignments == issue.assignments
+
+
+def test_reopening_an_already_failed_repair_does_not_charge_again(tmp_path):
+    store = StateStore(tmp_path / "state")
+    limits = manifest()
+    limits.limits = limits.limits.model_copy(
+        update={"max_failed_repairs_per_assignment": 3})
+    issue = IssueState(
+        id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
+        assignments=[AssignmentState(repairs=1, assessed_repairs=0,
+                                     failed_repair_ordinals=[])],
+    )
+    state = store.save(state_with({"code-1": issue}))
+    failure = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    state, _ = _accept_with_evidence(store, state, tmp_path, "code", failure, "a" * 64,
+                                     manifest_override=limits)
+    state, _ = _accept_with_evidence(
+        store, state, tmp_path, "code",
+        Verdict(reviewer="code", result="pass", candidate_sha=CANDIDATE,
+                resolved=["code-1"]), "b" * 64, manifest_override=limits)
+    state, reopened = _accept_with_evidence(
+        store, state, tmp_path, "code", failure, "c" * 64, manifest_override=limits)
+    assignment = state.issues["code-1"].assignments[0]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.failed_repair_ordinals) == (1, 1, [1])
+    assert state.operations[reopened.transaction]["accounting_decisions"][0]["assessment"] == "already_charged"
+
+
+def test_reopening_charge_is_attributed_to_the_replacement_assignment(tmp_path):
+    store = StateStore(tmp_path / "state")
+    limits = manifest()
+    limits.limits = limits.limits.model_copy(
+        update={"max_failed_repairs_per_assignment": 3})
+    issue = IssueState(
+        id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
+        assignments=[AssignmentState(repairs=1, assessed_repairs=0,
+                                     failed_repair_ordinals=[])],
+    )
+    state = store.save(state_with({"code-1": issue}))
+    requested_reassignment = Verdict(
+        reviewer="code", result="rework", candidate_sha=CANDIDATE,
+        findings=[finding("code-1", action="reassign")])
+    state, _ = _accept_with_evidence(
+        store, state, tmp_path, "code", requested_reassignment, "a" * 64,
+        manifest_override=limits)
+    assert len(state.issues["code-1"].assignments) == 2
+    state.issues["code-1"].assignments[1].repairs = 1
+    state = store.save(state)
+    passed = Verdict(reviewer="code", result="pass", candidate_sha=CANDIDATE,
+                     resolved=["code-1"])
+    state, _ = _accept_with_evidence(
+        store, state, tmp_path, "code", passed, "b" * 64, manifest_override=limits)
+    finding_again = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                            findings=[finding("code-1")])
+    state, reopened = _accept_with_evidence(
+        store, state, tmp_path, "code", finding_again, "c" * 64,
+        manifest_override=limits)
+    issue = state.issues["code-1"]
+    assert issue.assignments[0].failed_repair_ordinals == [1]
+    assert issue.assignments[1].failed_repair_ordinals == [1]
+    assert [decision["assignment_index"] for decision in
+            state.operations[reopened.transaction]["accounting_decisions"]] == [1]
+
+
+def test_distinct_defect_keeps_separate_initial_work_accounting(tmp_path):
+    store, state, limits = _successful_repair_then_pass(tmp_path)
+    verdict = Verdict(
+        reviewer="code", result="rework", candidate_sha=CANDIDATE,
+        findings=[finding("code-1"), finding("code-2", summary="different defect")])
+    state, result = _accept_with_evidence(
+        store, state, tmp_path, "code", verdict, "6" * 64, manifest_override=limits)
+    first, second = (state.issues[identity].assignments[0]
+                     for identity in ("code-1", "code-2"))
+    assert first.failed_repair_ordinals == [1, 2]
+    assert second.failed_repair_ordinals == []
+    decisions = {item["issue"]: item for item in
+                 state.operations[result.transaction]["accounting_decisions"]}
+    assert decisions["code-1"]["assessment"] == "superseding_failure"
+    assert decisions["code-2"]["assessment"] == "initial_work"
+
+
+def test_legacy_reopening_is_reconstructed_once_with_source_attribution(tmp_path):
+    store = StateStore(tmp_path / "state")
+    limits = manifest()
+    failure = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    passed = Verdict(reviewer="code", result="pass", candidate_sha=CANDIDATE,
+                     resolved=["code-1"])
+    first_base = _charged_issue(repairs=1, failed_repairs=0, review_rounds=0,
+                                assessed_repairs=0)
+    first_key, first = _completed_review_operation(failure, first_base, "a" * 64)
+    pass_base = _charged_issue(repairs=2, failed_repairs=1, review_rounds=1,
+                               assessed_repairs=1)
+    pass_key, passing = _completed_review_operation(passed, pass_base, "b" * 64)
+    pass_base.status = "resolved"
+    pass_base.assignments[-1].assessed_repairs = 2
+    pass_base.assignments[-1].review_rounds = 2
+    reopen_base = pass_base.model_copy(deep=True)
+    reopen_key, reopening = _completed_review_operation(failure, reopen_base, "c" * 64)
+    current = _charged_issue(repairs=2, failed_repairs=1, review_rounds=2,
+                             assessed_repairs=2)
+    state = state_with({"code-1": current})
+    state.operations = {first_key: first, pass_key: passing, reopen_key: reopening}
+    state = store.save(state)
+
+    state, result = _accept_with_evidence(
+        store, state, tmp_path, "code", failure, "d" * 64, manifest_override=limits)
+    assignment = state.issues["code-1"].assignments[0]
+    assert (assignment.failed_repairs, assignment.failed_repair_ordinals) == (2, [1, 2])
+    reconciliation = state.operations[result.transaction]["legacy_reconciliations"]
+    assert reconciliation == [{
+        "issue": "code-1", "assignment_index": 0, "repair_ordinal": 2,
+        "source_transactions": [reopen_key],
+    }]
+    state, _ = _accept_with_evidence(
+        store, state, tmp_path, "code", failure, "e" * 64, manifest_override=limits)
+    assignment = state.issues["code-1"].assignments[0]
+    assert (assignment.failed_repairs, assignment.failed_repair_ordinals) == (2, [1, 2])
+
+
+def test_ambiguous_legacy_reopening_refuses_before_mutation(tmp_path):
+    store = StateStore(tmp_path / "state")
+    finding_verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                              findings=[finding("code-1")])
+    resolved_base = _charged_issue(repairs=2, failed_repairs=1, review_rounds=1,
+                                   assessed_repairs=2)
+    resolved_base.status = "resolved"
+    key, operation = _completed_review_operation(finding_verdict, resolved_base, "a" * 64)
+    issue = _charged_issue(repairs=2, failed_repairs=1, review_rounds=2,
+                           assessed_repairs=2)
+    issue.assignments[-1].failed_repair_ordinals = None
+    state = state_with({"code-1": issue})
+    state.operations = {key: operation}
+    state = store.save(state)
+    before, events = store.load("run"), store.events("run")
+    with pytest.raises(ContractError, match="no retained successful assessment"):
+        _accept_with_evidence(store, before, tmp_path, "code", finding_verdict, "b" * 64)
+    after = store.load("run")
+    assert after.model_dump(mode="json") == before.model_dump(mode="json")
+    assert store.events("run") == events
+    assert not any("b" * 64 in key for key in after.operations)
+
+
+@pytest.mark.parametrize("boundary", ["after-intent", "after-issue-save", "before-completion"])
+def test_superseding_reopening_crash_replay_keeps_one_charge(tmp_path, monkeypatch, boundary):
+    store, state, limits = _successful_repair_then_pass(tmp_path)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    original_record = store.record_operation
+    original_save = store.save
+
+    def interrupted_record(current, key, value):
+        if boundary == "after-intent" and value.get("status") == "intent":
+            original_record(current, key, value)
+            raise RuntimeError("crash after accounting intent")
+        if boundary == "before-completion" and value.get("status") == "completed":
+            raise RuntimeError("crash before transaction completion")
+        return original_record(current, key, value)
+
+    def interrupted_save(current, *args, **kwargs):
+        result = original_save(current, *args, **kwargs)
+        if (boundary == "after-issue-save"
+                and any(assignment.failed_repair_ordinals == [1, 2]
+                        for issue in current.issues.values()
+                        for assignment in issue.assignments)):
+            raise RuntimeError("crash after issue accounting save")
+        return result
+
+    monkeypatch.setattr(store, "record_operation", interrupted_record)
+    monkeypatch.setattr(store, "save", interrupted_save)
+    with pytest.raises(RuntimeError):
+        _accept_with_evidence(store, state, tmp_path, "code", verdict, "7" * 64,
+                              manifest_override=limits)
+    monkeypatch.undo()
+    replay_state, result = _accept_with_evidence(
+        store, store.load("run"), tmp_path, "code", verdict, "7" * 64,
+        manifest_override=limits)
+    assignment = replay_state.issues["code-1"].assignments[0]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.failed_repair_ordinals) == (2, 2, [1, 2])
+    assert replay_state.operations[result.transaction]["accounting_decisions"][0]["assessment"] == "superseding_failure"
+    assert len([event for event in store.events("run")
+                if event.get("kind") == "review_result_accepted"
+                and event.get("transaction") == result.transaction]) == 1
+    assert review_transaction_gaps(replay_state, store.events("run")) == []
 
 
 @pytest.mark.parametrize("boundary", ["after-intent", "before-completion"])

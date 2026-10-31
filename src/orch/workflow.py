@@ -184,6 +184,7 @@ class RoleRoutingPlan:
     resolved: list[str]
     touched: list[str]
     affected_workers: list[str]
+    accounting_decisions: list[dict]
     escalation: str | None = None
 
 
@@ -195,6 +196,15 @@ def _validate_repair_counters(identity: str, assignment: AssignmentState) -> Non
             f"{assignment.repairs} repair attempt(s). Counters are inconsistent, so the "
             "assessment history cannot be trusted. Refusing to reset or reinterpret them; "
             "audit the retained review transactions and use an approved recovery."
+        )
+    charged = assignment.failed_repair_ordinals
+    if (charged is not None
+            and (charged != sorted(set(charged))
+                 or any(ordinal <= 0 or ordinal > assignment.repairs for ordinal in charged)
+                 or len(charged) != assignment.failed_repairs)):
+        raise ContractError(
+            f"Issue {identity} has contradictory failed-repair ordinal provenance; "
+            "the exact charge history cannot be trusted. Refusing to continue."
         )
     mark = assignment.assessed_repairs
     if mark is not None:
@@ -210,11 +220,16 @@ def _validate_repair_counters(identity: str, assignment: AssignmentState) -> Non
                 f"only repair outcome {mark} as assessed. Explicit provenance is "
                 "inconsistent with the retained counters; refusing to continue."
             )
+        if assignment.failed_repair_ordinals and max(assignment.failed_repair_ordinals) > mark:
+            raise ContractError(
+                f"Issue {identity} records a failed repair ordinal above assessed outcome {mark}; "
+                "explicit provenance is inconsistent with the retained counters. Refusing to continue."
+            )
 
 
 def repair_assessment_evidence(
     state: RunState,
-) -> dict[tuple[str, int], dict[int, dict[str, list[str]]]]:
+) -> dict[tuple[str, int], dict[int, dict[str, list]]]:
     """Derive per-assignment repair assessments from completed review transactions.
 
     A completed role transaction records the complete pre-routing register and the
@@ -227,8 +242,9 @@ def repair_assessment_evidence(
     completed transaction makes the history incomplete and is refused rather than
     filled in from counters.
     """
-    evidence: dict[tuple[str, int], dict[int, dict[str, list[str]]]] = {}
+    evidence: dict[tuple[str, int], dict[int, dict[str, list]]] = {}
     completed: set[str] = set()
+    charged: dict[tuple[str, int], set[int]] = {}
     for key, operation in state.operations.items():
         if not key.startswith(_REVIEW_RESULT_PREFIX):
             continue
@@ -249,6 +265,23 @@ def repair_assessment_evidence(
                 f"Review transaction {key} has a malformed retained verdict: {exc}"
             ) from exc
         finding_ids = {finding.id for finding in verdict.findings}
+        findings = {finding.id for finding in verdict.findings}
+        decisions = operation.get("accounting_decisions")
+        if decisions is not None and not isinstance(decisions, list):
+            raise ContractError(f"Review transaction {key} has malformed accounting provenance")
+        decisions_by_issue = {}
+        if decisions is not None:
+            for decision in decisions:
+                if not isinstance(decision, dict) or not isinstance(decision.get("issue"), str):
+                    raise ContractError(
+                        f"Review transaction {key} has malformed accounting provenance"
+                    )
+                identity = decision["issue"]
+                if identity in decisions_by_issue:
+                    raise ContractError(
+                        f"Review transaction {key} duplicates accounting provenance for {identity}"
+                    )
+                decisions_by_issue[identity] = decision
         for identity in finding_ids | set(verdict.resolved):
             base_issue = base.get(identity)
             if not isinstance(base_issue, dict):
@@ -264,10 +297,123 @@ def repair_assessment_evidence(
                 continue
             assignment_index = len(issue.assignments) - 1
             ordinal = issue.assignments[-1].repairs
+            assignment_key = (identity, assignment_index)
+            assignment = issue.assignments[-1]
+            known_charges = charged.setdefault(assignment_key, set())
+            if assignment.failed_repair_ordinals is not None:
+                known_charges.update(assignment.failed_repair_ordinals)
+            elif (assignment.assessed_repairs is not None
+                  and assignment.failed_repairs == assignment.assessed_repairs):
+                known_charges.update(range(1, assignment.failed_repairs + 1))
             record = evidence.setdefault((identity, assignment_index), {}).setdefault(
-                ordinal, {"findings": [], "resolved": []}
+                ordinal, {"findings": [], "resolved": [], "charges": [],
+                          "pending_legacy_charges": [], "decisions": []}
             )
-            record["findings" if identity in finding_ids else "resolved"].append(key)
+            is_finding = identity in findings
+            record["findings" if is_finding else "resolved"].append(key)
+            decision = decisions_by_issue.get(identity) if decisions is not None else None
+            if decisions is not None:
+                if decision is None:
+                    raise ContractError(
+                        f"Review transaction {key} has no accounting decision for {identity}"
+                    )
+                expected_assignment = decision.get("assignment_index")
+                expected_ordinal = decision.get("repair_ordinal")
+                assessment = decision.get("assessment")
+                charged_ordinals = set(issue.assignments[-1].failed_repair_ordinals or [])
+                semantically_valid = (
+                    (assessment == "initial_work" and is_finding
+                     and ordinal == 0 and not decision.get("failed_repair_charged")
+                     and not decision.get("review_round_charged"))
+                    or (assessment == "new_failure" and is_finding and ordinal > 0
+                        and ordinal not in charged_ordinals
+                        and ((issue.assignments[-1].assessed_repairs is not None
+                              and ordinal > issue.assignments[-1].assessed_repairs)
+                             or (issue.assignments[-1].assessed_repairs is None
+                                 and issue.assignments[-1].failed_repairs == 0
+                                 and issue.assignments[-1].review_rounds == 0
+                                 and issue.status != "resolved"))
+                        and decision.get("failed_repair_charged") is True
+                        and decision.get("review_round_charged") is True)
+                    or (assessment == "superseding_failure" and is_finding and ordinal > 0
+                        and issue.status == "resolved"
+                        and issue.assignments[-1].assessed_repairs == ordinal
+                        and ordinal not in charged_ordinals
+                        and decision.get("failed_repair_charged") is True
+                        and not decision.get("review_round_charged"))
+                    or (assessment == "already_charged" and is_finding
+                        and ordinal in charged_ordinals
+                        and not decision.get("failed_repair_charged")
+                        and not decision.get("review_round_charged"))
+                    or (assessment == "already_assessed" and is_finding
+                        and issue.assignments[-1].assessed_repairs is not None
+                        and ordinal <= issue.assignments[-1].assessed_repairs
+                        and not decision.get("failed_repair_charged")
+                        and not decision.get("review_round_charged"))
+                    or (assessment == "resolved" and not is_finding
+                        and not decision.get("failed_repair_charged")
+                        and decision.get("review_round_charged") is (
+                            issue.status == "open"
+                            and (issue.assignments[-1].assessed_repairs is None
+                                 or ordinal > issue.assignments[-1].assessed_repairs)))
+                )
+                if (expected_assignment != assignment_index or expected_ordinal != ordinal
+                        or assessment not in {
+                            "initial_work", "new_failure", "superseding_failure",
+                            "already_charged", "already_assessed", "resolved",
+                        }
+                        or not isinstance(decision.get("failed_repair_charged"), bool)
+                        or not isinstance(decision.get("review_round_charged"), bool)
+                        or not semantically_valid):
+                    raise ContractError(
+                        f"Review transaction {key} has contradictory accounting provenance for "
+                        f"{identity}"
+                    )
+            else:
+                # Schema-v1 completed transactions predate explicit decisions.
+                # Reconstruct only what their retained pre-routing snapshot proves.
+                already_charged = ordinal in known_charges
+                mark = assignment.assessed_repairs
+                if not is_finding:
+                    assessment = "resolved"
+                elif ordinal == 0:
+                    assessment = "initial_work"
+                elif already_charged or (assignment.failed_repair_ordinals is not None
+                                         and ordinal in assignment.failed_repair_ordinals):
+                    assessment = "already_charged"
+                elif issue.status == "resolved" and mark == ordinal:
+                    if not record["resolved"]:
+                        raise ContractError(
+                            f"Review transaction {key} reopens {identity} at repair {ordinal} "
+                            "but no retained successful assessment identifies the superseded "
+                            "outcome; refusing ambiguous legacy attribution"
+                        )
+                    assessment = "superseding_failure"
+                    record["pending_legacy_charges"].append(key)
+                elif ((mark is None and assignment.repairs > 0
+                       and assignment.failed_repairs == 0 and assignment.review_rounds == 0
+                       and issue.status != "resolved")
+                      or (mark is not None and ordinal > mark)):
+                    assessment = "new_failure"
+                else:
+                    assessment = "already_assessed"
+                decision = {
+                    "issue": identity, "assignment_index": assignment_index,
+                    "repair_ordinal": ordinal, "assessment": assessment,
+                    "failed_repair_charged": assessment in {
+                        "new_failure", "superseding_failure"},
+                    "review_round_charged": assessment == "new_failure",
+                    "legacy_inferred": True,
+                }
+            record["decisions"].append({"transaction": key, **decision})
+            if decision["failed_repair_charged"]:
+                record["charges"].append(key)
+                charged.setdefault((identity, assignment_index), set()).add(ordinal)
+            elif is_finding and decision["assessment"] == "already_charged" \
+                    and ordinal in known_charges:
+                # The current transaction did not add a charge, but its retained
+                # base snapshot independently preserves the exact earlier charge.
+                record["charges"].append(key)
     missing = sorted(set(state.review_results) - completed)
     if missing:
         raise ContractError(
@@ -278,7 +424,7 @@ def repair_assessment_evidence(
     return evidence
 
 
-def _failed_repair_ordinals(records: dict[int, dict[str, list[str]]]) -> set[int]:
+def _failed_repair_ordinals(records: dict[int, dict[str, list]]) -> set[int]:
     """Return repair ordinals assessed as unsuccessful actual repairs.
 
     Ordinal zero is initial work before any repair has been dispatched. A
@@ -286,11 +432,12 @@ def _failed_repair_ordinals(records: dict[int, dict[str, list[str]]]) -> set[int
     but it never consumes a failed-repair allowance because no repair happened.
     """
     return {ordinal for ordinal, record in records.items()
-            if ordinal > 0 and record["findings"]}
+            if ordinal > 0 and (record.get("charges") if "charges" in record
+                                else record.get("findings"))}
 
 
 def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
-                             records: dict[int, dict[str, list[str]]]) -> int:
+                             records: dict[int, dict[str, list]]) -> int:
     """Derive an assessment mark from completed-review evidence or refuse."""
     _validate_repair_counters(identity, assignment)
     if not records:
@@ -305,6 +452,8 @@ def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
         # review evidence has not had a repair outcome assessed yet.
         return 0
     failure_ordinals = _failed_repair_ordinals(records)
+    pending = {ordinal for ordinal, record in records.items()
+               if record.get("pending_legacy_charges")}
     if assignment.failed_repairs > len(failure_ordinals):
         raise ContractError(
             f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
@@ -314,10 +463,27 @@ def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
             "review transactions and use an approved recovery."
         )
     if assignment.failed_repairs < len(failure_ordinals):
+        missing = len(failure_ordinals) - assignment.failed_repairs
+        if missing == len(pending) and pending and assignment.failed_repair_ordinals is None:
+            # Old routing accepted a same-outcome reopening but did not charge
+            # it. The pre-routing resolved snapshot and exact assignment/ordinal
+            # prove the superseding failure; materialize it once in the next
+            # accepted transaction's base snapshot.
+            assignment.failed_repairs += missing
+            assignment.failed_repair_ordinals = sorted(failure_ordinals)
+        else:
+            raise ContractError(
+                f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
+                f"retained reviews show {len(failure_ordinals)} distinct unsuccessful repair "
+                "outcome(s). The counters understate the assessed history; refusing to continue."
+            )
+    if assignment.failed_repair_ordinals is None:
+        assignment.failed_repair_ordinals = sorted(failure_ordinals)
+    elif set(assignment.failed_repair_ordinals) != failure_ordinals:
         raise ContractError(
-            f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
-            f"completed reviews show {len(failure_ordinals)} distinct unsuccessful repair "
-            "outcome(s). The counters understate the assessed history; refusing to continue."
+            f"Issue {identity} records failed-repair ordinals "
+            f"{assignment.failed_repair_ordinals} but completed review decisions show "
+            f"{sorted(failure_ordinals)}; refusing to continue."
         )
     assessed = max(records)
     if assessed > assignment.repairs:
@@ -331,7 +497,7 @@ def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
 
 def derive_repair_assessment(
     issues: dict[str, IssueState],
-    evidence: dict[tuple[str, int], dict[int, dict[str, list[str]]]],
+    evidence: dict[tuple[str, int], dict[int, dict[str, list]]],
     finding_ids: set[str],
     relevant_ids: set[str] | None = None,
 ) -> dict[str, IssueState]:
@@ -347,39 +513,55 @@ def derive_repair_assessment(
         issue = work.get(identity)
         if issue is None or not issue.assignments:
             continue
-        assignment = issue.assignments[-1]
-        records = evidence.get((identity, len(issue.assignments) - 1), {})
-        if identity in finding_ids and assignment.assessed_repairs is None:
-            assignment.assessed_repairs = _derive_assessed_repairs(identity, assignment, records)
-            continue
-        _validate_repair_counters(identity, assignment)
-        if assignment.assessed_repairs is None:
-            continue
-        if not records:
-            # An explicit durable mark is itself provenance. Only the counter
-            # invariants can be checked here; there is no completed transaction
-            # to cross-validate against.
-            continue
-        evidence_mark = max(records)
-        if assignment.assessed_repairs != evidence_mark:
-            raise ContractError(
-                f"Issue {identity} records repair outcome {assignment.assessed_repairs} "
-                f"as assessed but retained reviews assessed outcome {evidence_mark}. "
-                "Explicit provenance disagrees with the retained evidence; refusing to continue."
-            )
-        failure_ordinals = _failed_repair_ordinals(records)
-        if assignment.failed_repairs != len(failure_ordinals):
-            raise ContractError(
-                f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
-                f"retained reviews show {len(failure_ordinals)} distinct unsuccessful "
-                "outcome(s). Explicit provenance disagrees with the retained evidence; "
-                "refusing to continue."
-            )
+        for index, assignment in enumerate(issue.assignments):
+            records = evidence.get((identity, index), {})
+            if not records:
+                _validate_repair_counters(identity, assignment)
+                if assignment.assessed_repairs is None and (
+                        assignment.failed_repairs or assignment.review_rounds):
+                    raise ContractError(
+                        f"Issue {identity} assignment {index} has failure or review counters "
+                        "but no completed review transaction evidence. Refusing to guess."
+                    )
+                if assignment.failed_repair_ordinals is None:
+                    if assignment.failed_repairs == 0:
+                        assignment.failed_repair_ordinals = []
+                    elif assignment.failed_repairs == assignment.assessed_repairs:
+                        # With every assessed positive ordinal charged, the exact
+                        # set is unambiguous even for an older explicit mark.
+                        assignment.failed_repair_ordinals = list(
+                            range(1, assignment.failed_repairs + 1))
+                    else:
+                        raise ContractError(
+                            f"Issue {identity} assignment {index} has failed-repair counters "
+                            "without enough retained evidence to identify the charged ordinals. "
+                            "Refusing to guess."
+                        )
+                continue
+            if (assignment.assessed_repairs is not None
+                    and assignment.assessed_repairs != max(records)):
+                raise ContractError(
+                    f"Issue {identity} records repair outcome {assignment.assessed_repairs} "
+                    f"as assessed but retained reviews assessed outcome {max(records)}. "
+                    "Explicit provenance disagrees with the retained evidence; refusing to continue."
+                )
+            derived = _derive_assessed_repairs(identity, assignment, records)
+            if index == len(issue.assignments) - 1 and identity in finding_ids:
+                if assignment.assessed_repairs is None:
+                    assignment.assessed_repairs = derived
+            elif assignment.assessed_repairs is not None and assignment.assessed_repairs != max(records):
+                raise ContractError(
+                    f"Issue {identity} records repair outcome {assignment.assessed_repairs} "
+                    f"as assessed but retained reviews assessed outcome {max(records)}. "
+                    "Explicit provenance disagrees with the retained evidence; refusing to continue."
+                )
+            elif assignment.assessed_repairs is None:
+                assignment.assessed_repairs = derived
     return work
 
 
-def _assess_repair_outcome(issue: IssueState, identity: str) -> bool:
-    """Return whether a finding assesses a distinct unsuccessful repair.
+def _assess_repair_outcome(issue: IssueState, identity: str) -> dict:
+    """Apply and describe the accounting effect of this finding.
 
     ``repairs`` counts worker dispatch attempts for the issue. ``assessed_repairs``
     records the highest repair ordinal whose outcome a reviewer has already
@@ -393,12 +575,31 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> bool:
     The caller owns a deep copy, so mutating the counters here cannot affect the
     accepted register unless the whole plan validates.
     """
+    assignment_index = len(issue.assignments) - 1
     current = issue.assignments[-1]
     _validate_repair_counters(identity, current)
+    if current.failed_repair_ordinals is None:
+        if current.repairs > 0 and current.assessed_repairs is None and (
+                current.failed_repairs or current.review_rounds or issue.status == "resolved"):
+            raise ContractError(
+                f"Issue {identity} has repair history without durable assessment provenance. "
+                "Counters alone cannot prove which repair outcome was assessed."
+            )
+        if current.failed_repairs == current.assessed_repairs:
+            current.failed_repair_ordinals = list(range(1, current.failed_repairs + 1))
+        elif current.failed_repairs == 0:
+            current.failed_repair_ordinals = []
+        else:
+            raise ContractError(
+                f"Issue {identity} has failed repairs but no exact charged-ordinal provenance. "
+                "Derive it from completed review transactions before routing."
+            )
     if current.repairs == 0:
         if current.assessed_repairs is None:
             current.assessed_repairs = 0
-        return False
+        return {"issue": identity, "assignment_index": assignment_index,
+                "repair_ordinal": 0, "assessment": "initial_work",
+                "failed_repair_charged": False, "review_round_charged": False}
     if current.assessed_repairs is None:
         if current.failed_repairs or current.review_rounds or issue.status == "resolved":
             raise ContractError(
@@ -408,11 +609,34 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> bool:
                 "transactions or use an approved recovery."
             )
         current.assessed_repairs = current.repairs
-        return True
-    if current.repairs > current.assessed_repairs:
+        current.failed_repairs += 1
+        current.failed_repair_ordinals.append(current.repairs)
+        current.review_rounds += 1
+        return {"issue": identity, "assignment_index": assignment_index,
+                "repair_ordinal": current.repairs, "assessment": "new_failure",
+                "failed_repair_charged": True, "review_round_charged": True}
+    ordinal = current.repairs
+    if ordinal in current.failed_repair_ordinals:
+        return {"issue": identity, "assignment_index": assignment_index,
+                "repair_ordinal": ordinal, "assessment": "already_charged",
+                "failed_repair_charged": False, "review_round_charged": False}
+    if ordinal > current.assessed_repairs:
         current.assessed_repairs = current.repairs
-        return True
-    return False
+        current.failed_repairs += 1
+        current.failed_repair_ordinals.append(ordinal)
+        current.review_rounds += 1
+        return {"issue": identity, "assignment_index": assignment_index,
+                "repair_ordinal": ordinal, "assessment": "new_failure",
+                "failed_repair_charged": True, "review_round_charged": True}
+    if issue.status == "resolved" and ordinal == current.assessed_repairs:
+        current.failed_repairs += 1
+        current.failed_repair_ordinals.append(ordinal)
+        return {"issue": identity, "assignment_index": assignment_index,
+                "repair_ordinal": ordinal, "assessment": "superseding_failure",
+                "failed_repair_charged": True, "review_round_charged": False}
+    return {"issue": identity, "assignment_index": assignment_index,
+            "repair_ordinal": ordinal, "assessment": "already_assessed",
+            "failed_repair_charged": False, "review_round_charged": False}
 
 
 def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
@@ -470,6 +694,7 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
             raise ContractError("Passing verdict must explicitly resolve " + ", ".join(missing))
 
     touched: set[str] = set()
+    accounting_decisions: list[dict] = []
     remaining = dict(findings)
     while remaining:
         progress = False
@@ -486,16 +711,19 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
                 if (previous.parent_issue_id, previous.worker) != (finding.parent_issue_id, finding.worker):
                     raise ContractError(f"Issue identity changed: {identity}")
                 current = previous.assignments[-1]
-                new_failed_repair = _assess_repair_outcome(previous, identity)
-                if new_failed_repair:
-                    current.failed_repairs += 1
-                    current.review_rounds += 1
+                accounting_decisions.append(_assess_repair_outcome(previous, identity))
                 previous.status = "open"
             else:
                 previous = IssueState(id=identity, worker=finding.worker, root_issue_id=root,
                                       parent_issue_id=finding.parent_issue_id, depth=depth,
-                                      summary=finding.summary, owner_role=role)
+                                      summary=finding.summary, owner_role=role,
+                                      assignments=[AssignmentState(failed_repair_ordinals=[])])
                 work[identity] = previous
+                accounting_decisions.append({
+                    "issue": identity, "assignment_index": 0, "repair_ordinal": 0,
+                    "assessment": "initial_work", "failed_repair_charged": False,
+                    "review_round_charged": False,
+                })
             touched.add(identity)
             if depth > manifest.limits.max_issue_depth:
                 work[root].status = "escalated"
@@ -503,6 +731,7 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
                 return RoleRoutingPlan(
                     issues=work, findings=findings, resolved=[], touched=sorted(touched),
                     affected_workers=sorted({f.worker for f in findings.values()}),
+                    accounting_decisions=accounting_decisions,
                     escalation=(f"Derived issue {identity} exceeds depth limit; "
                                 f"escalate root {root}"),
                 )
@@ -511,21 +740,30 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
                 return RoleRoutingPlan(
                     issues=work, findings=findings, resolved=[], touched=sorted(touched),
                     affected_workers=sorted({f.worker for f in findings.values()}),
+                    accounting_decisions=accounting_decisions,
                     escalation=f"Issue {identity} requires escalation",
                 )
             current = previous.assignments[-1]
-            exhausted = (current.failed_repairs >= manifest.limits.max_failed_repairs_per_assignment
-                         or current.repairs >= manifest.limits.max_repair_attempts
-                         or current.review_rounds >= manifest.limits.max_review_rounds)
+            latest_decision = accounting_decisions[-1]
+            new_failure_charge = latest_decision["failed_repair_charged"]
+            exhausted = (
+                (new_failure_charge
+                 and current.failed_repairs >= manifest.limits.max_failed_repairs_per_assignment)
+                or (new_failure_charge
+                    and current.repairs >= manifest.limits.max_repair_attempts)
+                or (latest_decision["review_round_charged"]
+                    and current.review_rounds >= manifest.limits.max_review_rounds)
+            )
             if exhausted or finding.action == "reassign":
                 if len(previous.assignments) - 1 >= manifest.limits.max_reassignments:
                     previous.status = "escalated"
                     return RoleRoutingPlan(
                         issues=work, findings=findings, resolved=[], touched=sorted(touched),
                         affected_workers=sorted({f.worker for f in findings.values()}),
+                        accounting_decisions=accounting_decisions,
                         escalation=f"Issue {identity} exhausted replacement allowance",
                     )
-                previous.assignments.append(AssignmentState())
+                previous.assignments.append(AssignmentState(failed_repair_ordinals=[]))
             del remaining[identity]
             progress = True
         if not progress:
@@ -543,16 +781,25 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
         current = issue.assignments[-1]
         new_outcome = (current.assessed_repairs is None
                        or current.repairs > current.assessed_repairs)
-        if was_open and new_outcome:
+        round_charged = was_open and new_outcome
+        if round_charged:
             current.review_rounds += 1
         if current.assessed_repairs is None:
             current.assessed_repairs = current.repairs
         else:
             current.assessed_repairs = max(current.assessed_repairs, current.repairs)
+        if current.failed_repair_ordinals is None:
+            current.failed_repair_ordinals = []
+        accounting_decisions.append({
+            "issue": identity, "assignment_index": len(issue.assignments) - 1,
+            "repair_ordinal": current.repairs, "assessment": "resolved",
+            "failed_repair_charged": False, "review_round_charged": round_charged,
+        })
         touched.add(identity)
     return RoleRoutingPlan(
         issues=work, findings=findings, resolved=resolved, touched=sorted(touched),
         affected_workers=sorted({f.worker for f in findings.values()}),
+        accounting_decisions=accounting_decisions,
     )
 
 
@@ -727,6 +974,65 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
         raise ContractError(f"Review transaction {key} has no pre-routing issue snapshot")
     base_issues = {identity: IssueState.model_validate(value) for identity, value in base.items()}
     plan = plan_role_routing(base_issues, verdict, manifest, role)
+    recorded_decisions = operation.get("accounting_decisions")
+    if not isinstance(recorded_decisions, list):
+        raise ContractError(
+            f"Review transaction {key} has no durable accounting decision; "
+            "refusing to reinterpret an interrupted legacy transaction"
+        )
+    if recorded_decisions != plan.accounting_decisions:
+        raise ContractError(
+            f"Review transaction {key} accounting decision disagrees with its recorded "
+            "pre-routing register; refusing replay"
+        )
+    reconciliations = operation.get("legacy_reconciliations", [])
+    if not isinstance(reconciliations, list):
+        raise ContractError(f"Review transaction {key} has malformed legacy reconciliation")
+    seen_reconciliations = set()
+    for item in reconciliations:
+        if (not isinstance(item, dict) or not isinstance(item.get("issue"), str)
+                or type(item.get("assignment_index")) is not int
+                or type(item.get("repair_ordinal")) is not int
+                or not isinstance(item.get("source_transactions"), list)
+                or not item["source_transactions"]
+                or not all(isinstance(source, str) for source in item["source_transactions"])):
+            raise ContractError(f"Review transaction {key} has malformed legacy reconciliation")
+        identity = item["issue"]
+        index = item["assignment_index"]
+        ordinal = item["repair_ordinal"]
+        marker = (identity, index, ordinal)
+        if marker in seen_reconciliations or ordinal <= 0:
+            raise ContractError(f"Review transaction {key} has duplicate legacy reconciliation")
+        seen_reconciliations.add(marker)
+        issue = base_issues.get(identity)
+        if (issue is None or index >= len(issue.assignments)
+                or ordinal not in (issue.assignments[index].failed_repair_ordinals or [])):
+            raise ContractError(
+                f"Review transaction {key} reconciliation does not match its base register"
+            )
+        for source in item["source_transactions"]:
+            source_operation = state.operations.get(source)
+            source_base = (source_operation.get("base_issues")
+                           if isinstance(source_operation, dict) else None)
+            source_issue_raw = source_base.get(identity) if isinstance(source_base, dict) else None
+            try:
+                source_issue = IssueState.model_validate(source_issue_raw)
+                source_verdict = Verdict.model_validate(source_operation.get("verdict"))
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise ContractError(
+                    f"Review transaction {key} legacy source {source} is malformed"
+                ) from exc
+            if (source_operation.get("status") != "completed"
+                    or source_operation.get("accounting_decisions") is not None
+                    or source_issue.status != "resolved"
+                    or not source_issue.assignments
+                    or source_issue.assignments[-1].repairs != ordinal
+                    or source_issue.assignments[-1].assessed_repairs != ordinal
+                    or identity not in {finding.id for finding in source_verdict.findings}):
+                raise ContractError(
+                    f"Review transaction {key} legacy source {source} does not prove the "
+                    "recorded reopening charge"
+                )
     result = ReviewResult(
         role=role,
         candidate_sha=candidate_sha,
@@ -757,6 +1063,11 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
         raise ContractError(f"Review transaction {key} has multiple acceptance events")
     if matching:
         event = matching[0]
+        if (event.get("accounting_decisions") != plan.accounting_decisions
+                or event.get("legacy_reconciliations") != reconciliations):
+            raise ContractError(
+                f"Review transaction {key} acceptance audit disagrees with its accounting decision"
+            )
     else:
         event = store.event(
             state.run_id, "review_result_accepted", transaction=key, role=role,
@@ -765,7 +1076,8 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
             verdict_path=result.verdict_path, result=result.result,
             findings=result.findings, resolved=result.resolved,
             affected_workers=result.affected_workers, escalation=result.escalation,
-            binding=result.binding,
+            binding=result.binding, accounting_decisions=plan.accounting_decisions,
+            legacy_reconciliations=reconciliations,
         )
     state = store.record_operation(state, key, {
         "status": "completed", "event_id": event["id"],
@@ -823,7 +1135,47 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
     evidence = repair_assessment_evidence(state)
     base_issues = derive_repair_assessment(
         state.issues, evidence, finding_ids, relevant_ids)
-    plan_role_routing(base_issues, verdict, manifest, role)
+    for identity in finding_ids:
+        issue = base_issues.get(identity)
+        if issue is None or issue.status != "resolved" or not issue.assignments:
+            continue
+        assignment_index = len(issue.assignments) - 1
+        assignment = issue.assignments[-1]
+        ordinal = assignment.repairs
+        charged_ordinals = set(assignment.failed_repair_ordinals or [])
+        if (ordinal > 0 and assignment.assessed_repairs == ordinal
+                and ordinal not in charged_ordinals
+                and not evidence.get((identity, assignment_index), {}).get(ordinal, {}).get("resolved")):
+            raise ContractError(
+                f"Issue {identity} is resolved at repair {ordinal}, but retained successful "
+                "assessment evidence cannot attribute the reopening; refusing before mutation"
+            )
+    plan = plan_role_routing(base_issues, verdict, manifest, role)
+    legacy_reconciliations = []
+    for identity, issue in base_issues.items():
+        previous = state.issues.get(identity)
+        if previous is None:
+            continue
+        for index, assignment in enumerate(issue.assignments):
+            old = previous.assignments[index]
+            if assignment.failed_repairs <= old.failed_repairs:
+                continue
+            added = sorted(set(assignment.failed_repair_ordinals or [])
+                           - set(old.failed_repair_ordinals or []))
+            records = evidence.get((identity, index), {})
+            reconciled = [ordinal for ordinal in added
+                          if records.get(ordinal, {}).get("pending_legacy_charges")]
+            if len(reconciled) != assignment.failed_repairs - old.failed_repairs:
+                raise ContractError(
+                    f"Issue {identity} assignment {index} has a legacy counter change without "
+                    "unambiguous retained accounting evidence"
+                )
+            for ordinal in reconciled:
+                sources = records[ordinal]["pending_legacy_charges"]
+                legacy_reconciliations.append({
+                    "issue": identity, "assignment_index": index,
+                    "repair_ordinal": ordinal, "source_transactions": sorted(sources),
+                })
     binding = "candidate-sha" if require_candidate_binding else "legacy-attempt"
     operation = {
         "status": "intent",
@@ -838,6 +1190,8 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
         "verdict": verdict.model_dump(mode="json"),
         "base_issues": {identity: issue.model_dump(mode="json")
                         for identity, issue in base_issues.items()},
+        "accounting_decisions": plan.accounting_decisions,
+        "legacy_reconciliations": legacy_reconciliations,
     }
     state = store.record_operation(state, key, operation)
     return _finish_review_operation(store, state, key, state.operations[key], manifest)
@@ -865,6 +1219,10 @@ def review_transaction_gaps(state: RunState, events: list[dict]) -> list[str]:
         accepted = _review_acceptance_events(events, key)
         if len(accepted) != 1:
             gaps.append(f"{key} (acceptance audit event missing or duplicated)")
+        elif (accepted[0].get("accounting_decisions") != operation.get("accounting_decisions")
+              or accepted[0].get("legacy_reconciliations")
+              != operation.get("legacy_reconciliations")):
+            gaps.append(f"{key} (acceptance audit accounting provenance disagrees with transaction)")
     for key in state.review_results:
         operation = state.operations.get(key)
         if not isinstance(operation, dict) or operation.get("status") != "completed":
@@ -2329,12 +2687,15 @@ class Engine:
                                                       summary=str(exc), owner_role="system")
                 issue = self.state.issues[key]
                 current = issue.assignments[-1]
-                if current.repairs:
+                if current.repairs and current.repairs not in (current.failed_repair_ordinals or []):
                     current.failed_repairs += 1
+                    if current.failed_repair_ordinals is None:
+                        current.failed_repair_ordinals = []
+                    current.failed_repair_ordinals.append(current.repairs)
                 if current.failed_repairs >= self.manifest.limits.max_failed_repairs_per_assignment:
                     if len(issue.assignments) - 1 >= self.manifest.limits.max_reassignments:
                         raise Escalation(f"Check repair exhausted for {worker.id}") from exc
-                    issue.assignments.append(AssignmentState())
+                    issue.assignments.append(AssignmentState(failed_repair_ordinals=[]))
                 feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"{worker.id}-{attempt}.md"
                 atomic_write(feedback, f"# CHECK feedback\n\n{exc}\n")
                 info["feedback"] = str(feedback)
@@ -2598,11 +2959,16 @@ class Engine:
                         self.state.issues[key] = issue
                     else:
                         current = issue.assignments[-1]
-                        current.failed_repairs += 1
+                        if (current.repairs
+                                and current.repairs not in (current.failed_repair_ordinals or [])):
+                            current.failed_repairs += 1
+                            if current.failed_repair_ordinals is None:
+                                current.failed_repair_ordinals = []
+                            current.failed_repair_ordinals.append(current.repairs)
                         if current.failed_repairs >= self.manifest.limits.max_failed_repairs_per_assignment:
                             if len(issue.assignments) - 1 >= self.manifest.limits.max_reassignments:
                                 raise Escalation("Integration check repairs exhausted") from exc
-                            issue.assignments.append(AssignmentState())
+                            issue.assignments.append(AssignmentState(failed_repair_ordinals=[]))
                     info = self.state.workers[worker.id]
                     info.update(checked=False, status="rework")
                     feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"integration-{worker.id}.md"

@@ -466,6 +466,10 @@ class AssignmentState(StrictModel):
     # charging the same repair again. The high-water mark makes a failure
     # charge idempotent across revalidation, replay and approval changes.
     assessed_repairs: int | None = Field(default=None, ge=0)
+    # Exact actual-repair ordinals charged as failed. ``None`` denotes legacy
+    # state that must be reconstructed from retained review transactions;
+    # newly written assignments use a concrete list, including an empty one.
+    failed_repair_ordinals: list[int] | None = None
 
 
 class IssueState(StrictModel):
@@ -475,7 +479,8 @@ class IssueState(StrictModel):
     parent_issue_id: str | None = None
     depth: int = Field(default=0, ge=0)
     status: Literal["open", "resolved", "escalated"] = "open"
-    assignments: list[AssignmentState] = Field(default_factory=lambda: [AssignmentState()])
+    assignments: list[AssignmentState] = Field(
+        default_factory=lambda: [AssignmentState(failed_repair_ordinals=[])])
     attempt: int = Field(default=1, ge=1)
     evidence: list[str] = Field(default_factory=list)
     summary: str = ""

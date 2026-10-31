@@ -81,7 +81,9 @@ The issue counters answer different questions and are charged separately:
 - `assessed_repairs` is the highest repair ordinal whose outcome a reviewer has
   already judged.
 - `failed_repairs` counts distinct unsuccessful repairs, at most once per repair
-  ordinal.
+  ordinal. The additive `failed_repair_ordinals` provenance lists those exact
+  positive ordinals; a missing value is legacy state and is reconstructed only
+  from retained transactions when attribution is unambiguous.
 - `review_rounds` counts accepted assessments of distinct work outcomes. A failed
   repair or a newly resolved issue advances it once; repeated review of the same
   outcome, including initially unrepaired work, does not advance it again.
@@ -97,15 +99,34 @@ high-water mark, so the configured stopping and one-reassignment policy still
 applies. Replay of a partially committed transaction recomputes the same plan
 from the recorded base register and is therefore idempotent.
 
-The provenance field is additive and optional. State written before it existed
-loads with no value. Routing derives a missing mark from completed review
-transactions: each transaction retains the complete pre-routing register and the
-accepted verdict, so the repair ordinal a review actually assessed is durable
-evidence. Ordinal zero is initial work before any repair; a finding there records
-an assessment of that initial work and can establish a mark of zero, but it never
-counts as an unsuccessful repair. The derived mark is accepted only when the
-distinct unsuccessful actual-repair outcomes in that evidence agree with the
-failure counter and the assessed ordinal does not exceed the repair counter.
+A valid finding that reopens an issue previously resolved at the same repair
+ordinal supersedes that premature successful assessment. It charges that exact
+assignment and repair ordinal once as unsuccessful, preserves the earlier pass,
+and records a `superseding_failure` accounting decision. It does not increment
+`repairs` or consume another review round. Repeated reopening of that same
+outcome records `already_charged` and cannot create another charge. If the new
+charge reaches the configured failure or reassignment boundary, the normal
+stopping policy applies. A later actual repair is assessed against its own
+ordinal and assignment.
+
+Accounting decisions are persisted in each new review transaction and acceptance
+audit event, including the issue, assignment index, repair ordinal, assessment
+kind and whether a failure/review-round counter changed. Replay verifies the
+decision against the recorded pre-routing register. Routing and evidence
+reconstruction use the same decision model; retained findings alone never imply
+a new charge. The optional `failed_repair_ordinals` field is an operational
+index of those durable decisions, not a replacement for their audit history.
+
+The provenance fields are additive and optional for schema-v1 state. Routing
+derives a missing assessment mark and exact charge ordinals from completed
+review transactions: each transaction retains the complete pre-routing register
+and accepted verdict. Ordinal zero is initial work before any repair; a finding
+there records an assessment of initial work and can establish a mark of zero,
+but it never counts as an unsuccessful repair. The derived mark and exact charge
+set must agree with counters. A legacy reopening is reconciled once only when a
+retained successful assessment, same assignment and repair ordinal establish
+unambiguous attribution; missing or contradictory history refuses before the
+next transaction is written.
 Counters alone never prove an assessment: a history with no completed review
 evidence, a duplicate charge for the same repair, an understated failure count,
 or explicit provenance that disagrees with retained evidence is refused with an
