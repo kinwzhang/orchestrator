@@ -33,8 +33,10 @@ from orch.workflow import (
     Engine,
     Escalation,
     approval_hashes,
+    derive_repair_assessment,
     plan_role_routing,
     recover_review_batch,
+    repair_assessment_evidence,
 )
 
 LIVE_RUN = Path("/home/zwj808/.local/state/orch/runs/model-preferences-cli-5ec7f5ee")
@@ -321,7 +323,7 @@ def test_approval_only_runtime_extension_revalidates_without_recharging(routing)
             id=identity, worker="w1", root_issue_id=identity, owner_role="code",
             status="open",
             assignments=[AssignmentState(
-                repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=None)])
+                repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=1)])
         for identity in ("code-w01-02", "code-w01-03")
     }
     state, sha = _round_two_review_state(store, state, feature, manifest, plan, issues)
@@ -436,7 +438,11 @@ def test_retained_live_round_two_revalidation_keeps_repair_counters(tmp_path):
                                   "instruction": "workers/w01.md",
                                   "allowed_paths": ["src/**", "tests/**"]}])
     before = state.model_dump(mode="json")
-    plan = plan_role_routing(state.issues, verdict, manifest, "code")
+    finding_ids = {finding.id for finding in verdict.findings}
+    evidence = repair_assessment_evidence(state)
+    base_issues = derive_repair_assessment(
+        state.issues, evidence, finding_ids, finding_ids | set(verdict.resolved))
+    plan = plan_role_routing(base_issues, verdict, manifest, "code")
     assert plan.escalation is None
     for identity in ("code-w01-02", "code-w01-03"):
         issue = plan.issues[identity]
@@ -445,7 +451,7 @@ def test_retained_live_round_two_revalidation_keeps_repair_counters(tmp_path):
         assert (assignment.repairs, assignment.failed_repairs,
                 assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)
         assert issue.status == "open"
-    assert plan.issues["code-w01-05"].assignments[-1].review_rounds == 1
+    assert plan.issues["code-w01-05"].assignments[-1].review_rounds == 0
     assert plan.issues["code-w01-05"].assignments[-1].failed_repairs == 0
     assert state.model_dump(mode="json") == before
     assert store.load(run_id).model_dump(mode="json") == before

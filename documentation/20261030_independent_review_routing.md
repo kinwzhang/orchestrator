@@ -82,10 +82,9 @@ The issue counters answer different questions and are charged separately:
   already judged.
 - `failed_repairs` counts distinct unsuccessful repairs, at most once per repair
   ordinal.
-- `review_rounds` counts accepted reviewer assessments. A review of initial
-  work on a first assignment that has no dispatched repair still counts as a
-  round, but revalidating an already-assessed repair outcome does not add
-  another round, including on a replacement that has not been repaired yet.
+- `review_rounds` counts accepted assessments of distinct work outcomes. A failed
+  repair or a newly resolved issue advances it once; repeated review of the same
+  outcome, including initially unrepaired work, does not advance it again.
 
 An approval-only change (for example a temporary runtime-limit extension)
 invalidates the approved-input digest and forces a fresh reviewer run and a new
@@ -99,12 +98,18 @@ applies. Replay of a partially committed transaction recomputes the same plan
 from the recorded base register and is therefore idempotent.
 
 The provenance field is additive and optional. State written before it existed
-loads with no value. Routing normalises such a record from retained counters:
-when every recorded repair already has a failure charge, the current outcome is
-treated as assessed; when an earlier repair is uncharged, the current finding
-charges once. A record with more failures than repairs has contradictory legacy
-evidence, so routing refuses with an actionable error instead of resetting
-counters or guessing whether another repair occurred.
+loads with no value. Routing derives a missing mark from completed review
+transactions: each transaction retains the complete pre-routing register and the
+accepted verdict, so the repair ordinal a review actually assessed is durable
+evidence. The derived mark is accepted only when the distinct unsuccessful
+outcomes in that evidence agree with the failure counter and the assessed ordinal
+does not exceed the repair counter. Counters alone never prove an assessment: a
+history with no completed review evidence, a duplicate charge for the same
+repair, an understated failure count, or explicit provenance that disagrees with
+retained evidence is refused with an actionable error. Legacy counters are
+preserved; the run is not silently granted or charged another allowance. Audit
+the retained transactions and use an approved recovery when the evidence is
+contradictory.
 
 ## Validation and transactions
 
@@ -168,8 +173,11 @@ does not edit `state.json`, delete verdicts or fabricate events. It:
    non-docs-owned findings, and confirms the code verdict is valid.
 6. Reconstructs the pre-batch register by inverting only the rejected batch's
    known mutations: one review round and, where a repair had been charged, one
-   failed repair. Findings absent from the pre-batch snapshot were created by
-   the batch and are removed.
+   failed repair. The assessment mark is reconstructed from completed review
+   transactions for the pre-batch counters; if that evidence is missing,
+   understated or duplicated, recovery refuses before any write instead of
+   inheriting the post-batch mark. Findings absent from the pre-batch snapshot
+   were created by the batch and are removed.
 7. Requires the reconstruction to equal, byte for byte, the independent
    pre-batch register copy written before that routing call
    (`round-<n>/docs-review/*-issues.md`), and requires that copy to predate the
@@ -235,8 +243,8 @@ the helper refuses, preserve the run and review the evidence.
 - Existing state schema version 1 loads; `owner_role`, `review_results` and the
   per-assignment repair-assessment mark are optional additions. Older states
   simply have no accepted role results, no ownership and no assessment mark
-  until the corresponding migration or normalisation runs. No schema version
-  bump or counter reset is required.
+  until the corresponding migration or evidence-based derivation runs. No schema
+  version bump or counter reset is required.
 - Older verdicts without `candidate_sha` remain parseable and are accepted only
   through the audited legacy recovery binding above.
 - Review verdict paths are attempt-specific for new runs. Historical

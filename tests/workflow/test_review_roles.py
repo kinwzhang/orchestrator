@@ -15,6 +15,7 @@ from orch.contracts import (
 )
 from orch.store import StateStore
 from orch.workflow import (
+    _legacy_pre_batch,
     accept_review_result,
     persist_issue_ownership,
     resolve_issue_ownership,
@@ -398,18 +399,19 @@ def test_later_ownership_conflict_does_not_apply_earlier_entries(tmp_path):
     assert store.events("run") == before_events
 
 
-def _accept_with_evidence(store, state, tmp_path, role, verdict, evidence, name=None):
+def _accept_with_evidence(store, state, tmp_path, role, verdict, evidence, name=None,
+                          manifest_override=None):
     path = tmp_path / f"verdict-{role}-{name or evidence[:8]}.md"
     write_markdown(path, verdict, "## Body\n\nEvidence.\n")
     return accept_review_result(
         store, state, role=role, candidate_sha=CANDIDATE, evidence_digest=evidence,
         attempt_id=f"review-{role}-1-1", verdict=verdict, verdict_path=path,
-        manifest=manifest(),
+        manifest=manifest_override or manifest(),
     )
 
 
 def _charged_issue(identity="code-1", repairs=1, failed_repairs=1, review_rounds=1,
-                   assessed_repairs=None):
+                   assessed_repairs=1):
     return IssueState(
         id=identity, worker="w1", root_issue_id=identity, owner_role="code",
         status="open",
@@ -527,7 +529,7 @@ def test_contradictory_legacy_repair_evidence_refuses_before_writes(tmp_path):
     before_events = store.events("run")
     verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
                       findings=[finding("code-1")])
-    with pytest.raises(ContractError, match="ambiguous whether the latest repair"):
+    with pytest.raises(ContractError, match="Counters are inconsistent"):
         _accept_with_evidence(store, state, tmp_path, "code", verdict, "d" * 64)
     after = store.load("run")
     assert after.model_dump(mode="json") == before.model_dump(mode="json")
@@ -569,3 +571,178 @@ def test_retained_legacy_result_is_not_rebound_to_changed_approval(tmp_path):
     assignment = after.issues["code-1"].assignments[-1]
     assert (assignment.failed_repairs, assignment.review_rounds,
             assignment.assessed_repairs) == (1, 1, 1)
+
+
+def _completed_review_operation(verdict, base_issue, evidence, candidate=CANDIDATE):
+    key = review_operation_key("code", candidate, evidence)
+    return key, {
+        "status": "completed",
+        "role": "code",
+        "candidate_sha": candidate,
+        "evidence_digest": evidence,
+        "attempt_id": "review-code-1-1",
+        "verdict_sha256": "0" * 64,
+        "verdict_path": f"/tmp/{evidence}.md",
+        "binding": "candidate-sha",
+        "recorded_at": "2026-01-01T00:00:00+00:00",
+        "verdict": verdict.model_dump(mode="json"),
+        "base_issues": {base_issue.id: base_issue.model_dump(mode="json")},
+    }
+
+
+def test_completed_review_evidence_derives_the_assessed_repair(tmp_path):
+    store = StateStore(tmp_path / "state")
+    issue = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                           assessed_repairs=None)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    base = _charged_issue(repairs=1, failed_repairs=0, review_rounds=0,
+                          assessed_repairs=0)
+    key, operation = _completed_review_operation(verdict, base, "a" * 64)
+    state = state_with({"code-1": issue})
+    state.operations = {key: operation}
+    state = store.save(state)
+
+    state, result = _accept_with_evidence(store, state, tmp_path, "code", verdict, "b" * 64)
+    after = store.load("run")
+    assignment = after.issues["code-1"].assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (1, 1, 1, 1)
+    assert result.transaction != key
+    assert after.review_results[result.transaction] == result
+
+
+def test_duplicate_legacy_failure_charge_is_refused_under_non_default_limit(tmp_path):
+    store = StateStore(tmp_path / "state")
+    issue = _charged_issue(repairs=2, failed_repairs=2, review_rounds=2,
+                           assessed_repairs=None)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    base_first = _charged_issue(repairs=1, failed_repairs=0, review_rounds=0,
+                                assessed_repairs=0)
+    base_repeat = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                                 assessed_repairs=1)
+    first_key, first = _completed_review_operation(verdict, base_first, "a" * 64)
+    repeat_key, repeat = _completed_review_operation(verdict, base_repeat, "b" * 64)
+    state = state_with({"code-1": issue})
+    state.operations = {first_key: first, repeat_key: repeat}
+    state = store.save(state)
+    before = store.load("run")
+
+    limits = manifest()
+    limits.limits = limits.limits.model_copy(
+        update={"max_failed_repairs_per_assignment": 3})
+    with pytest.raises(ContractError, match="only 1 distinct unsuccessful"):
+        _accept_with_evidence(store, store.load("run"), tmp_path, "code", verdict,
+                              "c" * 64, manifest_override=limits)
+    after = store.load("run")
+    assert after.model_dump(mode="json") == before.model_dump(mode="json")
+    assert store.events("run") == []
+    assert not any("c" * 64 in key for key in after.operations)
+
+
+@pytest.mark.parametrize("mutation,match", [
+    ({"assessed_repairs": 0, "failed_repairs": 0}, "retained reviews assessed outcome 1"),
+    ({"failed_repairs": 0}, "retained reviews show 1 distinct unsuccessful"),
+])
+def test_explicit_mark_disagreeing_with_evidence_refuses(tmp_path, mutation, match):
+    store = StateStore(tmp_path / "state")
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    base = _charged_issue(repairs=1, failed_repairs=0, review_rounds=0,
+                          assessed_repairs=0)
+    key, operation = _completed_review_operation(verdict, base, "a" * 64)
+    issue = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                           assessed_repairs=1)
+    issue.assignments[-1] = issue.assignments[-1].model_copy(update=mutation)
+    state = state_with({"code-1": issue})
+    state.operations = {key: operation}
+    state = store.save(state)
+    before = store.load("run")
+    with pytest.raises(ContractError, match=match):
+        _accept_with_evidence(store, store.load("run"), tmp_path, "code", verdict,
+                              "c" * 64)
+    after = store.load("run")
+    assert after.model_dump(mode="json") == before.model_dump(mode="json")
+    assert store.events("run") == []
+
+
+def test_legacy_pre_batch_restores_assessment_mark_and_recharges(tmp_path):
+    post = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                          assessed_repairs=1)
+    state = state_with({"code-1": post})
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    pre, removed, restored = _legacy_pre_batch(state, [verdict], {"code-1"}, {})
+    assert removed == []
+    assert restored == ["code-1"]
+    assignment = pre["code-1"].assignments[-1]
+    assert (assignment.repairs, assignment.failed_repairs,
+            assignment.review_rounds, assignment.assessed_repairs) == (1, 0, 0, 0)
+
+    store = StateStore(tmp_path / "state")
+    saved = store.save(state_with(pre))
+    saved, result = _accept_with_evidence(store, saved, tmp_path, "code", verdict, "e" * 64)
+    after = store.load("run")
+    assignment = after.issues["code-1"].assignments[-1]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.assessed_repairs) == (1, 1, 1)
+    assert after.review_results[result.transaction] == result
+
+    _, replay = _accept_with_evidence(store, store.load("run"), tmp_path, "code",
+                                      verdict, "e" * 64)
+    assert replay == result
+    assert store.load("run").issues["code-1"].assignments[-1].failed_repairs == 1
+
+
+def test_legacy_pre_batch_refuses_when_evidence_cannot_establish_mark():
+    post = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                          assessed_repairs=1)
+    state = state_with({"code-1": post})
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    evidence = {("code-1", 0): {1: {"findings": ["prior-transaction"],
+                                    "resolved": []}}}
+    before = state.model_dump(mode="json")
+    with pytest.raises(ContractError, match="understate the assessed history"):
+        _legacy_pre_batch(state, [verdict], {"code-1"}, evidence)
+    assert state.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize("boundary", ["after-intent", "before-completion"])
+def test_reconstructed_batch_reacceptance_is_crash_safe(tmp_path, monkeypatch, boundary):
+    post = _charged_issue(repairs=1, failed_repairs=1, review_rounds=1,
+                          assessed_repairs=1)
+    verdict = Verdict(reviewer="code", result="rework", candidate_sha=CANDIDATE,
+                      findings=[finding("code-1")])
+    pre, _, _ = _legacy_pre_batch(state_with({"code-1": post}), [verdict],
+                                  {"code-1"}, {})
+    store = StateStore(tmp_path / "state")
+    state = store.save(state_with(pre))
+    original = store.record_operation
+
+    def interrupted(current, key, value):
+        if boundary == "after-intent":
+            if value.get("status") == "completed":
+                return original(current, key, value)
+            original(current, key, value)
+            raise RuntimeError("crash after intent")
+        if value.get("status") == "completed":
+            raise RuntimeError("crash before completion")
+        return original(current, key, value)
+
+    monkeypatch.setattr(store, "record_operation", interrupted)
+    with pytest.raises(RuntimeError):
+        _accept_with_evidence(store, state, tmp_path, "code", verdict, "f" * 64)
+    monkeypatch.undo()
+
+    _, result = _accept_with_evidence(store, store.load("run"), tmp_path, "code",
+                                      verdict, "f" * 64)
+    replay = store.load("run")
+    assignment = replay.issues["code-1"].assignments[-1]
+    assert (assignment.failed_repairs, assignment.review_rounds,
+            assignment.assessed_repairs) == (1, 1, 1)
+    assert replay.review_results[result.transaction] == result
+    assert len([event for event in store.events("run")
+                if event.get("kind") == "review_result_accepted"]) == 1
+    assert review_transaction_gaps(replay, store.events("run")) == []

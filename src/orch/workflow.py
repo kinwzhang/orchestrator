@@ -187,6 +187,187 @@ class RoleRoutingPlan:
     escalation: str | None = None
 
 
+def _validate_repair_counters(identity: str, assignment: AssignmentState) -> None:
+    """Refuse internally contradictory repair counters before any routing."""
+    if assignment.failed_repairs > assignment.repairs:
+        raise ContractError(
+            f"Issue {identity} records {assignment.failed_repairs} failed repairs for "
+            f"{assignment.repairs} repair attempt(s). Counters are inconsistent, so the "
+            "assessment history cannot be trusted. Refusing to reset or reinterpret them; "
+            "audit the retained review transactions and use an approved recovery."
+        )
+    mark = assignment.assessed_repairs
+    if mark is not None:
+        if mark > assignment.repairs:
+            raise ContractError(
+                f"Issue {identity} records assessment of repair {mark} but only "
+                f"{assignment.repairs} repair attempt(s). Explicit provenance is "
+                "inconsistent with the retained counters; refusing to continue."
+            )
+        if assignment.failed_repairs > mark:
+            raise ContractError(
+                f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
+                f"only repair outcome {mark} as assessed. Explicit provenance is "
+                "inconsistent with the retained counters; refusing to continue."
+            )
+
+
+def repair_assessment_evidence(
+    state: RunState,
+) -> dict[tuple[str, int], dict[int, dict[str, list[str]]]]:
+    """Derive per-assignment repair assessments from completed review transactions.
+
+    A completed role transaction records the complete pre-routing register and the
+    accepted verdict. When that verdict reports or resolves an issue, the base
+    assignment's repair ordinal is the outcome that review assessed. The mapping
+    is keyed by issue, assignment position and repair ordinal, and retains the
+    transaction identities as audit evidence.
+
+    Only completed transactions are evidence. An accepted role result without a
+    completed transaction makes the history incomplete and is refused rather than
+    filled in from counters.
+    """
+    evidence: dict[tuple[str, int], dict[int, dict[str, list[str]]]] = {}
+    completed: set[str] = set()
+    for key, operation in state.operations.items():
+        if not key.startswith(_REVIEW_RESULT_PREFIX):
+            continue
+        if not isinstance(operation, dict) or operation.get("status") != "completed":
+            continue
+        completed.add(key)
+        base = operation.get("base_issues")
+        recorded = operation.get("verdict")
+        if not isinstance(base, dict) or not isinstance(recorded, dict):
+            raise ContractError(
+                f"Review transaction {key} has no retained pre-routing register or verdict; "
+                "repair-assessment provenance cannot be established"
+            )
+        try:
+            verdict = Verdict.model_validate(recorded)
+        except (ValueError, TypeError) as exc:
+            raise ContractError(
+                f"Review transaction {key} has a malformed retained verdict: {exc}"
+            ) from exc
+        finding_ids = {finding.id for finding in verdict.findings}
+        for identity in finding_ids | set(verdict.resolved):
+            base_issue = base.get(identity)
+            if not isinstance(base_issue, dict):
+                continue
+            try:
+                issue = IssueState.model_validate(base_issue)
+            except (ValueError, TypeError) as exc:
+                raise ContractError(
+                    f"Review transaction {key} has a malformed retained register for "
+                    f"{identity}: {exc}"
+                ) from exc
+            if not issue.assignments:
+                continue
+            assignment_index = len(issue.assignments) - 1
+            ordinal = issue.assignments[-1].repairs
+            record = evidence.setdefault((identity, assignment_index), {}).setdefault(
+                ordinal, {"findings": [], "resolved": []}
+            )
+            record["findings" if identity in finding_ids else "resolved"].append(key)
+    missing = sorted(set(state.review_results) - completed)
+    if missing:
+        raise ContractError(
+            "Accepted role results have no completed review transaction: "
+            + ", ".join(missing)
+            + "; repair-assessment provenance cannot be established"
+        )
+    return evidence
+
+
+def _derive_assessed_repairs(identity: str, assignment: AssignmentState,
+                             records: dict[int, dict[str, list[str]]]) -> int:
+    """Derive an assessment mark from completed-review evidence or refuse."""
+    _validate_repair_counters(identity, assignment)
+    if not records:
+        if assignment.failed_repairs or assignment.review_rounds:
+            raise ContractError(
+                f"Issue {identity} has failed or reviewed repair counters but no completed "
+                "review transaction evidence. Counters alone cannot prove which repair "
+                "outcome was assessed. Refusing to guess; audit the retained verdicts and "
+                "use an approved recovery instead."
+            )
+        # An open issue with no failure charge, no review round and no completed
+        # review evidence has not had a repair outcome assessed yet.
+        return 0
+    failure_ordinals = {ordinal for ordinal, record in records.items() if record["findings"]}
+    if assignment.failed_repairs > len(failure_ordinals):
+        raise ContractError(
+            f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
+            f"completed reviews show only {len(failure_ordinals)} distinct unsuccessful "
+            "repair outcome(s). The counters may contain a duplicate charge from an "
+            "earlier revalidation. Refusing to guess or reset them; audit the retained "
+            "review transactions and use an approved recovery."
+        )
+    if assignment.failed_repairs < len(failure_ordinals):
+        raise ContractError(
+            f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
+            f"completed reviews show {len(failure_ordinals)} distinct unsuccessful repair "
+            "outcome(s). The counters understate the assessed history; refusing to continue."
+        )
+    assessed = max(records)
+    if assessed > assignment.repairs:
+        raise ContractError(
+            f"Issue {identity} has review evidence for repair {assessed} but only "
+            f"{assignment.repairs} repair attempt(s). Retained evidence and counters "
+            "disagree; refusing to continue."
+        )
+    return assessed
+
+
+def derive_repair_assessment(
+    issues: dict[str, IssueState],
+    evidence: dict[tuple[str, int], dict[int, dict[str, list[str]]]],
+    finding_ids: set[str],
+    relevant_ids: set[str] | None = None,
+) -> dict[str, IssueState]:
+    """Return a copy with legacy finding assessments derived from evidence.
+
+    Explicit marks are validated against the counters and, when retained review
+    evidence exists, against the exact assessed repair outcome. Resolution
+    targets are not derived here: the current passing verdict is itself their
+    assessment. They are still checked for contradictory explicit counters.
+    """
+    work = {identity: issue.model_copy(deep=True) for identity, issue in issues.items()}
+    for identity in (relevant_ids if relevant_ids is not None else finding_ids):
+        issue = work.get(identity)
+        if issue is None or not issue.assignments:
+            continue
+        assignment = issue.assignments[-1]
+        records = evidence.get((identity, len(issue.assignments) - 1), {})
+        if identity in finding_ids and assignment.assessed_repairs is None:
+            assignment.assessed_repairs = _derive_assessed_repairs(identity, assignment, records)
+            continue
+        _validate_repair_counters(identity, assignment)
+        if assignment.assessed_repairs is None:
+            continue
+        if not records:
+            # An explicit durable mark is itself provenance. Only the counter
+            # invariants can be checked here; there is no completed transaction
+            # to cross-validate against.
+            continue
+        evidence_mark = max(records)
+        if assignment.assessed_repairs != evidence_mark:
+            raise ContractError(
+                f"Issue {identity} records repair outcome {assignment.assessed_repairs} "
+                f"as assessed but retained reviews assessed outcome {evidence_mark}. "
+                "Explicit provenance disagrees with the retained evidence; refusing to continue."
+            )
+        failure_ordinals = {ordinal for ordinal, record in records.items()
+                            if record["findings"]}
+        if assignment.failed_repairs != len(failure_ordinals):
+            raise ContractError(
+                f"Issue {identity} records {assignment.failed_repairs} failed repair(s) but "
+                f"retained reviews show {len(failure_ordinals)} distinct unsuccessful "
+                "outcome(s). Explicit provenance disagrees with the retained evidence; "
+                "refusing to continue."
+            )
+    return work
+
+
 def _assess_repair_outcome(issue: IssueState, identity: str) -> bool:
     """Return whether a finding assesses a distinct unsuccessful repair.
 
@@ -194,33 +375,28 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> bool:
     records the highest repair ordinal whose outcome a reviewer has already
     judged, so each actual repair is charged at most once even when a changed
     approval or a fresh reviewer run routes the same retained feedback again.
-    Legacy assignments without the provenance are normalised from their retained
-    counters; contradictory over-charged evidence is refused instead of guessed.
+
+    A missing mark is only safe for an open issue with no failure or review
+    history; all other legacy histories must be normalised from completed review
+    evidence by the caller first. Counters alone never prove an assessment.
 
     The caller owns a deep copy, so mutating the counters here cannot affect the
     accepted register unless the whole plan validates.
     """
     current = issue.assignments[-1]
+    _validate_repair_counters(identity, current)
     if current.repairs == 0:
-        # Reviewing work before any repair has been dispatched is a review round
-        # but cannot be an unsuccessful repair.
+        if current.assessed_repairs is None:
+            current.assessed_repairs = 0
         return False
     if current.assessed_repairs is None:
-        if current.failed_repairs > current.repairs:
+        if current.failed_repairs or current.review_rounds or issue.status == "resolved":
             raise ContractError(
-                f"Issue {identity} records {current.failed_repairs} failed repairs for "
-                f"{current.repairs} repair attempt(s) without repair-assessment provenance. "
-                "The counters are already inconsistent, so it is ambiguous whether the "
-                "latest repair was charged. Refusing to guess or reset them; audit the "
-                "retained verdicts and use an approved recovery instead."
+                f"Issue {identity} has repair history without durable assessment "
+                "provenance. Counters alone cannot prove which repair outcome was "
+                "assessed. Refusing to guess; derive the mark from completed review "
+                "transactions or use an approved recovery."
             )
-        if current.failed_repairs == current.repairs:
-            # Every recorded repair already has a failure charge. Retained
-            # evidence therefore shows the current outcome was assessed.
-            current.assessed_repairs = current.repairs
-            return False
-        # At least one recorded repair has no failure charge, so this is the
-        # first assessment of a distinct unsuccessful repair.
         current.assessed_repairs = current.repairs
         return True
     if current.repairs > current.assessed_repairs:
@@ -304,13 +480,6 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
                 if new_failed_repair:
                     current.failed_repairs += 1
                     current.review_rounds += 1
-                elif current.repairs == 0 and len(previous.assignments) == 1:
-                    # Preserve the historical review-call accounting for initial
-                    # work that has no repair outcome to deduplicate. A fresh
-                    # replacement with no repair yet is not initial work: a
-                    # repeated finding there is revalidation of the outcome that
-                    # caused the replacement.
-                    current.review_rounds += 1
                 previous.status = "open"
             else:
                 previous = IssueState(id=identity, worker=finding.worker, root_issue_id=root,
@@ -354,13 +523,22 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
 
     for identity in resolved:
         issue = work[identity]
+        was_open = issue.status == "open"
+        _validate_repair_counters(identity, issue.assignments[-1])
         issue.status = "resolved"
         # A passing assessment covers the current repair outcome even though it
-        # is not a failure. Recording the mark stops a later revalidation of the
-        # same work from charging a repair that was already accepted.
+        # is not a failure. Record the mark so a later revalidation of the same
+        # outcome cannot charge it as failed. A newly resolved outcome counts as
+        # a review round; re-resolving an already resolved outcome does not.
         current = issue.assignments[-1]
-        if current.assessed_repairs is None or current.repairs > current.assessed_repairs:
+        new_outcome = (current.assessed_repairs is None
+                       or current.repairs > current.assessed_repairs)
+        if was_open and new_outcome:
+            current.review_rounds += 1
+        if current.assessed_repairs is None:
             current.assessed_repairs = current.repairs
+        else:
+            current.assessed_repairs = max(current.assessed_repairs, current.repairs)
         touched.add(identity)
     return RoleRoutingPlan(
         issues=work, findings=findings, resolved=resolved, touched=sorted(touched),
@@ -628,9 +806,14 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
             )
         return _finish_review_operation(store, state, key, operation, manifest)
 
-    # Raises on any ownership, lineage, consistency or budget-shape problem
-    # before the first durable write for this role result.
-    plan_role_routing(state.issues, verdict, manifest, role)
+    # Derive legacy assessment marks from completed review evidence and validate
+    # explicit marks before the first durable write for this role result.
+    finding_ids = {finding.id for finding in verdict.findings}
+    relevant_ids = finding_ids | set(verdict.resolved)
+    evidence = repair_assessment_evidence(state)
+    base_issues = derive_repair_assessment(
+        state.issues, evidence, finding_ids, relevant_ids)
+    plan_role_routing(base_issues, verdict, manifest, role)
     binding = "candidate-sha" if require_candidate_binding else "legacy-attempt"
     operation = {
         "status": "intent",
@@ -644,7 +827,7 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
         "recorded_at": timestamp(),
         "verdict": verdict.model_dump(mode="json"),
         "base_issues": {identity: issue.model_dump(mode="json")
-                        for identity, issue in state.issues.items()},
+                        for identity, issue in base_issues.items()},
     }
     state = store.record_operation(state, key, operation)
     return _finish_review_operation(store, state, key, state.operations[key], manifest)
@@ -914,8 +1097,12 @@ def _legacy_review_attempt(store: StateStore, state: RunState, logical: str,
     return attempt, {"intent": intents[0]["id"], "completed": completed[0]["id"]}
 
 
-def _legacy_pre_batch(state: RunState, verdicts: list[Verdict],
-                      pre_ids: set[str]) -> tuple[dict[str, IssueState], list[str], list[str]]:
+def _legacy_pre_batch(
+    state: RunState,
+    verdicts: list[Verdict],
+    pre_ids: set[str],
+    evidence: dict[tuple[str, int], dict[int, dict[str, list[str]]]],
+) -> tuple[dict[str, IssueState], list[str], list[str]]:
     """Invert exactly the rejected legacy combined-routing batch.
 
     The old router mutated finding counters and created new findings before it
@@ -923,7 +1110,10 @@ def _legacy_pre_batch(state: RunState, verdicts: list[Verdict],
     increment and one failed-repair increment (only where a repair was already
     charged) reconstructs the pre-batch register. Finding IDs absent from the
     independently generated pre-batch snapshot are the batch's new findings and
-    are removed. The caller must additionally verify the rendered register.
+    are removed. The assessment mark is reconstructed from completed review
+    evidence for the pre-batch counters; if the retained evidence cannot
+    establish it, reconstruction refuses before any write. The caller must
+    additionally verify the rendered register.
     """
     pre = {identity: issue.model_copy(deep=True) for identity, issue in state.issues.items()}
     finding_ids = sorted({finding.id for verdict in verdicts for finding in verdict.findings})
@@ -960,6 +1150,10 @@ def _legacy_pre_batch(state: RunState, verdicts: list[Verdict],
             raise ContractError(
                 f"Issue {identity} has failed repairs without a charged repair; refusing"
             )
+        records = evidence.get((identity, len(issue.assignments) - 1), {})
+        assignment.assessed_repairs = None
+        assignment.assessed_repairs = _derive_assessed_repairs(
+            identity, assignment, records)
         restored.append(identity)
     for identity in resolved_ids:
         if identity not in pre_ids:
@@ -1170,9 +1364,23 @@ def recover_review_batch(store: StateStore, feature, manifest: Manifest, plan: P
             )
             ownership_entries = engine.settle_issue_ownership(persist=False)
             validate_ownership_audit(store.events(run_id), ownership_entries)
-            plan_role_routing(working.issues, code_verdict, manifest, "code")
+
+            snapshots = sorted((engine.run_dir / f"round-{round_no}" / "docs-review")
+                               .glob("*-issues.md"))
+            if len(snapshots) != 1:
+                raise ContractError(
+                    "Expected exactly one pre-batch issue-register snapshot in "
+                    f"round-{round_no}/docs-review"
+                )
+            snapshot = snapshots[0]
+            evidence = repair_assessment_evidence(working)
+            pre, removed, restored = _legacy_pre_batch(
+                working, [code_verdict, docs_verdict], _snapshot_issue_ids(snapshot),
+                evidence,
+            )
+            plan_role_routing(pre, code_verdict, manifest, "code")
             try:
-                plan_role_routing(working.issues, docs_verdict, manifest, "docs")
+                plan_role_routing(pre, docs_verdict, manifest, "docs")
             except ContractError as exc:
                 docs_error = str(exc)
             else:
@@ -1186,23 +1394,12 @@ def recover_review_batch(store: StateStore, feature, manifest: Manifest, plan: P
                 )
             invalid_resolved = sorted(
                 identity for identity in docs_verdict.resolved
-                if (working.issues.get(identity) is not None
-                    and working.issues[identity].owner_role != "docs")
+                if (pre.get(identity) is not None
+                    and pre[identity].owner_role != "docs")
             )
             if not invalid_resolved:
                 raise ContractError("No cross-role resolutions were found to reject")
 
-            snapshots = sorted((engine.run_dir / f"round-{round_no}" / "docs-review")
-                               .glob("*-issues.md"))
-            if len(snapshots) != 1:
-                raise ContractError(
-                    "Expected exactly one pre-batch issue-register snapshot in "
-                    f"round-{round_no}/docs-review"
-                )
-            snapshot = snapshots[0]
-            pre, removed, restored = _legacy_pre_batch(
-                working, [code_verdict, docs_verdict], _snapshot_issue_ids(snapshot)
-            )
             snapshot_state = working.model_copy(deep=True)
             snapshot_state.issues = pre
             expected = issues_markdown(snapshot_state, include_ownership=False)

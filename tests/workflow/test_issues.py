@@ -139,8 +139,11 @@ def test_docs_new_finding_is_docs_owned_and_reopens_only_itself():
     assert plan.issues["docs-1"].owner_role == "docs"
     plan = plan_role_routing(plan.issues, docs_verdict(new), manifest(), "docs")
     issue = plan.issues["docs-1"]
-    assert issue.assignments[-1].review_rounds == 1
+    # Repeated review of initially unrepaired work must not move the review-round
+    # allowance; only a distinct repair outcome or resolution may do that.
+    assert issue.assignments[-1].review_rounds == 0
     assert issue.assignments[-1].failed_repairs == 0
+    assert issue.assignments[-1].assessed_repairs == 0
 
 
 def live_shaped_issues(repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=None):
@@ -157,8 +160,8 @@ def live_shaped_issues(repairs=1, failed_repairs=1, review_rounds=1, assessed_re
     }
 
 
-def test_revalidating_an_already_charged_repair_keeps_counters_and_assignment():
-    issues = live_shaped_issues()
+def test_revalidating_an_assessed_repair_keeps_counters_and_assignment():
+    issues = live_shaped_issues(assessed_repairs=1)
     original = copy.deepcopy(issues)
     verdict = code_verdict(finding("code-w01-02", root="code-w01-02"), finding("code-w01-03", root="code-w01-03"))
     plan = plan_role_routing(issues, verdict, manifest(), "code")
@@ -172,6 +175,16 @@ def test_revalidating_an_already_charged_repair_keeps_counters_and_assignment():
         assert assignment.failed_repairs == 1
         assert assignment.review_rounds == 1
         assert assignment.assessed_repairs == 1
+
+
+def test_counter_only_legacy_repair_history_refuses_without_provenance():
+    issues = live_shaped_issues()
+    original = copy.deepcopy(issues)
+    with pytest.raises(ContractError, match="without durable assessment provenance"):
+        plan_role_routing(
+            issues, code_verdict(finding("code-w01-02", root="code-w01-02")),
+            manifest(), "code")
+    assert issues == original
 
 
 def test_each_distinct_unsuccessful_repair_is_charged_once_then_replaces():
@@ -214,12 +227,13 @@ def test_each_distinct_unsuccessful_repair_is_charged_once_then_replaces():
         assert issue.assignments[-1].review_rounds == 0
 
 
-def test_legacy_repair_counters_are_normalised_per_issue():
+def test_explicit_assessment_marks_are_validated_per_issue():
     issues = {
         "already-charged": IssueState(
             id="already-charged", worker="w1", root_issue_id="already-charged",
             owner_role="code", status="open",
-            assignments=[AssignmentState(repairs=1, failed_repairs=1, review_rounds=1)]),
+            assignments=[AssignmentState(
+                repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=1)]),
         "new-outcome": IssueState(
             id="new-outcome", worker="w1", root_issue_id="new-outcome",
             owner_role="code", status="open",
@@ -237,10 +251,25 @@ def test_legacy_repair_counters_are_normalised_per_issue():
     assert len(plan.issues["new-outcome"].assignments) == 1
 
 
+@pytest.mark.parametrize("repairs,failed,review,mark,match", [
+    (1, 1, 1, 5, "assessment of repair 5"),
+    (2, 2, 2, 1, "only repair outcome 1 as assessed"),
+])
+def test_inconsistent_explicit_assessment_marks_refuse(repairs, failed, review, mark, match):
+    issues = live_shaped_issues(repairs=repairs, failed_repairs=failed,
+                                review_rounds=review, assessed_repairs=mark)
+    original = copy.deepcopy(issues)
+    with pytest.raises(ContractError, match=match):
+        plan_role_routing(
+            issues, code_verdict(finding("code-w01-02", root="code-w01-02")),
+            manifest(), "code")
+    assert issues == original
+
+
 def test_contradictory_legacy_repair_evidence_refuses_without_mutation():
     issues = live_shaped_issues(repairs=1, failed_repairs=2, review_rounds=2)
     original = copy.deepcopy(issues)
-    with pytest.raises(ContractError, match="ambiguous whether the latest repair"):
+    with pytest.raises(ContractError, match="Counters are inconsistent"):
         plan_role_routing(issues, code_verdict(finding("code-w01-02", root="code-w01-02")), manifest(), "code")
     assert issues == original
 
@@ -250,11 +279,13 @@ def test_repair_revalidation_is_independent_between_reviewer_roles():
         "code-1": IssueState(
             id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
             status="open",
-            assignments=[AssignmentState(repairs=1, failed_repairs=1, review_rounds=1)]),
+            assignments=[AssignmentState(
+                repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=1)]),
         "docs-1": IssueState(
             id="docs-1", worker="w1", root_issue_id="docs-1", owner_role="docs",
             status="open",
-            assignments=[AssignmentState(repairs=1, failed_repairs=1, review_rounds=1)]),
+            assignments=[AssignmentState(
+                repairs=1, failed_repairs=1, review_rounds=1, assessed_repairs=1)]),
     }
     code_plan = plan_role_routing(issues, code_verdict(finding("code-1", root="code-1")), manifest(), "code")
     assert code_plan.touched == ["code-1"]
@@ -266,3 +297,30 @@ def test_repair_revalidation_is_independent_between_reviewer_roles():
     assert docs_plan.touched == ["docs-1"]
     assert docs_plan.issues["docs-1"].assignments[-1].failed_repairs == 1
     assert docs_plan.issues["code-1"].assignments[-1].failed_repairs == 1
+
+
+def test_repeated_review_of_initially_unrepaired_work_does_not_advance_rounds():
+    new = finding("docs-1", root="docs-1")
+    issues = {}
+    for _ in range(3):
+        issues = apply(issues, docs_verdict(new), role="docs")
+    assignment = issues["docs-1"].assignments[-1]
+    assert len(issues["docs-1"].assignments) == 1
+    assert assignment.repairs == 0
+    assert assignment.failed_repairs == 0
+    assert assignment.review_rounds == 0
+    assert assignment.assessed_repairs == 0
+
+
+def test_resolution_counts_a_new_outcome_but_revalidation_does_not():
+    issue = IssueState(
+        id="docs-1", worker="w1", root_issue_id="docs-1", owner_role="docs",
+        status="open",
+        assignments=[AssignmentState(repairs=1, failed_repairs=0, review_rounds=0,
+                                     assessed_repairs=0)])
+    passed = docs_verdict(resolved=["docs-1"], result="pass")
+    plan = plan_role_routing({"docs-1": issue}, passed, manifest(), "docs")
+    assignment = plan.issues["docs-1"].assignments[-1]
+    assert (assignment.review_rounds, assignment.assessed_repairs) == (1, 1)
+    again = plan_role_routing(plan.issues, passed, manifest(), "docs")
+    assert again.issues["docs-1"].assignments[-1].review_rounds == 1
