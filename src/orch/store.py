@@ -1,6 +1,7 @@
 """Atomic snapshots, a durable event journal, and human-readable run evidence."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -12,7 +13,14 @@ from pathlib import Path
 import portalocker
 from pydantic import ValidationError
 
-from orch.contracts import ContractError, RunState
+from orch.contracts import (
+    REVIEW_APPLICATION_OPERATION,
+    SUPPORTED_STATE_SCHEMA_VERSIONS,
+    ContractError,
+    EvidenceConflictError,
+    ReviewApplication,
+    RunState,
+)
 
 # Internal writer locks tolerate brief contention (for example a control
 # command racing a snapshot refresh) without ever weakening exclusivity.
@@ -21,6 +29,14 @@ WRITER_LOCK_TIMEOUT = 5.0
 
 def timestamp() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _decision_digest(decision: dict | None) -> str | None:
+    """Stable digest of one applied entry decision for audit reconciliation."""
+    if decision is None:
+        return None
+    payload = json.dumps(decision, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -89,14 +105,20 @@ def issues_markdown(state: RunState, *, include_ownership: bool = True) -> str:
         parent = issue.parent_issue_id or "none"
         ownership = (f"; role={issue.owner_role}"
                      if include_ownership and issue.owner_role else "")
+        legacy = f"; legacy={issue.legacy_status}" if issue.legacy_status else ""
         issues.append(f"- **{issue.id}** — status={issue.status}; depth={issue.depth}; "
                       f"owner={issue.worker}; root={issue.root_issue_id}; parent={parent}; "
                       f"attempt={issue.attempt}; reassignments={issue.reassignments}"
-                      f"{ownership}")
+                      f"{ownership}; lifecycle={issue.lifecycle}{legacy}")
         for number, assignment in enumerate(issue.assignments, start=1):
             issues.append(f"  - assignment {number}: repairs={assignment.repairs}; "
                           f"failed={assignment.failed_repairs}; "
                           f"review_rounds={assignment.review_rounds}")
+            for outcome in assignment.outcomes:
+                issues.append(
+                    f"  - outcome {outcome.repair_ordinal}: {outcome.outcome}; "
+                    f"charged={outcome.charged_failed_repair}; "
+                    f"transaction={outcome.review_transaction}")
         if issue.summary:
             issues.append(f"  - summary: {_one_line(issue.summary)}")
         for link in issue.evidence:
@@ -129,7 +151,7 @@ class StateStore:
             raise ContractError(f"{path}: corrupt run state: expected a JSON object")
         if "version" not in data:
             raise ContractError(f"{path}: run state has no schema version; explicit migration is required")
-        if data.get("version") != 1:
+        if data.get("version") not in SUPPORTED_STATE_SCHEMA_VERSIONS:
             raise ContractError(
                 f"{path}: unsupported run state version {data.get('version')!r}; "
                 "explicit migration is required"
@@ -207,6 +229,208 @@ class StateStore:
         state = self.save(state)
         self.event(state.run_id, "operation", operation=key, **payload)
         return state
+
+    def _application(self, state: RunState, application_id: str) -> ReviewApplication:
+        application = state.review_applications.get(application_id)
+        if application is None:
+            raise ContractError(
+                f"Review application {application_id} has no durable intent; "
+                "nothing may be applied before the intent is persisted"
+            )
+        return application
+
+    @staticmethod
+    def _entry(application: ReviewApplication, entry_id: str):
+        for entry in application.entries:
+            if entry.entry_id == entry_id:
+                return entry
+        raise ContractError(
+            f"Review application {application.application_id} has no entry {entry_id!r}"
+        )
+
+    def begin_review_application(self, state: RunState,
+                                 application: ReviewApplication) -> RunState:
+        """Persist the complete review intent before any entry is applied.
+
+        Repeating an identical intent is idempotent. A different intent for the
+        same application identity is contradictory and refused.
+        """
+        existing = state.review_applications.get(application.application_id)
+        if existing is not None:
+            def core(value: ReviewApplication) -> dict:
+                payload = value.model_dump(mode="json")
+                payload.pop("intent_at", None)
+                return payload
+            if core(existing) != core(application):
+                raise EvidenceConflictError(
+                    f"Review application {application.application_id} already has a "
+                    "different durable intent"
+                )
+            return state
+        if not application.entries:
+            raise ContractError("A review application with no entries cannot be recorded")
+        state.review_applications[application.application_id] = application.model_copy(deep=True)
+        operation_key = f"{REVIEW_APPLICATION_OPERATION}{application.application_id}"
+        return self.record_operation(state, operation_key, {
+            "status": "intent",
+            "transaction": application.transaction,
+            "reviewer_role": application.reviewer_role,
+            "candidate_sha": application.candidate_sha,
+            "verdict_sha256": application.verdict_sha256,
+            "entry_ids": [entry.entry_id for entry in application.entries],
+            "intent_at": application.intent_at,
+        })
+
+    def apply_review_entry(self, state: RunState, application_id: str, entry_id: str, *,
+                           decision: dict, issue) -> RunState:
+        """Atomically save one entry's issue effects and applied decision.
+
+        No audit event is written here: a crash between this save and
+        ``record_review_entry_audit`` is a supported boundary that reconciliation
+        repairs from the durable decision.
+        """
+        application = self._application(state, application_id)
+        entry = self._entry(application, entry_id)
+        if not isinstance(decision, dict) or not decision:
+            raise ContractError(f"Entry {entry_id} requires an explicit nonempty decision")
+        if decision.get("issue", entry.issue_id) != entry.issue_id:
+            raise EvidenceConflictError(
+                f"Entry {entry_id} decision names {decision.get('issue')!r}, not "
+                f"{entry.issue_id!r}"
+            )
+        if entry.state == "applied":
+            if entry.decision != decision:
+                raise EvidenceConflictError(
+                    f"Entry {entry_id} was already applied with a different decision"
+                )
+            return state
+        if issue is None or issue.id != entry.issue_id:
+            raise ContractError(
+                f"Entry {entry_id} must supply the updated issue record for {entry.issue_id}"
+            )
+        current = state.issues.get(entry.issue_id)
+        if (entry.issue_before and current is not None
+                and current.model_dump(mode="json") != entry.issue_before):
+            raise EvidenceConflictError(
+                f"Entry {entry_id} has stale pre-application evidence; the issue "
+                "changed after the review intent was persisted"
+            )
+        state.issues[entry.issue_id] = issue.model_copy(deep=True)
+        updated = entry.model_copy(update={
+            "state": "applied", "decision": dict(decision), "applied_at": timestamp()})
+        application.entries[entry.order_index] = updated
+        return self.save(state)
+
+    def record_review_entry_audit(self, state: RunState, application_id: str,
+                                  entry_id: str) -> RunState:
+        """Append the stable audit event for one already-applied entry."""
+        application = self._application(state, application_id)
+        entry = self._entry(application, entry_id)
+        if entry.state != "applied":
+            raise ContractError(
+                f"Entry {entry_id} cannot be audited before its decision is applied"
+            )
+        digest = _decision_digest(entry.decision)
+        matching = [event for event in self.events(state.run_id)
+                    if event.get("kind") == "review_entry_applied"
+                    and event.get("application_id") == application_id
+                    and event.get("entry_id") == entry_id]
+        if len(matching) > 1:
+            raise EvidenceConflictError(
+                f"Entry {entry_id} has multiple audit events"
+            )
+        if matching:
+            if matching[0].get("decision_digest") != digest:
+                raise EvidenceConflictError(
+                    f"Entry {entry_id} audit event disagrees with its durable decision"
+                )
+            return state
+        self.event(
+            state.run_id, "review_entry_applied",
+            application_id=application_id, entry_id=entry_id,
+            transaction=application.transaction,
+            reviewer_role=application.reviewer_role,
+            decision=entry.decision, decision_digest=digest,
+        )
+        return state
+
+    def reconcile_review_application(self, state: RunState,
+                                     application_id: str) -> RunState:
+        """Repair missing audit events from durable decisions, or refuse.
+
+        An audit event without an applied decision is a contradictory state and
+        is refused rather than retroactively "applied" from the journal.
+        """
+        application = self._application(state, application_id)
+        events = self.events(state.run_id)
+        audited = {event.get("entry_id") for event in events
+                   if event.get("kind") == "review_entry_applied"
+                   and event.get("application_id") == application_id}
+        for entry in application.entries:
+            if entry.state == "not_applied" and entry.entry_id in audited:
+                raise EvidenceConflictError(
+                    f"Entry {entry.entry_id} has audit evidence but no applied decision"
+                )
+        for entry in application.entries:
+            if entry.state == "applied":
+                state = self.record_review_entry_audit(state, application_id, entry.entry_id)
+        return state
+
+    def complete_review_application(self, state: RunState,
+                                    application_id: str) -> RunState:
+        """Mark completion only when every entry and audit event agree."""
+        application = self._application(state, application_id)
+        if not application.fully_applied:
+            missing = [entry.entry_id for entry in application.entries
+                       if entry.state != "applied"]
+            raise ContractError(
+                f"Review application {application_id} is not complete; "
+                f"unapplied entries: {', '.join(missing)}"
+            )
+        state = self.reconcile_review_application(state, application_id)
+        application = self._application(state, application_id)
+        if not application.complete:
+            application.complete = True
+            application.completed_at = timestamp()
+            state = self.save(state)
+        completed = [event for event in self.events(state.run_id)
+                     if event.get("kind") == "review_application_completed"
+                     and event.get("application_id") == application_id]
+        if len(completed) > 1:
+            raise EvidenceConflictError(
+                f"Review application {application_id} has multiple completion events"
+            )
+        if not completed:
+            self.event(
+                state.run_id, "review_application_completed",
+                application_id=application_id, transaction=application.transaction,
+                applied_entry_ids=application.applied_entry_ids,
+                completed_at=application.completed_at,
+            )
+        return state
+
+    def resume_review_application(self, state: RunState, application_id: str) -> dict:
+        """Resume an interrupted application before relevant dispatch.
+
+        Reconciles missing audit events, finishes completion when possible, and
+        reports the derived next-entry position. It never launches a worker.
+        """
+        application = state.review_applications.get(application_id)
+        if application is None:
+            return {"status": "absent", "application_id": application_id,
+                    "next_entry_index": None, "complete": False}
+        state = self.reconcile_review_application(state, application_id)
+        application = self._application(state, application_id)
+        if application.fully_applied:
+            state = self.complete_review_application(state, application_id)
+        application = self._application(state, application_id)
+        return {
+            "status": "completed" if application.complete else "pending",
+            "application_id": application_id,
+            "next_entry_index": application.next_entry_index,
+            "complete": application.complete,
+            "applied_entry_ids": application.applied_entry_ids,
+        }
 
     def render_log(self, run_id: str) -> None:
         with self.lock(f"events-{run_id}", timeout=WRITER_LOCK_TIMEOUT):
