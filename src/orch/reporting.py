@@ -42,9 +42,34 @@ def render_report(state: RunState, events: list[dict]) -> str:
         lines.append(f"- {name}: {info.get('status', 'pending')}; handover: {info.get('handover', 'none')}")
     lines += ["", "## Issues", ""]
     for issue in state.issues.values():
-        lines.append(f"- {issue.id} ({issue.status}, root {issue.root_issue_id}, depth {issue.depth}): {issue.summary}")
+        legacy = f"; legacy {issue.legacy_status}" if issue.legacy_status else ""
+        lines.append(
+            f"- {issue.id} ({issue.lifecycle}{legacy}, root {issue.root_issue_id}, "
+            f"depth {issue.depth}): {issue.summary}")
         for index, assignment in enumerate(issue.assignments, 1):
             lines.append(f"  - Assignment {index}: {assignment.repairs} repairs, {assignment.failed_repairs} failed repairs, {assignment.review_rounds} review rounds.")
+    if state.review_applications:
+        lines += ["", "## Review applications", ""]
+        for application in state.review_applications.values():
+            lines.append(
+                f"- {application.application_id} ({application.reviewer_role}, "
+                f"transaction {application.transaction}): "
+                f"{len(application.applied_entry_ids)}/{len(application.entries)} entries "
+                f"applied; next {application.next_entry_index}; "
+                f"{'complete' if application.complete else 'incomplete'}.")
+    if state.dependency_record is not None:
+        lines += ["", "## Dependency record", ""]
+        lines.append(
+            f"- plan {state.dependency_record.plan_version}; "
+            f"{len(state.dependency_record.dependencies)} dependent issue(s).")
+        for item in state.dependency_record.dependencies:
+            waits = sorted(set(item.prerequisite_issue_ids)
+                           | set(item.verification_prerequisites))
+            lines.append(
+                f"  - {item.dependent_issue_id}: waits on "
+                f"{', '.join(waits) if waits else 'nothing declared'}"
+                + (f"; shared {', '.join(item.shared_resource_paths)}"
+                   if item.shared_resource_paths else ""))
     lines += ["", "## Usage by call", ""]
     for call in calls:
         lines.append(f"- {call.get('agent')} ({call.get('model', 'unknown model')}): {call.get('duration_seconds', 0):.2f}s; usage: {call.get('usage') or 'unavailable'}")
