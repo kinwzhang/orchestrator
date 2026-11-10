@@ -692,6 +692,12 @@ def _target_state(store: StateStore, run_id: str) -> RunState:
 
 
 def _verify_target_issues(state: RunState, expected: dict[str, IssueState]) -> None:
+    unknown = sorted(set(state.issues) - set(expected))
+    if unknown:
+        raise CarryForwardRefused(
+            "target run records issues outside the reviewed inventory: "
+            + ", ".join(unknown)
+        )
     for identity, issue in expected.items():
         current = state.issues.get(identity)
         if current is None:
@@ -1107,6 +1113,12 @@ def import_carry_forward(
             "requires a separate target run"
         )
     state = _target_state(store, run_id)
+    operation = _operation(state)
+    if operation is not None:
+        _verify_operation_digest(state, inventory)
+        if operation.get("status") == "completed":
+            return _completion_report(store, state, inventory, operation)
+
     if predecessor_run_dir is not None:
         predecessor = _read_predecessor(
             predecessor_run_dir,
@@ -1114,12 +1126,6 @@ def import_carry_forward(
             expected_run_id=inventory.predecessor_run_id,
         )
         _verify_predecessor(inventory, predecessor)
-
-    operation = _operation(state)
-    if operation is not None:
-        _verify_operation_digest(state, inventory)
-        if operation.get("status") == "completed":
-            return _completion_report(store, state, inventory, operation)
 
     expected = _migrated_issues(inventory, state.run_id, state.slug)
     _verify_target_issues(state, expected)

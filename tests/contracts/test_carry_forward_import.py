@@ -462,6 +462,27 @@ def test_completed_import_refuses_a_different_digest(orch_store, tmp_path):
     assert orch_store.events("target-1") == before_events
 
 
+def test_completed_import_reports_even_if_predecessor_is_unavailable(orch_store, tmp_path):
+    items = [issue("i1")]
+    predecessor_state(orch_store, items)
+    target_state(orch_store)
+    path = tmp_path / "inventory.md"
+    write_inventory(path, issues=items)
+    import_carry_forward(
+        orch_store, run_id="target-1", inventory_path=path,
+        predecessor_run_dir=orch_store.run_dir("pred-1"),
+    )
+    orch_store.run_dir("pred-1").rename(tmp_path / "pred-1-moved")
+
+    report = import_carry_forward(
+        orch_store, run_id="target-1", inventory_path=path,
+        predecessor_run_dir=orch_store.run_dir("pred-1"),
+    )
+
+    assert report.status == "completed"
+    assert report.already_imported_issues == ("i1",)
+
+
 def test_different_digest_after_intent_is_refused_before_write(orch_store, tmp_path):
     target_state(orch_store)
     path = tmp_path / "inventory.md"
@@ -488,6 +509,25 @@ def test_invalid_inventory_refuses_before_any_write(orch_store, tmp_path):
     assert orch_store.events("target-1") == []
     assert orch_store.load("target-1").operations == {}
     assert orch_store.load("target-1").issues == {}
+
+
+def test_target_issue_outside_inventory_is_refused_before_write(orch_store, tmp_path):
+    target_state(orch_store)
+    state = orch_store.load("target-1")
+    state.issues["extra"] = IssueState(
+        id="extra", worker="w1", root_issue_id="extra", status="pending",
+        owner_role="code",
+    )
+    orch_store.save(state)
+    path = tmp_path / "inventory.md"
+    write_inventory(path, issues=[issue("i1")])
+    before_state = state_bytes(orch_store)
+    before_events = orch_store.events("target-1")
+
+    with pytest.raises(CarryForwardRefused, match="outside the reviewed inventory"):
+        import_carry_forward(orch_store, run_id="target-1", inventory_path=path)
+    assert state_bytes(orch_store) == before_state
+    assert orch_store.events("target-1") == before_events
 
 
 def test_missing_target_run_is_refused_and_never_created(orch_store, tmp_path):
