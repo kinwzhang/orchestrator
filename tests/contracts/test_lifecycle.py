@@ -228,6 +228,27 @@ def test_dependency_record_participates_in_approval_and_parsing(tmp_path):
     assert path in approved_files(tmp_path, manifest)
 
 
+def test_carry_forward_inventory_participates_in_approval_and_path_validation(tmp_path):
+    from orch.contracts import Manifest, approved_files
+
+    path = tmp_path / "carry-forward-inventory.md"
+    path.write_text("# Carry-forward inventory\n\nApproved.\n")
+    manifest = Manifest(slug="x", branch="feature/x",
+                        carry_forward_inventory="carry-forward-inventory.md",
+                        workers=[{"id": "w1", "title": "t", "instruction": "workers/w1.md",
+                                  "allowed_paths": ["src/**"]}])
+    assert path in approved_files(tmp_path, manifest)
+
+    with pytest.raises(ValidationError):
+        Manifest(slug="x", branch="feature/x", carry_forward_inventory="../outside.md",
+                 workers=[{"id": "w1", "title": "t", "instruction": "workers/w1.md",
+                           "allowed_paths": ["src/**"]}])
+    with pytest.raises(ValidationError):
+        Manifest(slug="x", branch="feature/x", carry_forward_inventory="/absolute.md",
+                 workers=[{"id": "w1", "title": "t", "instruction": "workers/w1.md",
+                           "allowed_paths": ["src/**"]}])
+
+
 def test_migration_requires_explicit_ambiguous_mapping():
     issue = IssueState(id="i1", worker="w1", root_issue_id="i1", status="open",
                        assignments=[AssignmentState(repairs=1, failed_repairs=0,

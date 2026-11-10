@@ -4,12 +4,23 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import types
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Annotated, ClassVar, Literal, Union, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 ERROR_CATEGORIES = (
     "validation",
@@ -142,12 +153,111 @@ def _mapping(loader, node, deep=False):
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
         if not isinstance(key, str) or key in result:
-            raise ContractError(f"Duplicate or non-string YAML key: {key!r}")
+            raise ContractError("Duplicate or non-string YAML key")
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
 
 
 UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _mapping)
+
+
+@dataclass(frozen=True)
+class _LocNode:
+    """What one error-location component is allowed to name."""
+
+    models: tuple[type[BaseModel], ...] = ()
+    kind: str = "opaque"
+    child: _LocNode | None = None
+
+
+_UNRECOGNIZED_FIELD = "<unrecognized field>"
+
+
+def _loc_node(annotation) -> _LocNode:
+    """Describe the models, sequence or mapping a location component indexes.
+
+    Only names the schema declares are safe to print. Mapping keys and any
+    component the schema does not declare come from the input document, so the
+    traversal reports them as unrecognized instead of echoing them.
+    """
+    while get_origin(annotation) is Annotated:
+        annotation = get_args(annotation)[0]
+    origin = get_origin(annotation)
+    if origin is None:
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            return _LocNode((annotation,), "model")
+        return _LocNode()
+    if origin in (Union, types.UnionType):
+        models = tuple(model for member in get_args(annotation)
+                       for model in _loc_node(member).models)
+        return _LocNode(models, "model" if models else "opaque")
+    arguments = get_args(annotation)
+    if origin in (list, set, frozenset, tuple, Sequence):
+        child = _loc_node(arguments[0]) if arguments else None
+        return _LocNode((), "sequence", child)
+    if origin in (dict, Mapping):
+        child = _loc_node(arguments[1]) if len(arguments) == 2 else None
+        return _LocNode((), "mapping", child)
+    return _LocNode()
+
+
+def _render_location(root: _LocNode, loc) -> str:
+    """Render a location using declared field names and integer indices only."""
+    if not loc:
+        return "<root>"
+    node = root
+    rendered: list[str] = []
+    for part in loc:
+        if isinstance(part, int) and not isinstance(part, bool):
+            rendered.append(str(part))
+            node = node.child if node.kind == "sequence" and node.child else _LocNode()
+            continue
+        if node.kind == "mapping":
+            rendered.append(_UNRECOGNIZED_FIELD)
+            node = node.child or _LocNode()
+            continue
+        found: _LocNode | None = None
+        if node.kind == "model" and isinstance(part, str):
+            for model in node.models:
+                field = model.model_fields.get(part)
+                if field is not None:
+                    found = _loc_node(field.annotation)
+                    break
+        if found is None:
+            rendered.append(_UNRECOGNIZED_FIELD)
+            node = _LocNode()
+        else:
+            rendered.append(part)
+            node = found
+    return ".".join(rendered)
+
+
+def validation_detail(exc: ValidationError, schema: type[BaseModel] | None = None) -> str:
+    """Describe schema failures by safe field location and error type only.
+
+    Pydantic's rendered exception includes ``input_value``, which can contain
+    credentials, webhook URLs or other sensitive front-matter or TOML values,
+    and its location carries the offending mapping key for extra fields and for
+    mapping entries. Never render the raw exception or a location component the
+    schema does not declare; callers prefix the affected file.
+    """
+    root = _loc_node(schema) if schema is not None else _LocNode()
+    parts: list[str] = []
+    for error in exc.errors(include_url=False, include_context=False,
+                            include_input=False):
+        location = _render_location(root, error.get("loc", ()))
+        parts.append(f"{location}: {error.get('type', 'invalid')}")
+    return "; ".join(parts) or "invalid value"
+
+
+def yaml_error_detail(exc: yaml.YAMLError) -> str:
+    """Report parser location using numeric marks, never parser prose or source."""
+    mark = getattr(exc, "problem_mark", None) or getattr(exc, "context_mark", None)
+    line = getattr(mark, "line", None)
+    column = getattr(mark, "column", None)
+    if type(line) is int and type(column) is int and line >= 0 and column >= 0:
+        return f"invalid YAML front matter (line {line + 1}, column {column + 1})"
+    return "invalid YAML front matter"
 
 
 def read_markdown(path: Path, schema: type[BaseModel]) -> tuple[BaseModel, str]:
@@ -161,8 +271,14 @@ def read_markdown(path: Path, schema: type[BaseModel]) -> tuple[BaseModel, str]:
         if not isinstance(data, dict):
             raise ContractError("Front matter must be a mapping")
         value = schema.model_validate(data)
-    except (yaml.YAMLError, ValueError, TypeError) as exc:
+    except ValidationError as exc:
+        raise ContractError(f"{path}: invalid contract: {validation_detail(exc, schema)}") from exc
+    except yaml.YAMLError as exc:
+        raise ContractError(f"{path}: {yaml_error_detail(exc)}") from exc
+    except ContractError as exc:
         raise ContractError(f"{path}: {exc}") from exc
+    except (ValueError, TypeError) as exc:
+        raise ContractError(f"{path}: invalid YAML front matter") from exc
     body = match[2]
     for heading in REQUIRED_BODY_SECTIONS.get(schema, ()):
         if heading not in body:
@@ -235,9 +351,45 @@ class Limits(StrictModel):
     concurrency: int = Field(default=4, ge=1, le=4)
 
 
+# Unicode category Cc: ASCII C0 controls, DEL and the C1 range. Rejected so a
+# stored preference cannot inject terminal escapes, split log lines or corrupt
+# TOML/Markdown rendering.
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def preference_value(value: str | None, field: str) -> str | None:
+    """Validate a user-supplied model or reasoning preference verbatim.
+
+    Values stay exactly as supplied: no trimming, case changes or catalog
+    lookups. Reject empty/whitespace-only strings and Unicode control
+    characters so persisted settings cannot corrupt TOML, logs or Markdown.
+    ``inherit`` is reserved for the replacement clearing command and is never
+    a stored reasoning value.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a nonempty, non-whitespace string")
+    if _CONTROL_CHARACTERS.search(value):
+        raise ValueError(f"{field} must not contain control characters")
+    if field == "reasoning" and value == "inherit":
+        raise ValueError("inherit is reserved for clearing a replacement reasoning override")
+    return value
+
+
 class ModelSpec(StrictModel):
     model: str = Field(min_length=1)
     reasoning: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def model_value(cls, value):
+        return preference_value(value, "model")
+
+    @field_validator("reasoning")
+    @classmethod
+    def reasoning_value(cls, value):
+        return preference_value(value, "reasoning")
 
 
 class ReplacementModel(StrictModel):
@@ -245,6 +397,11 @@ class ReplacementModel(StrictModel):
 
     inherit: Literal["worker"] = "worker"
     reasoning: str | None = None
+
+    @field_validator("reasoning")
+    @classmethod
+    def reasoning_value(cls, value):
+        return preference_value(value, "reasoning")
 
 
 class RoleModels(StrictModel):
@@ -361,10 +518,18 @@ class Manifest(StrictModel):
     # Optional approved dependency record. When configured it participates in
     # approval hashing exactly like the other reviewed plan inputs.
     dependency_record: str | None = None
+    # Optional approved carry-forward inventory. When configured it participates
+    # in approval hashing exactly like the other reviewed plan inputs.
+    carry_forward_inventory: str | None = None
 
     @field_validator("dependency_record")
     @classmethod
     def dependency_record_path(cls, value):
+        return safe_relative(value) if value is not None else None
+
+    @field_validator("carry_forward_inventory")
+    @classmethod
+    def carry_forward_inventory_path(cls, value):
         return safe_relative(value) if value is not None else None
 
     @model_validator(mode="after")
@@ -1682,6 +1847,8 @@ def approved_files(plan: Path, manifest: Manifest) -> list[Path]:
     names += [w.instruction for w in manifest.workers]
     if manifest.dependency_record:
         names.append(manifest.dependency_record)
+    if manifest.carry_forward_inventory:
+        names.append(manifest.carry_forward_inventory)
     return sorted({within(plan, name) for name in names})
 
 
