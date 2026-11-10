@@ -2,7 +2,33 @@
 
 This note explains how the runner distinguishes a launch that never started from
 one whose ownership is unknown, and how an operator resolves a recorded uncertain
-attempt without hand-editing state or fabricating evidence.
+attempt without hand-editing state or fabricating evidence. It also covers the
+review-application reconciliation that must finish before relevant dispatch. The
+normative lifecycle, transition and application contract is
+`20261109_review_lifecycle_application.md`; the operator runbook is
+`20261109_review_lifecycle_operations.md`.
+
+## Unfinished review application before dispatch
+
+A review transaction can be durably complete while its per-entry application is not.
+Before repair dispatch, at the start of each worker pass and during review
+finalisation, the runner reconciles every durable but incomplete review application
+from its recorded intent. It applies only decisions already persisted, recreates a
+missing audit event from the durable decision, and completes the application only
+when every entry and every audit agrees. It launches no worker and does not dispatch.
+
+An incomplete application is a gap, not a completed review. A missing application
+record, named unapplied entries, a missing completion record, missing or duplicated
+entry audits and a non-verified evidence classification are all reported. Promotion
+is refused while an application gap remains. Replay reads the recorded intent, base
+register, verdict and per-entry decisions; current counters are never substitute
+proof. A contradiction stops the affected application instead of choosing an
+interpretation.
+
+If reconciliation refuses, stop and preserve the run. Do not fabricate an entry
+decision, delete an audit event or hand-edit state. An unfinished application and
+uncertain process ownership are separate blocks: one can be resolved while the other
+still prevents redispatch.
 
 ## Prelaunch rejection versus uncertain launch
 
@@ -176,17 +202,20 @@ unchanged. Re-entry returns the same event without adding another one.
 ## Order of operator steps
 
 1. Stop the runner and back up the run directory and its worktrees together.
-2. Recheck the evidence table above (or the generic checklist for another run).
-3. Run the audited recovery helper. It must come before approval, because a new
+2. Confirm from the status or report views that no unfinished review application
+   and no uncertain process ownership blocks the intended action. Reconcile the
+   application or stop as described above; the two blocks are independent.
+3. Recheck the evidence table above (or the generic checklist for another run).
+4. Run the audited recovery helper. It must come before approval, because a new
    decision requires a paused or escalated phase. If it refuses, stop and
    preserve the run.
-4. Run `orch approve <slug>`. Approval is required because the run's recorded
+5. Run `orch approve <slug>`. Approval is required because the run's recorded
    feature head is stale: the stored head predates the escalated report commit
    written after the last approval. Approval records the actual head so the
    later reviewed-candidate head check can pass. Recheck approval separately; in
    this observed case the approval hashes already match and are not the reason
    for this step.
-5. Run `orch resume <slug>` and watch the next attempt. A missing optional
+6. Run `orch resume <slug>` and watch the next attempt. A missing optional
    handover is skipped explicitly; a new launch receives a new attempt identity.
    For the worked example the next attempt is expected to be `w01-1-5`.
 

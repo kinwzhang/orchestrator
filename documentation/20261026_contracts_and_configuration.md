@@ -91,7 +91,9 @@ inputs and any input not covered by the recorded approval. Report/history
 outputs and approval metadata are excluded. Effective settings must be pinned
 so a global configuration edit cannot silently change an approved run. Edits
 invalidate approval at the next stage boundary; re-approval preserves only
-work whose relevant inputs remain valid.
+work whose relevant inputs remain valid. An optional manifest-declared dependency
+record is one of those reviewed inputs: when it is configured it participates in
+approved-file hashing and a change to it invalidates approval like any other input.
 
 Use argv arrays for portable checks. A string command must select
 `shell = "bash"` or `shell = "pwsh"`; arbitrary shell scripts are not translated
@@ -111,17 +113,19 @@ The shared persistence interface is:
 
 | Operation | Contract |
 |---|---|
-| Load | `StateStore.load(run_id)` returns a validated version-one run state. Missing files raise the operating-system error; malformed state and unsupported or missing schema versions raise a validation error that names the state file. |
+| Load | `StateStore.load(run_id)` returns a validated run state at schema version one or two. Missing files raise the operating-system error; malformed state and unsupported or missing schema versions raise a validation error that names the state file. Loading version-one bytes does not rewrite them. |
 | Save | `StateStore.save(state, expected_revision=None)` returns a copied state with the next revision. If omitted, the supplied state's revision is the expected revision; a mismatch is rejected rather than overwriting newer work. |
 | Event | `StateStore.event(run_id, kind, **details)` atomically records an event with a monotonically assigned integer ID and UTC timestamp, then refreshes the activity log. |
 | Operation | `StateStore.record_operation(state, key, value)` persists and journals an operation record. Call once with intent before a side effect and again with result after it; the stable key merges both records while retaining the original first-seen time. |
 | Lock | `StateStore.lock(name="active", timeout=0)` is an exclusive context manager. Run and lock names are restricted to portable letters, numbers, hyphens and underscores. |
 
-Run state uses schema version one and a nonnegative revision. Unsupported schema
-versions are rejected; there is no implicit migration. The `save` method's
-expected-revision default is the revision currently present on the supplied
-state. Callers that retain stale state must pass the revision they expect and
-handle the validation error rather than retrying an overwrite.
+Run state uses schema version two and a nonnegative revision. Newly created runs
+are written as version two; loading also accepts version one. Any other missing or
+unsupported schema version is rejected, and operational use of version-one records
+requires an explicit compatible migration rather than an implicit rewrite. The
+`save` method's expected-revision default is the revision currently present on the
+supplied state. Callers that retain stale state must pass the revision they expect
+and handle the validation error rather than retrying an overwrite.
 
 Each run continuously maintains physical `checklist.md`, `activity_log.md` and
 `issues.md`. The checklist records phase/stage/round, next action and worker
@@ -134,6 +138,42 @@ are authoritative; Markdown mirrors can be regenerated after a crash without
 duplicating event IDs. Operation intent is persisted before a side effect and
 completion is recorded afterward. Do not edit internal state to steer a run;
 use CLI commands and approved Markdown instructions.
+
+### Issue lifecycle and review application
+
+Each issue has exactly one writable lifecycle status: `pending`, `in_repair`,
+`finished` or `escalated`. Newly created issues start `pending`. Status changes pass
+one guarded transition authority; an unlisted transition or an unmet guard is
+refused before mutation, and a status change never edits counters, assignments,
+review rounds or outcomes. Each committed change appends a transition history record
+naming the source and target statuses, the satisfied guard and the evidence.
+
+| Status | Meaning |
+|---|---|
+| `pending` | Not dispatched; may be new work, reopened work or work returned by human continuation. Dispatch still needs the normal guard. |
+| `in_repair` | An authorized assignment is being worked, including a permitted subsequent attempt or reassignment. |
+| `finished` | Owning-reviewer acceptance for the relevant candidate, inputs and outcome, or explicit scoped human acceptance/deferral. |
+| `escalated` | A stop boundary, allowance exhaustion, depth rule, explicit escalation or unsafe attribution. Human disposition is required. |
+
+Counters, activity and review application records are separate facts, not duplicate
+substatuses. A review application retains the reviewer role and attempt, candidate,
+approved-input bindings, verdict identity and digest, immutable pre-application issue
+evidence, deterministic entry identities and order, per-entry decisions, applied
+lifecycle and accounting decisions, and the derived next-entry position. Every
+finding and resolution produces one entry in verdict order. An entry is either not
+applied or applied with an explicit decision; a no-change decision is still applied.
+Completion means every entry has a validated disposition and its audit evidence
+agrees; it does not mean the issue passed, finished or became promotion-eligible. If
+an early entry escalates, untouched entries retain their exact prior status and
+counters and stay not applied until each is individually validated and committed.
+Unfinished application is resumed before relevant dispatch, and replay uses retained
+intent and decisions rather than current counters.
+
+A version-one `open` record is never mapped to `pending` or `in_repair` from
+counters. Segregation of evidence into verified, recomputed-unbound,
+unverifiable-for-missing-inputs and conflicting classes is unchanged in intent and is
+now enforced by the single evidence authority described in
+`20261109_review_lifecycle_application.md`.
 
 Per assignment, allow up to three repairs and three review rounds, stopping
 after two unsuccessful repairs. One fresh replacement receives its own
