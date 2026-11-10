@@ -1,14 +1,15 @@
 # AGENTS.md
 
-Guidance for every agent working in this repository. The coordinator's instruction
-package and approved plan under `analysis_and_reviews/` override this file when they
-conflict; keep this file current as the code changes.
+Guidance for every agent working in this repository. The coordinator's current instruction
+package and approved feature plan override this file when they conflict. Keep
+this file current as the code changes. First-cycle historical plans and handovers
+are archived; see documentation/20261110_first_cycle_archive.md.
 
 ## What this repository is
 
 This repository builds `orch`, a deterministic, Markdown-driven local delivery
-orchestrator described by `requirement.md` and the approved plan at
-`analysis_and_reviews/20261026_implementation_plan.md`. Agents decide what to build
+orchestrator described by `requirement.md`. The first-cycle approved plan is
+preserved in the archive documented in the archive index. Agents decide what to build
 and whether it is good; the orchestrator decides when, in what order, and what
 happens next. Every deliverable is a Markdown file. Internal JSON state is never an
 agent input.
@@ -33,9 +34,9 @@ actual commands and results in your handover.
 
 ## Layout and ownership
 
-Ownership lists in `analysis_and_reviews/20261027_delivery_instructions/manifest.md`
-are exact. Work only within your assigned paths; preserve uncommitted work you did
-not create. Route cross-module findings to the owning worker; shared fixtures and
+Ownership lists in the current approved delivery manifest are exact. The table
+below is the module map, not permission to revive retired first-cycle assignments.
+Work only within your assigned paths; preserve uncommitted work you did not create. Route cross-module findings to the owning worker; shared fixtures and
 dependency changes go through W01. Do not edit the plan, worker instructions, or
 reviewer instructions.
 
@@ -87,8 +88,8 @@ Markdown evidence), `git_ops.py` (owned git resources), `processes.py`/`agents.p
 
 ## Safety rules
 
-- Never modify `main`, never force-push, never delete branches, worktrees, or
-  files the run does not own. No automatic push, deployment, or external
+- Modify `main` only under explicit operator instruction. Never force-push or
+  delete branches, worktrees, or files without ownership and operator authority. No automatic push, deployment, or external
   messaging. Cleanup is explicit and must refuse to discard unfinished or dirty
   work.
 - Keep secrets out of logs, state, handovers, and reports; redact configured
