@@ -13,6 +13,10 @@ from pathlib import Path
 
 import portalocker
 
+from orch.carry_forward import (
+    CARRY_FORWARD_IMPORT_OPERATION,
+    load_inventory,
+)
 from orch.config import Config
 from orch.contracts import (
     ActivityRecord,
@@ -186,6 +190,8 @@ _LEGACY_REVIEW_CONFLICT = "Issue is simultaneously resolved and open"
 _SYSTEM_ISSUE_TEMPLATES = ("check-{}", "post-check-{}", "integration-check-{}")
 # Lifecycle values that may still receive an authorized dispatch.
 _DISPATCHABLE = frozenset({"pending", "in_repair"})
+# Named dispatch refusal while the approved carry-forward import is incomplete.
+CARRY_FORWARD_IMPORT_PENDING = "carry_forward_import_pending"
 # A finding must reopen or continue work; these are the only reviewer-owned
 # lifecycle effects. Escalation is issue-scoped and never truncates the plan.
 _FINDING_STAYS = frozenset({"pending", "in_repair"})
@@ -1902,6 +1908,45 @@ def select_dispatchable_issues(issues: list[IssueState], state: RunState,
     return selected, waiting
 
 
+def carry_forward_gate_reason(state: RunState, plan: Path,
+                              manifest: Manifest) -> str | None:
+    """Return the dispatch refusal reason while carry-forward import is pending.
+
+    The gate is inert unless the approved manifest declares a carry-forward
+    inventory. When one is declared, dispatch is allowed only after the importer
+    recorded a completed ``carry_forward_import`` operation whose
+    ``inventory_digest`` equals the digest of that approved inventory file.
+    The digest is read through the committed importer so its canonicalization
+    is never re-derived here.
+    """
+    if manifest.carry_forward_inventory is None:
+        return None
+    try:
+        inventory_path = within(plan, manifest.carry_forward_inventory)
+        approved_digest = load_inventory(inventory_path).inventory_digest
+    except (ContractError, OSError, ValueError) as exc:
+        return (f"{CARRY_FORWARD_IMPORT_PENDING}: approved inventory "
+                f"{manifest.carry_forward_inventory!r} is unusable: {exc}")
+    operation = state.operations.get(CARRY_FORWARD_IMPORT_OPERATION)
+    if not isinstance(operation, dict):
+        return f"{CARRY_FORWARD_IMPORT_PENDING}: no durable import operation"
+    if operation.get("status") != "completed":
+        return (f"{CARRY_FORWARD_IMPORT_PENDING}: import status is "
+                f"{operation.get('status')!r}")
+    if operation.get("inventory_digest") != approved_digest:
+        return (f"{CARRY_FORWARD_IMPORT_PENDING}: imported inventory digest does "
+                "not match the approved inventory")
+    return None
+
+
+def require_carry_forward_import(state: RunState, plan: Path,
+                                 manifest: Manifest) -> None:
+    """Refuse every dispatch until the approved carry-forward import completes."""
+    reason = carry_forward_gate_reason(state, plan, manifest)
+    if reason is not None:
+        raise Escalation(reason)
+
+
 def promotion_blockers(state: RunState, events: list[dict] | None = None) -> list[str]:
     """Return exact reasons promotion must wait for explicit disposition."""
     events = events or []
@@ -3356,6 +3401,7 @@ class Engine:
                    guard=transition.guard, evidence=transition.evidence)
 
     async def run_worker(self, worker, active_resources: set[str] | None = None):
+        require_carry_forward_import(self.state, self.plan, self.manifest)
         self.check_recovery_audit()
         self.resume_review_applications()
         workspace = self.record.workers[worker.id]
@@ -3514,6 +3560,9 @@ class Engine:
                 self.save()
 
     async def work(self):
+        # The approved carry-forward import is a dispatch precondition: until it
+        # is completed with the matching digest, no wave may record an attempt.
+        require_carry_forward_import(self.state, self.plan, self.manifest)
         # Finish durable review applications before any repair dispatch: an
         # interrupted acceptance must not be silently skipped by new work.
         self.resume_review_applications()
