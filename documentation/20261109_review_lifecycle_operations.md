@@ -201,6 +201,39 @@ for. Record that the work is deferred for that stage, not technically fixed.
 A deferral alone is not historical continuation authority, and it does not permit
 another automatic repair attempt, another reassignment or a counter reset.
 
+### 6.3 Interrupted save and audit reconciliation
+
+`Engine.record_human_disposition` saves a durable operation intent and the guarded
+transition before appending the single `human_disposition` audit. If the process
+stops between those writes, the run retains the transition but no audit. Resume
+reports that operation as an audit gap; the transition must not be presented as
+completed acceptance and must not be replayed.
+
+For an already-saved authorized transition, use
+`Engine.reconcile_human_disposition` with the same `HumanDisposition` that was
+authorized. Before writing anything, reconciliation validates:
+
+- the exact issue and the supplied kind, scope, evidence, allowance disposition,
+  dependencies and deferred stage;
+- that the latest retained `lifecycle_history` entry is exactly the transition the
+  supplied disposition would have produced from its recorded prior status,
+  including guard and evidence;
+- that exactly one retained history entry matches that transition;
+- that the current lifecycle equals the retained result;
+- unchanged attempt, counter and assignment history (exact operation digests when
+  the durable intent exists, or an independently supplied accounting digest);
+- that any existing audit for the same transition agrees with the disposition.
+
+It appends at most one audit carrying `disposition_kind`, the retained
+`transition_recorded_at`, `reconciled: true` and the actual `reconciled_at` time.
+It never reapplies the transition, resets status, changes counters or assignments,
+rewrites `lifecycle_history`, or fabricates the original event time or ID.
+Repeated reconciliation returns the existing audit and appends nothing. Missing or
+conflicting attribution is refused, and an audit that does not identify the
+retained transition is never reused as its evidence. A finished status alone is
+never eligibility. If the original durable transition or its authorization cannot
+be proven, stop for a human disposition instead of backfilling.
+
 ## 7. Uncertain process ownership
 
 Uncertain process ownership blocks redispatch. The absence of a process-start
