@@ -16,6 +16,7 @@ per-review application record afterwards.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -23,6 +24,14 @@ from pathlib import Path
 
 import pytest
 
+from orch.carry_forward import (
+    CARRY_FORWARD_COMPLETED_EVENT,
+    CARRY_FORWARD_IMPORT_OPERATION,
+    CARRY_FORWARD_ISSUE_EVENT,
+    CarryForwardRefused,
+    import_carry_forward,
+    load_inventory,
+)
 from orch.cli import parser
 from orch.config import Config, effective_feature, resolve_config
 from orch.contracts import (
@@ -66,9 +75,12 @@ from orch.git_ops import git
 from orch.models import run_models
 from orch.store import StateStore
 from orch.workflow import (
+    CARRY_FORWARD_IMPORT_PENDING,
     ApprovalRequired,
     Engine,
+    Escalation,
     accept_review_result,
+    carry_forward_gate_reason,
     load_validated_dependencies,
     plan_role_routing,
     promotion_blockers,
@@ -1621,4 +1633,453 @@ def test_s11_model_commands_leave_dependency_and_promotion_gates_unchanged(
     assert [item.id for item in after_selected] == [item.id for item in selected]
     assert after_waiting == waiting
     assert promotion_blockers(reloaded, store.events("run")) == before_blockers
+
+
+# --------------- S12 carry-forward importer x dispatch gate integration seams
+#
+# Unit coverage for the inventory grammar, each importer component and the gate
+# table already lives in ``tests/contracts/test_carry_forward_import.py`` and
+# ``tests/workflow/test_carry_forward_gate.py``.  These cases cover only the
+# end-to-end seam: one real one-shot import into an isolated temporary run,
+# killed at each durable boundary, with the real dispatch gate consulted by
+# ``Engine.work`` before and after every kill, and a stub worker used for the
+# eventual scheduling.  No run is created, no predecessor run is touched and no
+# agent, model, network or process is started.
+
+CARRY_FORWARD_RUN_ID = "gate-run"
+
+
+def inventory_assignment(identity: str, *, repairs: int = 0, failed: int = 0,
+                         rounds: int = 0) -> dict:
+    return {"id": identity, "repairs": repairs, "failed": failed, "rounds": rounds}
+
+
+def inventory_issue(identity: str, *, owner: str = "w1", owner_role: str = "code",
+                    root: str | None = None, parent: str | None = None,
+                    depth: int = 0, status: str = "open",
+                    lifecycle: str | None = None, attempt: int = 1,
+                    summary: str = "", assignments: list[dict] | None = None,
+                    reassignments: int | None = None,
+                    dispositions: tuple[str, ...] = (),
+                    evidence: tuple[str, ...] = (),
+                    uncertainties: tuple[str, ...] = ()) -> dict:
+    if root is None:
+        root = identity
+    if lifecycle is None:
+        lifecycle = {"open": "pending", "resolved": "finished",
+                     "escalated": "escalated"}[status]
+    if assignments is None:
+        assignments = [inventory_assignment(f"{identity}:0")]
+    if reassignments is None:
+        reassignments = len(assignments) - 1
+    return {
+        "id": identity, "owner": owner, "owner_role": owner_role, "root": root,
+        "parent": parent, "depth": depth, "status": status, "lifecycle": lifecycle,
+        "attempt": attempt, "summary": summary, "assignments": assignments,
+        "reassignments": reassignments, "dispositions": dispositions,
+        "evidence": evidence, "uncertainties": uncertainties,
+    }
+
+
+def _joined(items: tuple[str, ...]) -> str:
+    return "; ".join(items) if items else "none"
+
+
+def render_carry_forward_inventory(*, issues: list[dict], digest: str = "0" * 64,
+                                   predecessor_run_id: str = "pred-1",
+                                   predecessor_candidate_sha: str = "a" * 40,
+                                   source_shas: dict[str, str] | None = None) -> str:
+    source_shas = source_shas if source_shas is not None else {"s1": "b" * 40}
+    lines = [
+        "---",
+        "version: 1",
+        f"predecessor_run_id: {predecessor_run_id}",
+        f'predecessor_candidate_sha: "{predecessor_candidate_sha}"',
+        f'inventory_digest: "{digest}"',
+        "source_shas:",
+    ]
+    for name, sha in source_shas.items():
+        lines.append(f'  {name}: "{sha}"')
+    lines.extend(["---", ""])
+    for item in issues:
+        lines.extend([
+            f"## Issue {item['id']}",
+            "",
+            f"- owner: {item['owner']}",
+            f"- owner_role: {item['owner_role']}",
+            f"- root: {item['root']}",
+            f"- parent: {item['parent'] or 'none'}",
+            f"- depth: {item['depth']}",
+            f"- status: {item['status']}",
+            f"- lifecycle: {item['lifecycle']}",
+            f"- attempt: {item['attempt']}",
+            f"- reassignments: {item['reassignments']}",
+            f"- dispositions: {_joined(item['dispositions'])}",
+            f"- uncertainties: {_joined(item['uncertainties'])}",
+            f"- evidence: {_joined(item['evidence'])}",
+            "- assignments:",
+        ])
+        for value in item["assignments"]:
+            lines.append(
+                f"  - {value['id']}; repairs={value['repairs']}; "
+                f"failed={value['failed']}; rounds={value['rounds']}")
+        lines.append(f"- summary: {item['summary']}" if item["summary"]
+                     else "- summary:")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def write_carry_forward_inventory(path: Path, *, issues: list[dict]):
+    path.write_text(render_carry_forward_inventory(digest="0" * 64, issues=issues),
+                    encoding="utf-8")
+    unsigned = load_inventory(path, verify_digest=False)
+    path.write_text(
+        render_carry_forward_inventory(digest=unsigned.computed_digest, issues=issues),
+        encoding="utf-8")
+    return load_inventory(path)
+
+
+def carry_forward_inventory_issues() -> list[dict]:
+    return [
+        inventory_issue("i1"),
+        inventory_issue(
+            "i2", root="i1", parent="i1", depth=1, lifecycle="in_repair",
+            assignments=[inventory_assignment("i2:0", repairs=1, failed=1,
+                                              rounds=1)]),
+    ]
+
+
+def carry_forward_run(tmp_path, plan_factory, *, slug, declare=True,
+                      issues=None):
+    """Isolated plan, inventory, target run and gate inputs for one case."""
+    plan, manifest = plan_factory(slug=slug)
+    items = list(issues) if issues is not None else carry_forward_inventory_issues()
+    inventory = write_carry_forward_inventory(plan / "inventory.md", issues=items)
+    if declare:
+        manifest = manifest.model_copy(
+            update={"carry_forward_inventory": "inventory.md"})
+    repo = make_model_repo(tmp_path)
+    feature = FeatureSpec(slug=slug, target_project=repo,
+                          requirement=plan / "requirement.md")
+    store = StateStore(tmp_path / f"state-{slug}")
+    store.save(RunState(
+        run_id=CARRY_FORWARD_RUN_ID, slug=slug, phase="RUNNING", stage="WORK",
+        workers={"w1": {"checked": False}},
+        workspace={"repo": str(repo), "feature_path": str(tmp_path / "checkout"),
+                   "feature_branch": f"feature/{slug}", "base_sha": "0" * 40,
+                   "workers": {}}))
+    return store, feature, manifest, plan, inventory
+
+
+def carry_forward_audits(store: StateStore) -> list[dict]:
+    return [event for event in store.events(CARRY_FORWARD_RUN_ID)
+            if event.get("kind") == CARRY_FORWARD_ISSUE_EVENT]
+
+
+def carry_forward_completions(store: StateStore) -> list[dict]:
+    return [event for event in store.events(CARRY_FORWARD_RUN_ID)
+            if event.get("kind") == CARRY_FORWARD_COMPLETED_EVENT]
+
+
+def assert_import_complete(store: StateStore, inventory):
+    state = store.load(CARRY_FORWARD_RUN_ID)
+    operation = state.operations[CARRY_FORWARD_IMPORT_OPERATION]
+    assert operation["status"] == "completed"
+    assert operation["inventory_digest"] == inventory.inventory_digest
+    assert set(state.issues) == set(inventory.issue_ids)
+    audits = carry_forward_audits(store)
+    assert sorted(event["issue_id"] for event in audits) == sorted(inventory.issue_ids)
+    for identity in inventory.issue_ids:
+        assert len([event for event in audits
+                    if event["issue_id"] == identity]) == 1
+    assert len(carry_forward_completions(store)) == 1
+    return state
+
+
+def gate_refusal(store: StateStore, feature, manifest, plan, *, detail: str) -> str:
+    """Consult the real gate through ``Engine.work`` and prove inertness."""
+    state = store.load(CARRY_FORWARD_RUN_ID)
+    before_state = state.model_dump(mode="json")
+    before_bytes = run_bytes(store, CARRY_FORWARD_RUN_ID)
+    engine = Engine(store, state, feature, manifest, plan, adapters={})
+    with pytest.raises(Escalation) as caught:
+        asyncio.run(engine.work())
+    message = str(caught.value)
+    assert message.startswith(CARRY_FORWARD_IMPORT_PENDING + ":")
+    assert detail in message
+    assert state.model_dump(mode="json") == before_state
+    assert run_bytes(store, CARRY_FORWARD_RUN_ID) == before_bytes
+    return message
+
+
+def dispatch_after_gate(store: StateStore, feature, manifest, plan) -> list[str]:
+    """Stub the worker launch; the real gate must allow scheduling to proceed."""
+    state = store.load(CARRY_FORWARD_RUN_ID)
+    assert carry_forward_gate_reason(state, plan, manifest) is None
+    engine = Engine(store, state, feature, manifest, plan, adapters={})
+    dispatched: list[str] = []
+
+    async def fake_run_worker(worker, active_resources=None):
+        dispatched.append(worker.id)
+        engine.state.workers[worker.id]["checked"] = True
+
+    engine.run_worker = fake_run_worker
+    asyncio.run(engine.work())
+    assert dispatched == ["w1"]
+    assert engine.state.workers["w1"]["checked"] is True
+    assert not any(event.get("kind") == "dispatch_intent"
+                   for event in store.events(CARRY_FORWARD_RUN_ID))
+    return dispatched
+
+
+@contextlib.contextmanager
+def crash_on_event(store: StateStore, kind: str, *, call: int = 1):
+    """Inject a ``Crash`` before the ``call``-th event of one kind is written."""
+    original = store.event
+    seen = {"n": 0}
+
+    def wrapper(run_id, event_kind, **details):
+        if event_kind == kind:
+            seen["n"] += 1
+            if seen["n"] == call:
+                raise Crash("event")
+        return original(run_id, event_kind, **details)
+
+    store.event = wrapper
+    try:
+        yield seen
+    finally:
+        store.event = original
+
+
+def test_e2e_carry_forward_gate_refuses_dispatch_before_import(tmp_path, plan_factory):
+    """Declared inventory, no import yet: named refusal and zero side effects."""
+    store, feature, manifest, plan, _inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-gate-before")
+    state = store.load(CARRY_FORWARD_RUN_ID)
+    assert state.operations == {}
+    assert state.issues == {}
+    assert store.events(CARRY_FORWARD_RUN_ID) == []
+
+    gate_refusal(store, feature, manifest, plan,
+                 detail="no durable import operation")
+
+    assert store.load(CARRY_FORWARD_RUN_ID).operations == {}
+    assert store.load(CARRY_FORWARD_RUN_ID).issues == {}
+    assert store.events(CARRY_FORWARD_RUN_ID) == []
+
+
+def test_e2e_carry_forward_kill_before_intent_is_clean_rerun(
+        tmp_path, plan_factory):
+    """Kill before intent: nothing durable; rerun imports once and opens the gate."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-kill-intent")
+
+    with crash_at(store, "record_operation", call=1), pytest.raises(Crash):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    interrupted = store.load(CARRY_FORWARD_RUN_ID)
+    assert interrupted.operations == {}
+    assert interrupted.issues == {}
+    assert store.events(CARRY_FORWARD_RUN_ID) == []
+    gate_refusal(store, feature, manifest, plan,
+                 detail="no durable import operation")
+
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "imported"
+    assert report.imported_issues == tuple(inventory.issue_ids)
+    assert_import_complete(store, inventory)
+    dispatch_after_gate(store, feature, manifest, plan)
+
+
+def test_e2e_carry_forward_kill_after_intent_keeps_gate_closed_then_resumes(
+        tmp_path, plan_factory):
+    """Kill after the intent save: gate names the intent status; resume completes."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-kill-after-intent")
+
+    with crash_at(store, "save", call=2), pytest.raises(Crash):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    interrupted = store.load(CARRY_FORWARD_RUN_ID)
+    assert interrupted.operations[CARRY_FORWARD_IMPORT_OPERATION]["status"] == "intent"
+    assert interrupted.issues == {}
+    assert carry_forward_audits(store) == []
+    gate_refusal(store, feature, manifest, plan, detail="import status is 'intent'")
+
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "resumed"
+    assert report.imported_issues == tuple(inventory.issue_ids)
+    assert_import_complete(store, inventory)
+    dispatch_after_gate(store, feature, manifest, plan)
+
+
+def test_e2e_carry_forward_kill_at_per_issue_save_resumes_prefix(
+        tmp_path, plan_factory):
+    """Kill before the second issue save: durable prefix is verified and skipped."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-kill-issue-save")
+
+    with crash_at(store, "save", call=3), pytest.raises(Crash):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    interrupted = store.load(CARRY_FORWARD_RUN_ID)
+    assert interrupted.operations[CARRY_FORWARD_IMPORT_OPERATION]["status"] == "intent"
+    assert list(interrupted.issues) == ["i1"]
+    assert [event["issue_id"] for event in carry_forward_audits(store)] == ["i1"]
+    gate_refusal(store, feature, manifest, plan, detail="import status is 'intent'")
+
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "resumed"
+    assert report.imported_issues == ("i2",)
+    assert report.already_imported_issues == ("i1",)
+    assert_import_complete(store, inventory)
+    dispatch_after_gate(store, feature, manifest, plan)
+
+
+def test_e2e_carry_forward_kill_at_per_issue_audit_recreates_only_missing(
+        tmp_path, plan_factory):
+    """Kill before the second audit: resume adds it once and never duplicates i1."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-kill-issue-audit")
+
+    with crash_on_event(store, CARRY_FORWARD_ISSUE_EVENT, call=2), \
+            pytest.raises(Crash):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    interrupted = store.load(CARRY_FORWARD_RUN_ID)
+    assert sorted(interrupted.issues) == ["i1", "i2"]
+    assert [event["issue_id"] for event in carry_forward_audits(store)] == ["i1"]
+    gate_refusal(store, feature, manifest, plan, detail="import status is 'intent'")
+
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "resumed"
+    assert report.imported_issues == ()
+    assert report.already_imported_issues == ("i1", "i2")
+    assert_import_complete(store, inventory)
+    assert [event["issue_id"] for event in carry_forward_audits(store)] == ["i1", "i2"]
+    dispatch_after_gate(store, feature, manifest, plan)
+
+
+def test_e2e_carry_forward_kill_at_completion_save_resumes_to_completion(
+        tmp_path, plan_factory):
+    """Kill before the completion save: gate stays closed; resume completes once."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-kill-completion-save")
+
+    with crash_at(store, "record_operation", call=2), pytest.raises(Crash):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    interrupted = store.load(CARRY_FORWARD_RUN_ID)
+    assert interrupted.operations[CARRY_FORWARD_IMPORT_OPERATION]["status"] == "intent"
+    assert sorted(interrupted.issues) == ["i1", "i2"]
+    assert [event["issue_id"] for event in carry_forward_audits(store)] == ["i1", "i2"]
+    assert carry_forward_completions(store) == []
+    gate_refusal(store, feature, manifest, plan, detail="import status is 'intent'")
+
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "resumed"
+    assert_import_complete(store, inventory)
+    assert [event["status"] for event in store.events(CARRY_FORWARD_RUN_ID)
+            if event.get("kind") == "operation"] == ["intent", "completed"]
+    dispatch_after_gate(store, feature, manifest, plan)
+
+
+def test_e2e_carry_forward_kill_after_completion_save_emits_missing_event(
+        tmp_path, plan_factory):
+    """Kill before the completion event: the completed save already opens the gate."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-kill-completion-event")
+
+    with crash_on_event(store, CARRY_FORWARD_COMPLETED_EVENT), \
+            pytest.raises(Crash):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    interrupted = store.load(CARRY_FORWARD_RUN_ID)
+    assert interrupted.operations[CARRY_FORWARD_IMPORT_OPERATION]["status"] == "completed"
+    assert carry_forward_completions(store) == []
+    assert carry_forward_gate_reason(interrupted, plan, manifest) is None
+    before_state = (store.run_dir(CARRY_FORWARD_RUN_ID) / "state.json").read_bytes()
+
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "completed"
+    assert report.completion_event_id is not None
+    assert (store.run_dir(CARRY_FORWARD_RUN_ID) / "state.json").read_bytes() \
+        == before_state
+    assert_import_complete(store, inventory)
+    assert [event["status"] for event in store.events(CARRY_FORWARD_RUN_ID)
+            if event.get("kind") == "operation"] == ["intent", "completed"]
+    dispatch_after_gate(store, feature, manifest, plan)
+
+
+def test_e2e_carry_forward_different_digest_refuses_import_and_closes_gate(
+        tmp_path, plan_factory):
+    """A changed approved inventory is refused by the importer and the gate."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-different-digest")
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "imported"
+    assert carry_forward_gate_reason(store.load(CARRY_FORWARD_RUN_ID),
+                                     plan, manifest) is None
+
+    changed_issues = carry_forward_inventory_issues()
+    changed_issues[0] = inventory_issue("i1", summary="changed after approval")
+    changed = write_carry_forward_inventory(plan / "inventory.md",
+                                            issues=changed_issues)
+    assert changed.inventory_digest != inventory.inventory_digest
+    before_bytes = run_bytes(store, CARRY_FORWARD_RUN_ID)
+
+    with pytest.raises(CarryForwardRefused, match="different inventory digest"):
+        import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                             inventory_path=plan / "inventory.md")
+    assert run_bytes(store, CARRY_FORWARD_RUN_ID) == before_bytes
+    gate_refusal(store, feature, manifest, plan,
+                 detail="does not match the approved inventory")
+    durable = store.load(CARRY_FORWARD_RUN_ID)
+    assert durable.issues["i1"].summary == ""
+    assert durable.operations[CARRY_FORWARD_IMPORT_OPERATION]["inventory_digest"] \
+        == inventory.inventory_digest
+
+
+def test_e2e_carry_forward_completed_matching_import_opens_gate(
+        tmp_path, plan_factory):
+    """Completed matching import: imported issues stay dispatchable and schedule."""
+    store, feature, manifest, plan, inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-gate-open")
+    report = import_carry_forward(store, run_id=CARRY_FORWARD_RUN_ID,
+                                  inventory_path=plan / "inventory.md")
+    assert report.status == "imported"
+    state = assert_import_complete(store, inventory)
+    assert state.issues["i1"].lifecycle == "pending"
+    assert state.issues["i2"].lifecycle == "in_repair"
+    assert state.issues["i1"].legacy_status == "open"
+    assert state.issues["i2"].assignments[0].repairs == 1
+
+    dispatch_after_gate(store, feature, manifest, plan)
+    after = store.load(CARRY_FORWARD_RUN_ID)
+    assert after.operations[CARRY_FORWARD_IMPORT_OPERATION]["status"] == "completed"
+    assert set(after.issues) == set(inventory.issue_ids)
+
+
+def test_e2e_carry_forward_ordinary_run_without_inventory_dispatches_normally(
+        tmp_path, plan_factory):
+    """Manifest field ``None``: the gate is inert and ordinary dispatch proceeds."""
+    store, feature, manifest, plan, _inventory = carry_forward_run(
+        tmp_path, plan_factory, slug="cf-ordinary", declare=False)
+    assert manifest.carry_forward_inventory is None
+    assert carry_forward_gate_reason(store.load(CARRY_FORWARD_RUN_ID),
+                                     plan, manifest) is None
+
+    dispatch_after_gate(store, feature, manifest, plan)
+    state = store.load(CARRY_FORWARD_RUN_ID)
+    assert CARRY_FORWARD_IMPORT_OPERATION not in state.operations
+    assert state.issues == {}
+    assert store.events(CARRY_FORWARD_RUN_ID) == []
 
