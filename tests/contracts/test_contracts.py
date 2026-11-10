@@ -281,8 +281,10 @@ def test_issue_state_tracks_attempt_evidence_and_reassignments():
 
 def test_run_state_rejects_unsupported_versions():
     with pytest.raises(ValidationError):
-        RunState(run_id="r", slug="x", version=2)
-    assert RunState(run_id="r", slug="x").updated_at is None
+        RunState(run_id="r", slug="x", version=3)
+    state = RunState(run_id="r", slug="x")
+    assert state.updated_at is None
+    assert state.version == 2  # newly created runs use the canonical schema
 
 
 def test_globs_include_zero_directory_components():

@@ -31,11 +31,11 @@ def test_unsupported_state_version_requires_migration(orch_store):
     saved = orch_store.save(RunState(run_id="r1", slug="demo"))
     path = orch_store.run_dir("r1") / "state.json"
     data = json.loads(path.read_text(encoding="utf-8"))
-    data["version"] = 2
+    data["version"] = 3
     path.write_text(json.dumps(data), encoding="utf-8")
     with pytest.raises(ContractError, match="migration"):
         orch_store.load("r1")
-    assert saved.version == 1
+    assert saved.version == 2
 
 
 def test_state_without_schema_version_requires_explicit_migration(orch_store):
