@@ -15,7 +15,7 @@ from pathlib import Path
 
 import portalocker
 
-from orch.config import effective_feature, load_config
+from orch.config import ConfigResolution, effective_feature, resolve_config
 from orch.contracts import (
     ContractError,
     Discussion,
@@ -38,8 +38,12 @@ from orch.workflow import (
 
 
 def parser():
-    root = argparse.ArgumentParser(prog="orch", description="Markdown-driven local delivery")
+    root = argparse.ArgumentParser(prog="orch", description="Markdown-driven local delivery",
+                                   allow_abbrev=False)
     root.add_argument("--data-dir", type=Path, help="Override platform state directory")
+    root.add_argument(
+        "--global-models", action="store_true",
+        help="Use global model preferences instead of repository role overrides")
     commands = root.add_subparsers(dest="command", required=True)
     new = commands.add_parser("new", help="Create a feature checkout and Markdown settings")
     new.add_argument("slug")
@@ -68,6 +72,19 @@ def parser():
     validate = commands.add_parser("validate", help="Validate a Markdown contract")
     validate.add_argument("kind", choices=["feature", "manifest", "discussion", "handover", "verdict"])
     validate.add_argument("file", type=Path)
+    models = commands.add_parser("models", allow_abbrev=False,
+                                 help="Inspect or change model preferences")
+    model_commands = models.add_subparsers(dest="models_command", required=True)
+    show = model_commands.add_parser("show", allow_abbrev=False)
+    selectors = show.add_mutually_exclusive_group()
+    selectors.add_argument("--target", type=Path)
+    selectors.add_argument("--feature")
+    change = model_commands.add_parser("set", allow_abbrev=False)
+    change.add_argument("role")
+    change.add_argument("--model")
+    change.add_argument("--reasoning")
+    change.add_argument("--scope", choices=["global", "repo"], default="global")
+    change.add_argument("--target", type=Path)
     return root
 
 
@@ -93,14 +110,22 @@ def locate(store, slug=None):
     return matches[0]
 
 
-def context(store, slug):
+def context(store, slug, global_models=False):
+    from orch.models import consent_resolution
     entry = locate(store, slug)
     source = Path(entry["plan"]) / "feature.md"
     feature, _ = read_markdown(source, FeatureSpec)
-    config = load_config(Path(entry["repo"]))
-    feature = effective_feature(feature, config, source)
+    resolution = consent_resolution(
+        Path(entry["repo"]), global_models=global_models, feature_path=source)
+    if global_models:
+        # Announce the invocation-local selection before any lifecycle action
+        # or dispatch can use it. Inspection paths print the same notice in
+        # their preference view.
+        print("Model selection: global preferences (--global-models); "
+              "repository model overrides are ignored for this command.")
+    feature = effective_feature(feature, resolution.config, source)
     state = store.load(entry["run_id"])
-    return entry, feature, state
+    return entry, feature, state, resolution
 
 
 def new_feature(store, args):
@@ -537,13 +562,34 @@ def approve_feature(store, entry, feature, state):
     return state
 
 
-def engine(store, entry, feature, state):
+def engine(store, entry, feature, state, resolution: ConfigResolution | None = None):
     manifest, _ = read_markdown(Path(entry["plan"]) / "manifest.md", Manifest)
     feature.limits = manifest.limits
     from orch.processes import ProcessRunner
-    config = load_config(Path(entry["repo"]))
+    repo = Path(entry["repo"])
+    source = Path(entry["plan"]) / "feature.md"
+    if resolution is None:
+        from orch.models import consent_resolution
+        resolution = consent_resolution(repo, feature_path=source)
+    config = resolution.config
+    consented = (tuple(resolution.findings),
+                 json.dumps(resolution.config.models.model_dump(mode="json"), sort_keys=True))
+
+    def settings_loader():
+        fresh = resolve_config(repo, global_models=resolution.global_models)
+        if fresh.findings:
+            current = (tuple(fresh.findings),
+                       json.dumps(fresh.config.models.model_dump(mode="json"), sort_keys=True))
+            if current != consented:
+                from orch.workflow import ApprovalRequired
+                raise ApprovalRequired(
+                    "Configuration now requires a fresh fallback decision; run orch again")
+        refreshed, _ = read_markdown(source, FeatureSpec)
+        return effective_feature(refreshed, fresh.config, source), fresh.config
+
     runner = ProcessRunner([os.environ.get(name, "") for name in config.redaction_env])
-    return Engine(store, state, feature, manifest, Path(entry["plan"]), runner=runner, config=config)
+    return Engine(store, state, feature, manifest, Path(entry["plan"]), runner=runner,
+                  config=config, settings_loader=settings_loader)
 
 
 def control(store, state, request):
@@ -563,15 +609,32 @@ def control(store, state, request):
     return state
 
 
+# Only commands that resolve effective model preferences accept the root flag.
+# `done` and `clean` are lifecycle bookkeeping: they neither resolve nor use
+# model selection, so accepting the flag would misrepresent the invocation.
+# `recover-review` reuses the same context resolution as the lifecycle commands.
+PREFERENCE_COMMANDS = frozenset(
+    {"next", "plan", "approve", "run", "resume", "reopen", "recover-review"})
+
+
 def run_command(args):
-    config = load_config(Path.cwd())
-    store = StateStore(args.data_dir or config.data_dir)
+    global_models = bool(getattr(args, "global_models", False))
+    if args.command == "models":
+        from orch.models import run_models
+        if global_models and getattr(args, "models_command", None) == "set":
+            raise ContractError("--global-models cannot be combined with models set")
+        return run_models(args)
+    if global_models and args.command not in PREFERENCE_COMMANDS:
+        raise ContractError(
+            f"--global-models does not apply to the {args.command} command")
     if args.command == "validate":
         schema = {"feature": FeatureSpec, "manifest": Manifest, "discussion": Discussion,
                   "handover": Handover, "verdict": Verdict}[args.kind]
         read_markdown(args.file, schema)
         print(f"Valid {args.kind}: {args.file}")
         return 0
+    config = resolve_config(Path.cwd(), global_models=global_models).config
+    store = StateStore(args.data_dir or config.data_dir)
     if args.command == "new":
         with store.lock(f"feature-{args.slug}"):
             new_feature(store, args)
@@ -608,10 +671,11 @@ def run_command(args):
         from orch.watch import watch
         watch(store, entry["run_id"], once=args.once)
         return 0
-    entry, feature, state = context(store, args.slug)
     if args.command in {"pause", "abort"}:
-        control(store, state, args.command)
+        # Control commands stay free of model resolution and never prompt.
+        control(store, store.load(entry["run_id"]), args.command)
         return 0
+    entry, feature, state, resolution = context(store, args.slug, global_models=global_models)
     if args.command == "recover-review":
         with store.lock(f"feature-{state.slug}"):
             manifest, _ = read_markdown(Path(entry["plan"]) / "manifest.md", Manifest)
@@ -652,12 +716,13 @@ def run_command(args):
             if state.phase == "DISCUSSING":
                 plan_feature(store, entry, feature, state)
             else:
-                target_config = load_config(Path(entry["repo"]))
+                target_config = resolution.config
                 if target_config.viewer and command == "run":
                     from orch.platform_support import launch_viewer
                     result = launch_viewer(state.slug, data_dir=store.data_dir)
                     print(result.message)
-                asyncio.run(engine(store, entry, feature, state).run(one_stage=args.command == "next"))
+                asyncio.run(engine(store, entry, feature, state, resolution).run(
+                    one_stage=args.command == "next"))
         elif command == "done":
             if state.phase != "AWAITING_TEST":
                 raise ContractError("done requires AWAITING_TEST")
