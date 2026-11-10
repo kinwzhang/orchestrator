@@ -75,7 +75,8 @@ _ALLOWED_FIELDS = frozenset((*_REQUIRED_FIELDS, *_OPTIONAL_FIELDS, "assignments"
 _FIELD_LINE = re.compile(r"- ([a-z_]+):(?: (.*))?")
 _HEADING_LINE = re.compile(r"## Issue ([A-Za-z0-9][A-Za-z0-9._-]*)")
 _ASSIGNMENT_LINE = re.compile(
-    r"  - ([A-Za-z0-9][A-Za-z0-9._:-]*); repairs=(\d+); failed=(\d+); rounds=(\d+)"
+    r"  - ([A-Za-z0-9][A-Za-z0-9._:-]*); repairs=([0-9]+); failed=([0-9]+); "
+    r"rounds=([0-9]+)"
 )
 
 
@@ -264,7 +265,7 @@ def _parse_identity(value: str, pattern: re.Pattern[str], *, label: str,
 
 
 def _parse_int(value: str, *, label: str, minimum: int, path: Path, index: int) -> int:
-    if not re.fullmatch(r"\d+", value):
+    if not re.fullmatch(r"[0-9]+", value):
         raise _body_error(path, index, f"{label} must be a nonnegative integer")
     parsed = int(value)
     if parsed < minimum:
