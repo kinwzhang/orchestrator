@@ -250,7 +250,7 @@ def test_docs_rework_and_malformed_verdict_repaired_once(delivery):
     result = store.load(state.run_id)
     assert result.phase == "AWAITING_TEST"
     assert result.round == 2
-    assert result.issues["docs-relevance"].status == "resolved"
+    assert result.issues["docs-relevance"].status == "finished"
     assert len([c for c in fake.calls if c.role == "code_reviewer"]) == 3
     assert "rework_issued" in (store.run_dir(state.run_id) / "activity_log.md").read_text()
 
@@ -262,7 +262,7 @@ def test_malformed_handover_returns_to_worker_before_review(delivery):
     asyncio.run(engine.run())
     result = store.load(state.run_id)
     assert result.phase == "AWAITING_TEST"
-    assert result.issues["check-w1"].status == "resolved"
+    assert result.issues["check-w1"].status == "finished"
     assert [c.role for c in fake.calls[:2]] == ["worker", "worker"]
 
 
@@ -844,7 +844,7 @@ def test_post_check_worker_mutation_blocks_candidate_and_returns_to_work(deliver
     result = store.load(state.run_id)
     assert result.stage == "WORK"
     assert result.workers["w1"]["checked"] is False
-    assert result.issues["post-check-w1"].status == "open"
+    assert result.issues["post-check-w1"].status == "pending"
     assert not result.candidate
     assert "changed after check" in (worker_path / "app.py").read_text()
 
