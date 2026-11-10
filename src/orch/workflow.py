@@ -31,6 +31,7 @@ from orch.contracts import (
     Handover,
     HumanDisposition,
     IssueState,
+    LifecycleTransition,
     LifecycleTransitionError,
     Manifest,
     RepairOutcomeCharge,
@@ -125,6 +126,7 @@ _UNCERTAINTY_EVENTS = frozenset({
     "agent_interrupted_uncertain",
 })
 _RECOVERY_OPERATION_PREFIX = "uncertain-recovery:"
+_HUMAN_DISPOSITION_OPERATION_PREFIX = "human-disposition:"
 
 
 def _dispatch_activity(issue: IssueState, worker_id: str, attempt: int) -> ActivityRecord:
@@ -2930,6 +2932,228 @@ def resolve_uncertain_dispatch(store: StateStore, run_id: str, attempt_id: str, 
         )
 
 
+def _human_disposition_operation_key(issue_id: str,
+                                     transition: LifecycleTransition) -> str:
+    """Stable operation identity for one retained human-disposition transition."""
+    return (f"{_HUMAN_DISPOSITION_OPERATION_PREFIX}{issue_id}:"
+            f"{transition.from_status}->{transition.to_status}:"
+            f"{transition.recorded_at}")
+
+
+def _accounting_digest(issue: IssueState) -> str:
+    """Digest counters and assignment history, excluding lifecycle status."""
+    payload = {
+        "attempt": issue.attempt,
+        "assignments": [assignment.model_dump(mode="json")
+                        for assignment in issue.assignments],
+    }
+    return _sha256_text(json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def _human_disposition_expectation(issue: IssueState,
+                                   retained: LifecycleTransition,
+                                   disposition: HumanDisposition) -> LifecycleTransition:
+    """Revalidate a disposition against the retained transition without mutating it.
+
+    The pre-transition issue is reconstructed in memory and passed through the
+    contract layer. A mismatch in guard or evidence means the supplied
+    disposition is not the one that produced the retained transition.
+    """
+    if not issue.lifecycle_history or issue.lifecycle_history[-1] is not retained:
+        raise ContractError(
+            f"Issue {issue.id} retained transition is not the latest lifecycle entry")
+    if issue.status != retained.to_status:
+        raise ContractError(
+            f"Issue {issue.id} currently records {issue.status!r}, not the retained "
+            f"transition result {retained.to_status!r}; refusing reconciliation")
+    probe = issue.model_copy(deep=True)
+    probe.status = retained.from_status
+    probe.lifecycle_history = probe.lifecycle_history[:-1]
+    try:
+        expected = apply_human_disposition(probe, disposition)
+    except LifecycleTransitionError as exc:
+        raise ContractError(
+            f"Human disposition for {disposition.issue_id} does not match the retained "
+            f"transition: {exc}") from exc
+    if (expected.from_status, expected.to_status, expected.guard, expected.evidence) != (
+            retained.from_status, retained.to_status, retained.guard, retained.evidence):
+        raise ContractError(
+            f"Human disposition for {disposition.issue_id} does not match the retained "
+            "transition guard or evidence; refusing reconciliation")
+    if expected.to_status == "finished" and (
+            (disposition.kind == "deferral") != (disposition.deferred_stage is not None)):
+        raise ContractError(
+            f"Human disposition for {disposition.issue_id} has a deferred stage that "
+            "cannot distinguish scoped acceptance from deferral; refusing ambiguous "
+            "reconciliation")
+    return expected
+
+
+def _matching_human_disposition_audit(events: list[dict], issue_id: str,
+                                      transition: LifecycleTransition) -> dict | None:
+    """Return the one audit for this transition, refusing ambiguous attribution."""
+    audits = [event for event in events
+              if event.get("kind") == "human_disposition"
+              and event.get("issue") == issue_id]
+    identified = [event for event in audits
+                  if event.get("transition_recorded_at") == transition.recorded_at]
+    if len(identified) > 1:
+        raise ContractError(
+            f"Human disposition for {issue_id} has {len(identified)} audits for the "
+            "same retained transition; refusing duplicate reconciliation")
+    if identified:
+        return identified[0]
+    lookalikes = [event for event in audits
+                  if event.get("from_status") == transition.from_status
+                  and event.get("to_status") == transition.to_status
+                  and list(event.get("evidence") or []) == list(transition.evidence)]
+    if lookalikes:
+        raise ContractError(
+            f"Human disposition for {issue_id} has an audit with matching content but "
+            "no usable transition identity; refusing ambiguous reconciliation")
+    return None
+
+
+def _validate_human_disposition_audit(event: dict, disposition: HumanDisposition,
+                                      transition: LifecycleTransition) -> None:
+    expected = {
+        "issue": disposition.issue_id,
+        "disposition_kind": disposition.kind,
+        "from_status": transition.from_status,
+        "to_status": transition.to_status,
+        "scope": disposition.scope,
+        "evidence": list(transition.evidence),
+        "deferred_stage": disposition.deferred_stage,
+    }
+    for field, value in expected.items():
+        if event.get(field) != value:
+            raise ContractError(
+                f"Existing human_disposition audit {event.get('id')} for "
+                f"{disposition.issue_id} disagrees on {field}; refusing reconciliation")
+
+
+def _validate_human_disposition_operation(operation: dict, key: str,
+                                          disposition: HumanDisposition,
+                                          transition: LifecycleTransition,
+                                          accounting_digest: str) -> None:
+    expected = {
+        "issue": disposition.issue_id,
+        "disposition_kind": disposition.kind,
+        "scope": disposition.scope,
+        "evidence": list(disposition.evidence),
+        "allowance_disposition": disposition.allowance_disposition,
+        "dependencies": list(disposition.dependencies),
+        "deferred_stage": disposition.deferred_stage,
+        "from_status": transition.from_status,
+        "to_status": transition.to_status,
+        "transition_recorded_at": transition.recorded_at,
+        "transition_guard": transition.guard,
+        "transition_evidence": list(transition.evidence),
+    }
+    for field, value in expected.items():
+        if operation.get(field) != value:
+            raise ContractError(
+                f"Human disposition operation {key} disagrees on {field}; refusing "
+                "reconciliation")
+    if operation.get("status") not in {"intent", "completed"}:
+        raise ContractError(
+            f"Human disposition operation {key} has unknown status "
+            f"{operation.get('status')!r}; refusing reconciliation")
+    for field in ("prior_accounting_digest", "accounting_digest"):
+        recorded = operation.get(field)
+        if recorded != accounting_digest:
+            raise ContractError(
+                f"Human disposition operation {key} records {field} {recorded!r}, but "
+                f"issue {disposition.issue_id} now has {accounting_digest}; counters or "
+                "assignments changed and cannot be reconciled")
+
+
+def reconcile_human_disposition(store: StateStore, state: RunState,
+                                disposition: HumanDisposition, *,
+                                expected_accounting_digest: str | None = None
+                                ) -> tuple[RunState, dict]:
+    """Append only the missing audit for an already-saved human disposition.
+
+    The transition itself is never reapplied: status, counters, assignments and
+    lifecycle history are read and validated but not written. A finished status
+    alone is never sufficient; the exact retained transition must match the
+    supplied authorized disposition. Repeated reconciliation returns the
+    existing audit instead of appending another.
+    """
+    issue = state.issues.get(disposition.issue_id)
+    if issue is None:
+        raise ContractError(
+            f"Human disposition names unknown issue {disposition.issue_id}")
+    history = issue.lifecycle_history
+    if not history:
+        raise ContractError(
+            f"Issue {issue.id} has no retained lifecycle transition; a finished "
+            "status alone is not evidence of an authorized human disposition")
+    retained = history[-1]
+    matches = [transition for transition in history if (
+        transition.from_status, transition.to_status, transition.guard,
+        transition.evidence) == (
+        retained.from_status, retained.to_status, retained.guard,
+        retained.evidence)]
+    if len(matches) != 1:
+        raise ContractError(
+            f"Issue {issue.id} has {len(matches)} retained transitions matching the "
+            "supplied disposition; attribution is ambiguous and cannot be reconciled")
+    _human_disposition_expectation(issue, retained, disposition)
+    accounting_digest = _accounting_digest(issue)
+    if (expected_accounting_digest is not None
+            and accounting_digest != expected_accounting_digest):
+        raise ContractError(
+            f"Issue {issue.id} accounting digest {accounting_digest} does not match "
+            "the supplied pre-transition snapshot; counters or assignments changed")
+    key = _human_disposition_operation_key(issue.id, retained)
+    operation = state.operations.get(key)
+    if operation is not None:
+        if not isinstance(operation, dict):
+            raise ContractError(
+                f"Human disposition operation {key} is malformed; refusing reconciliation")
+        _validate_human_disposition_operation(
+            operation, key, disposition, retained, accounting_digest)
+    event = _matching_human_disposition_audit(
+        store.events(state.run_id), issue.id, retained)
+    if event is not None:
+        _validate_human_disposition_audit(event, disposition, retained)
+        if operation is not None and operation.get("status") != "completed":
+            state = store.record_operation(state, key, {
+                "status": "completed",
+                "audit_event_id": event["id"],
+                "reconciled": bool(event.get("reconciled")),
+                "reconciled_at": event.get("reconciled_at"),
+            })
+        return state, event
+    reconciled_at = timestamp()
+    details = {
+        "issue": issue.id,
+        "disposition_kind": disposition.kind,
+        "from_status": retained.from_status,
+        "to_status": retained.to_status,
+        "scope": disposition.scope,
+        "evidence": list(retained.evidence),
+        "deferred_stage": disposition.deferred_stage,
+        "transition_recorded_at": retained.recorded_at,
+        "reconciled": True,
+        "reconciled_at": reconciled_at,
+        "accounting_digest": accounting_digest,
+    }
+    if operation is not None:
+        details["operation"] = key
+    event = store.event(state.run_id, "human_disposition", **details)
+    if operation is not None:
+        state = store.record_operation(state, key, {
+            "status": "completed",
+            "audit_event_id": event["id"],
+            "reconciled": True,
+            "reconciled_at": reconciled_at,
+        })
+    return state, event
+
+
 class Engine:
     def __init__(self, store: StateStore, state: RunState, feature: FeatureSpec,
                  manifest: Manifest, plan: Path, *, adapters=None, runner=None,
@@ -2955,7 +3179,7 @@ class Engine:
         self.state.revision = saved.revision
 
     def event(self, kind, **details):
-        self.store.event(self.state.run_id, kind, **details)
+        return self.store.event(self.state.run_id, kind, **details)
 
     def settle_issue_ownership(self, persist: bool = True) -> list[dict]:
         """Resolve legacy ownership from retained verdict evidence.
@@ -3062,17 +3286,61 @@ class Engine:
 
         This is a contract-layer surface, not a new CLI command. It refuses an
         unknown issue and records the guarded transition as audit evidence.
+        The durable operation intent and the transition are saved before the
+        single audit append, so an interruption at that boundary is detected
+        as an audit gap and can be reconciled without repeating the transition.
         """
         issue = self.state.issues.get(disposition.issue_id)
         if issue is None:
             raise ContractError(
                 f"Human disposition names unknown issue {disposition.issue_id}")
+        prior_digest = _accounting_digest(issue)
         transition = apply_human_disposition(issue, disposition)
-        self.save()
-        self.event("human_disposition", issue=issue.id, kind=disposition.kind,
-                   from_status=transition.from_status, to_status=transition.to_status,
-                   scope=disposition.scope, evidence=transition.evidence,
-                   deferred_stage=disposition.deferred_stage)
+        accounting_digest = _accounting_digest(issue)
+        if accounting_digest != prior_digest:
+            raise ContractError(
+                f"Human disposition for {issue.id} changed counters or assignments; "
+                "refusing to save it")
+        key = _human_disposition_operation_key(issue.id, transition)
+        self.state = self.store.record_operation(self.state, key, {
+            "status": "intent",
+            "issue": issue.id,
+            "disposition_kind": disposition.kind,
+            "scope": disposition.scope,
+            "evidence": list(disposition.evidence),
+            "allowance_disposition": disposition.allowance_disposition,
+            "dependencies": list(disposition.dependencies),
+            "deferred_stage": disposition.deferred_stage,
+            "from_status": transition.from_status,
+            "to_status": transition.to_status,
+            "transition_recorded_at": transition.recorded_at,
+            "transition_guard": transition.guard,
+            "transition_evidence": list(transition.evidence),
+            "prior_accounting_digest": prior_digest,
+            "accounting_digest": accounting_digest,
+        })
+        event = self.event(
+            "human_disposition", issue=issue.id,
+            disposition_kind=disposition.kind,
+            from_status=transition.from_status, to_status=transition.to_status,
+            scope=disposition.scope, evidence=transition.evidence,
+            deferred_stage=disposition.deferred_stage,
+            operation=key, transition_recorded_at=transition.recorded_at,
+        )
+        self.state = self.store.record_operation(self.state, key, {
+            "status": "completed",
+            "audit_event_id": event["id"],
+            "reconciled": False,
+        })
+
+    def reconcile_human_disposition(self, disposition: HumanDisposition, *,
+                                    expected_accounting_digest: str | None = None
+                                    ) -> dict:
+        """Append only the missing audit for an already-saved disposition."""
+        self.state, event = reconcile_human_disposition(
+            self.store, self.state, disposition,
+            expected_accounting_digest=expected_accounting_digest)
+        return event
 
     def finalize_review_transactions(self, candidate) -> None:
         """Complete or refuse role transactions recorded before an interruption."""
@@ -4119,6 +4387,28 @@ class Engine:
             accepted = operation.get("accepted_transaction")
             if not isinstance(accepted, str) or accepted not in self.state.review_results:
                 gaps.add(f"{key} (accepted role result missing)")
+        for key, operation in self.state.operations.items():
+            if not key.startswith(_HUMAN_DISPOSITION_OPERATION_PREFIX):
+                continue
+            if not isinstance(operation, dict):
+                gaps.add(f"{key} (malformed human disposition operation)")
+                continue
+            if operation.get("status") != "completed":
+                gaps.add(
+                    f"{key} (human disposition audit "
+                    f"{operation.get('status') or 'unknown'})")
+                continue
+            event_id = operation.get("audit_event_id")
+            matching = [event for event in events
+                        if event.get("id") == event_id
+                        and event.get("kind") == "human_disposition"
+                        and event.get("issue") == operation.get("issue")
+                        and event.get("operation") == key
+                        and event.get("transition_recorded_at")
+                        == operation.get("transition_recorded_at")]
+            if len(matching) != 1:
+                gaps.add(
+                    f"{key} (human disposition audit event missing or conflicting)")
         return sorted(gaps)
 
     def check_recovery_audit(self):
