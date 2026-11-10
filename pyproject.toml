@@ -7,7 +7,15 @@ name = "orc2610-orchestrator"
 version = "0.1.0"
 description = "File-driven local software delivery orchestration"
 requires-python = ">=3.14"
-dependencies = ["pydantic>=2.12,<3", "PyYAML>=6,<7", "platformdirs>=4,<5", "portalocker>=3,<4", "rich>=14,<15", "psutil>=7,<8"]
+dependencies = [
+    "pydantic>=2.12,<3",
+    "PyYAML>=6,<7",
+    "platformdirs>=4,<5",
+    "portalocker>=3,<4",
+    "rich>=14,<15",
+    "psutil>=7,<8",
+    "tomlkit>=0.13,<0.14",
+]
 
 [project.scripts]
 orch = "orch.cli:main"

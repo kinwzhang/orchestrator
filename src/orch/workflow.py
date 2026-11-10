@@ -2887,13 +2887,15 @@ def resolve_uncertain_dispatch(store: StateStore, run_id: str, attempt_id: str, 
 
 class Engine:
     def __init__(self, store: StateStore, state: RunState, feature: FeatureSpec,
-                 manifest: Manifest, plan: Path, *, adapters=None, runner=None, config: Config | None = None):
+                 manifest: Manifest, plan: Path, *, adapters=None, runner=None,
+                 config: Config | None = None, settings_loader=None):
         from orch.agents import CodexAdapter, OpenCodeAdapter
         from orch.git_ops import GitWorkspace, WorkspaceRecord
         from orch.processes import ProcessRunner
         self.store, self.state, self.feature = store, state, feature
         self.config = config or Config()
         self.manifest, self.plan = manifest, plan.resolve()
+        self.settings_loader = settings_loader
         self.run_dir = store.run_dir(state.run_id)
         self.git = GitWorkspace(feature.target_project, self.run_dir)
         self.record = WorkspaceRecord.from_dict(state.workspace)
@@ -3079,8 +3081,23 @@ class Engine:
             self.save()
         self.event("transition", phase=self.state.phase, stage=self.state.stage, cycle=self.state.round)
 
+    def _boundary_feature(self) -> FeatureSpec:
+        """Read the current effective settings without hot-swapping the call.
+
+        The loader is supplied by the CLI and reuses the same selected files,
+        global-model policy and manifest limits. It deliberately cannot prompt;
+        a changed or newly unconsented fallback raises before dispatch.
+        """
+        if self.settings_loader is None:
+            return self.feature
+        refreshed, _ = self.settings_loader()
+        refreshed.limits = self.manifest.limits
+        return refreshed
+
     def check_approval(self):
-        actual = approval_hashes(self.plan, self.manifest, self.feature)
+        # Compare fresh boundary settings against approval, but keep this
+        # invocation's resolved feature (and any active request) unchanged.
+        actual = approval_hashes(self.plan, self.manifest, self._boundary_feature())
         if actual != self.state.approved_hashes:
             self.state.error = "Approved inputs changed; run orch approve before continuing"
             self.state.previous_phase = self.state.phase
