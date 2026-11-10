@@ -39,8 +39,8 @@ repository's `.orch.toml`; outside a valid repository it fails. Feature
 settings are never written by these commands, though they remain visible in
 `show` and keep their existing precedence.
 
-Both commands route before any run-state or configuration load, so they cannot
-pause, resume or otherwise steer an active feature.
+Both commands route before run-state loading and never read or mutate run
+state, so they cannot pause, resume or otherwise steer an active feature.
 
 ## Files and precedence
 
