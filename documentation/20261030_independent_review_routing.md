@@ -3,9 +3,12 @@
 This note defines the repaired code/docs review contract. It replaces the old
 combined verdict routing, which could resolve code-owned findings from a docs
 relevance verdict and could partially charge counters before rejecting the
-conflict. The repair is scoped to review routing, issue ownership, per-role
-transactions and the audited recovery command. It does not change planning,
-candidate assembly, worker budgets or the hard concurrency cap.
+conflict. Review acceptance now also applies each verdict entry individually and
+durably, so an issue-scoped stop in one entry cannot silently complete or discard
+the rest of the batch. The repair is scoped to review routing, issue ownership,
+per-role transactions, per-entry application and the audited recovery command. It
+does not change planning, candidate assembly, worker budgets or the hard
+concurrency cap.
 
 ## Roles, ownership and authority
 
@@ -146,12 +149,20 @@ A role verdict is fully validated before anything is written:
 - repair/review/reassignment budgets and depth limits.
 
 Only then is a durable operation intent written. The intent contains the exact
-normalized verdict and the complete pre-routing issue register. The role's issue
-changes, its `review_results` entry and the `review_result_accepted` event are
-then committed. The operation is marked completed last. Re-entry recomputes the
-same plan from the recorded base, so it cannot charge a counter twice or apply a
-different decision. A second, different verdict for the same role, candidate and
-evidence digest is refused as a conflict rather than applied.
+normalized verdict, the complete pre-routing issue register, the ordered entry plan
+with each entry's stable identity and deterministic proposed decision, and any
+issue-scoped escalations. A durable review application is then persisted from that
+intent. Entries are applied in verdict finding order followed by resolution order:
+an entry's issue effects and accounting decision are saved atomically with its
+applied decision, its audit event is recorded under the stable application and entry
+identity, and an issue-scoped stop is recorded on the affected entry without removing
+later entries. Completion is refused until every entry is applied and every audit
+agrees. The role's `review_results` entry and acceptance event are recorded after the
+entries, and the operation is marked completed last. Re-entry replays the recorded
+intent and applies only decisions already persisted; it never recomputes from current
+counters. A second, different verdict for the same role, candidate and evidence
+digest is refused as a conflict rather than applied. A resolution entry never becomes
+a repair request.
 
 The operation key is
 `review-result:<role>:<candidate-sha>:<evidence-digest>`. Completed results for
@@ -159,6 +170,30 @@ an earlier candidate remain historical evidence but never authorize the current
 candidate. An interrupted intent for the current candidate is completed before
 dispatch; an intent for another candidate blocks resume instead of being applied
 silently.
+
+### Per-entry application and unfinished batches
+
+A verdict's entries are applied individually. An entry may legitimately escalate
+(allowance exhaustion, depth stop, explicit escalation or a reassignment refusal)
+and return before later entries receive decisions. When entry A stops, untouched
+entries B–F retain their exact prior statuses and counters and remain not applied.
+They are not treated as resolved, and the review transaction is not described as
+complete. The remaining entries are validated and committed individually, and any
+unfinished application is resumed before relevant dispatch.
+
+Application completion means every entry has a validated disposition, not that the
+issue finished, the review passed or the candidate may be promoted. Gap checks name
+a missing application, unapplied entries, a missing completion record, missing or
+duplicate entry audits and a non-verified evidence classification. Issue-scoped
+escalation blocks promotion for the affected issue while independent eligible work
+may proceed.
+
+A no-change entry is still an applied entry with an explicit decision and invents no
+charge. Each application retains the role and selected attempt, candidate, approved
+inputs, verdict identity and digest, immutable pre-application evidence, entry order
+and the per-entry decision map. The evidence authority requires the prerequisites
+appropriate to the consumer; conflicting evidence stops the affected application,
+and a missing or unvalidated prerequisite refuses authoritative application.
 
 Each completed role is checkpointed immediately. Rework is queued only after
 both roles have reached a terminal result for the same candidate, so worker
@@ -263,11 +298,14 @@ the helper refuses, preserve the run and review the evidence.
 
 ## Compatibility and limits
 
-- Existing state schema version 1 loads; `owner_role`, `review_results` and the
-  per-assignment repair-assessment mark are optional additions. Older states
-  simply have no accepted role results, no ownership and no assessment mark
-  until the corresponding migration or evidence-based derivation runs. No schema
-  version bump or counter reset is required.
+- Newly created runs use state schema version two; version-one state still loads
+  and renders without being rewritten. `owner_role`, `review_results`, the
+  per-assignment repair-assessment mark, activity records, transition history,
+  dependency records and review applications are retained contract fields.
+- Operational use of version-one records requires an explicit compatible migration.
+  A version-one `open` issue with repair activity is ambiguous and refused
+  operationally; it is never inferred as `pending` or `in_repair` from counters.
+  Pure routing planning may project such a record only to compute a proposal.
 - Older verdicts without `candidate_sha` remain parseable and are accepted only
   through the audited legacy recovery binding above.
 - Review verdict paths are attempt-specific for new runs. Historical
