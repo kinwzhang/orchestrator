@@ -69,6 +69,14 @@ Never put API keys in feature or config files. Authentication remains in the
 agent CLI's existing credential mechanism; configure log redaction separately
 for secrets supplied through environment variables.
 
+Inspect or edit these layers with `orch models show` and `orch models set`
+rather than by hand when a validated, format-preserving write is wanted. The six
+roles are `planner`, `worker`, `replacement`, `code_reviewer`, `docs_reviewer`
+and `conflict_resolver`; repository declarations for ordinary roles must be
+complete model/reasoning pairs, and replacement accepts only worker inheritance
+plus an optional reasoning override. `20261030_model_preferences_cli.md`
+describes selectors, provenance output, fallback consent and write safety.
+
 ## Scope and approval
 
 Scopes use anchored POSIX repository-relative glob paths regardless of the host
@@ -94,6 +102,9 @@ invalidate approval at the next stage boundary; re-approval preserves only
 work whose relevant inputs remain valid. An optional manifest-declared dependency
 record is one of those reviewed inputs: when it is configured it participates in
 approved-file hashing and a change to it invalidates approval like any other input.
+The optional `carry_forward_inventory` manifest field is bound the same way: when
+set, the named repository-relative inventory file is an approved input whose edit
+invalidates approval at the next stage boundary.
 
 Use argv arrays for portable checks. A string command must select
 `shell = "bash"` or `shell = "pwsh"`; arbitrary shell scripts are not translated

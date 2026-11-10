@@ -22,7 +22,8 @@ code-reviewer, docs-reviewer and conflict-resolver models. Replacement inherits
 the final effective worker model. Model IDs in examples elsewhere are
 placeholders. Never put credentials in these files. See
 `20261026_contracts_and_configuration.md` for precedence, settings, approval
-hashes and redaction guidance.
+hashes and redaction guidance, and `20261030_model_preferences_cli.md` for
+inspecting or editing preferences with `orch models show`/`orch models set`.
 
 ## Create and plan a feature
 

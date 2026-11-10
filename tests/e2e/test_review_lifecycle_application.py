@@ -2,9 +2,11 @@
 
 Scenarios S01-S10 of ``outputs/w03/1-matrix.md`` (approved packet
 ``20261109_review_lifecycle_delivery``) bound to the committed W02 reducer interface
-(source ``e9ea61f``). Every test uses isolated temporary evidence, synthetic issue
-registers and deterministic verdict files. No worker, model, network or runner is
-started, and no live run evidence is written.
+(source ``e9ea61f``), plus S11 combined lifecycle x product coverage bound to the
+carry-forward S1/S2 interfaces (models preferences, sanitized approval diagnostics,
+dependency/promotion gates). Every test uses isolated temporary evidence, synthetic
+issue registers and deterministic verdict files. No worker, model, network or runner
+is started, and no live run evidence is written.
 
 Tests never assert an internal implementation shape: they drive the public acceptance
 entry point (``accept_review_result``), resume (``resume_review_applications``), the
@@ -21,11 +23,14 @@ from pathlib import Path
 
 import pytest
 
+from orch.cli import parser
+from orch.config import Config, effective_feature, resolve_config
 from orch.contracts import (
     AssignmentState,
     ContractError,
     DependencyRecord,
     EvidenceConflictError,
+    FeatureSpec,
     Finding,
     FindingDependency,
     HumanDisposition,
@@ -33,27 +38,36 @@ from orch.contracts import (
     LifecycleTransitionError,
     Limits,
     Manifest,
+    ModelSpec,
     RepairOutcomeCharge,
     ReviewerProvenance,
     ReviewResult,
+    RoleModels,
     RunState,
     TransitionGuard,
     UnverifiableEvidenceError,
     Verdict,
     apply_human_disposition,
     apply_lifecycle_transition,
+    approval_hashes,
     assess_repair_outcome,
     classify_review_evidence,
     create_pending_issue,
     create_system_issue,
+    detect_approval_changes,
     finish_system_issue,
     migrate_v1_state,
+    read_markdown,
     require_authoritative_evidence,
     require_operational_schema,
     write_markdown,
 )
+from orch.git_ops import git
+from orch.models import run_models
 from orch.store import StateStore
 from orch.workflow import (
+    ApprovalRequired,
+    Engine,
     accept_review_result,
     load_validated_dependencies,
     plan_role_routing,
@@ -1409,4 +1423,202 @@ def test_s10_dispatch_and_completion_provenance_are_mandatory():
         broken = base.model_copy(update={field: False})
         with pytest.raises(UnverifiableEvidenceError):
             assess_repair_outcome(issue("A"), "A", broken)
+
+
+# ------------------------- S11 combined lifecycle x product (models CLI) coverage
+
+
+def make_model_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "Test")
+    (repo / "app.txt").write_text("base\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    return repo
+
+
+def test_s11_approval_binds_model_preferences_and_carry_forward_inventory(
+        tmp_path, plan_factory):
+    """S1: effective preferences and the approved inventory are pinned; shadowed edits are inert."""
+    plan, manifest = plan_factory(slug="prefs")
+    inventory = plan / "inventory.md"
+    inventory.write_text("# Carry-forward inventory\n\n- committed interface\n")
+    manifest = manifest.model_copy(update={"carry_forward_inventory": "inventory.md"})
+
+    feature = FeatureSpec(
+        slug="prefs", target_project=tmp_path, requirement=plan / "requirement.md",
+        models=RoleModels(worker=ModelSpec(model="feature/coder")))
+    write_markdown(plan / "feature.md", feature)
+    config = Config(models=RoleModels(
+        worker=ModelSpec(model="global/coder", reasoning="low")))
+    effective = effective_feature(feature, config, plan / "feature.md")
+    assert effective.models.worker.model == "feature/coder"
+    assert effective.models.worker.reasoning == "low"
+
+    approved = approval_hashes(plan, manifest, effective)
+    assert str(inventory.resolve()) in approved
+    assert detect_approval_changes(approved, plan, manifest, effective) == []
+
+    # A global edit fully shadowed by the explicit feature model changes nothing.
+    shadowed = effective_feature(
+        feature,
+        Config(models=RoleModels(worker=ModelSpec(model="global/other", reasoning="low"))),
+        plan / "feature.md")
+    assert shadowed.models.worker.model == "feature/coder"
+    assert detect_approval_changes(approved, plan, manifest, shadowed) == []
+
+    changed = feature.model_copy(update={"models": RoleModels(
+        worker=ModelSpec(model="feature/coder", reasoning="high"))})
+    changed_effective = effective_feature(changed, config, plan / "feature.md")
+    changes = detect_approval_changes(approved, plan, manifest, changed_effective)
+    assert any("effective_configuration: content changed" in item for item in changes)
+
+    # The optional approved inventory is bound exactly like other reviewed inputs.
+    inventory.write_text("# Carry-forward inventory\n\n- changed input\n")
+    changes = detect_approval_changes(approved, plan, manifest, effective)
+    assert any(str(inventory.resolve()) in item and "content changed" in item
+               for item in changes)
+
+
+def test_s11_guarded_lifecycle_invalidates_approval_after_model_write(
+        tmp_path, plan_factory, monkeypatch):
+    """S2: a repository preference write changes boundary settings and stops dispatch."""
+    plan, manifest = plan_factory(slug="prefs")
+    repo = make_model_repo(tmp_path)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.chdir(tmp_path)
+    write_markdown(plan / "feature.md", FeatureSpec(
+        slug="prefs", target_project=repo, requirement=plan / "requirement.md"))
+
+    def resolve():
+        current, _ = read_markdown(plan / "feature.md", FeatureSpec)
+        resolution = resolve_config(repo)
+        return effective_feature(current, resolution.config, plan / "feature.md"), \
+            resolution.config
+
+    assert run_models(parser().parse_args([
+        "models", "set", "worker", "--model", "global/coder", "--reasoning", "low"])) == 0
+    feature, _ = resolve()
+    assert feature.models.worker.model == "global/coder"
+
+    store = StateStore(tmp_path / "state")
+    state = store.save(RunState(
+        run_id="prefs-run", slug="prefs", phase="RUNNING", stage="WORK",
+        approved_hashes=approval_hashes(plan, manifest, feature),
+        workspace={"repo": str(repo), "feature_path": str(tmp_path / "checkout"),
+                   "feature_branch": "feature/prefs", "base_sha": "0" * 40,
+                   "workers": {}}))
+    engine = Engine(store, state, feature, manifest, plan, adapters={},
+                    settings_loader=resolve)
+    engine.check_approval()
+    assert state.phase == "RUNNING"
+
+    assert run_models(parser().parse_args([
+        "models", "set", "worker", "--model", "repo/coder", "--reasoning", "high",
+        "--scope", "repo", "--target", str(repo)])) == 0
+    written = (repo / ".orch.toml").read_text()
+    assert 'model = "repo/coder"' in written
+    assert 'reasoning = "high"' in written
+
+    with pytest.raises(ApprovalRequired):
+        engine.check_approval()
+    assert state.phase == "PLAN_READY"
+    events = store.events("prefs-run")
+    assert "approval_invalidated" in [event["kind"] for event in events]
+    assert not any(event["kind"] in {"dispatch_intent", "process_started"}
+                   for event in events)
+    # The in-flight invocation keeps the settings it resolved; nothing is hot-swapped.
+    assert engine.feature.models.worker.model == "global/coder"
+
+
+def test_s11_approval_diagnostics_are_sanitized_for_feature_and_inventory(tmp_path):
+    """S1 sanitization on approval inputs: paths/types only, never values or unknown keys."""
+    sentinel = "https://hooks.invalid/approval-secret"
+    plan = tmp_path / "plan"
+    plan.mkdir()
+
+    feature = plan / "feature.md"
+    feature.write_text(
+        "---\nslug: demo\ntarget_project: /tmp/x\nrequirement: requirement.md\n"
+        f"credential-secret: {sentinel}\n---\n")
+    with pytest.raises(ContractError) as caught:
+        read_markdown(feature, FeatureSpec)
+    message = str(caught.value)
+    assert sentinel not in message
+    assert "credential-secret" not in message
+    assert "<unrecognized field>: extra_forbidden" in message
+    assert str(feature) in message
+
+    manifest_path = plan / "manifest.md"
+    manifest_path.write_text(
+        "---\nslug: demo\nbranch: feature/demo\nworkers:\n  - id: w1\n"
+        "    title: work\n    instruction: workers/w1.md\n    allowed_paths: [app/**]\n"
+        f'carry_forward_inventory: "../{sentinel}.md"\n---\n')
+    with pytest.raises(ContractError) as caught:
+        read_markdown(manifest_path, Manifest)
+    message = str(caught.value)
+    assert sentinel not in message
+    assert "carry_forward_inventory: value_error" in message
+    assert str(manifest_path) in message
+
+    duplicate = plan / "duplicate.md"
+    duplicate.write_text(f"---\nslug: demo\n{sentinel}: a\n{sentinel}: b\n---\n")
+    with pytest.raises(ContractError, match="Duplicate or non-string YAML key"):
+        read_markdown(duplicate, FeatureSpec)
+
+
+def test_s11_model_commands_leave_dependency_and_promotion_gates_unchanged(
+        tmp_path, monkeypatch):
+    """S2/S3: models show/set never load or mutate run state, scheduling or gates."""
+    plan = tmp_path / "plan"
+    plan.mkdir()
+    record = DependencyRecord(
+        plan_version="v1", source_verdicts=["review-result:code:x:y"],
+        dependencies=[
+            FindingDependency(dependent_issue_id="dependent",
+                              prerequisite_issue_ids=["independent"],
+                              rationale="needs the committed interface"),
+            FindingDependency(dependent_issue_id="shared-a",
+                              shared_resource_paths=["app/shared.py"],
+                              rationale="same file"),
+            FindingDependency(dependent_issue_id="shared-b",
+                              shared_resource_paths=["app/shared.py"],
+                              rationale="same file"),
+        ])
+    write_markdown(plan / "dependencies.md", record, "## Dependencies\n")
+    store = new_store(tmp_path, "models-gates")
+    state = seed(store, {
+        "independent": issue("independent", status="pending", repairs=0, assessed=None),
+        "dependent": issue("dependent", status="pending", repairs=0, assessed=None),
+        "shared-a": issue("shared-a", status="pending", repairs=0, assessed=None),
+        "shared-b": issue("shared-b", status="pending", repairs=0, assessed=None),
+        "escalated": issue("escalated", status="escalated", repairs=2, failed=1,
+                           assessed=2, ordinals=[1]),
+    })
+    dependencies = load_validated_dependencies(dependency_manifest(plan), plan, state)
+    candidates = [state.issues[identity] for identity in
+                  ("independent", "dependent", "shared-a", "shared-b")]
+    selected, waiting = select_dispatchable_issues(candidates, state, dependencies)
+    before_blockers = promotion_blockers(state, store.events("run"))
+    before = run_bytes(store)
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.chdir(tmp_path)
+    assert run_models(parser().parse_args([
+        "models", "set", "worker", "--model", "provider/worker",
+        "--reasoning", "low"])) == 0
+    assert run_models(parser().parse_args(["models", "show"])) == 0
+
+    assert run_bytes(store) == before
+    reloaded = store.load("run")
+    after_selected, after_waiting = select_dispatchable_issues(
+        [reloaded.issues[identity] for identity in
+         ("independent", "dependent", "shared-a", "shared-b")],
+        reloaded, dependencies)
+    assert [item.id for item in after_selected] == [item.id for item in selected]
+    assert after_waiting == waiting
+    assert promotion_blockers(reloaded, store.events("run")) == before_blockers
 
