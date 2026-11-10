@@ -462,6 +462,23 @@ def test_completed_import_refuses_a_different_digest(orch_store, tmp_path):
     assert orch_store.events("target-1") == before_events
 
 
+def test_different_digest_after_intent_is_refused_before_write(orch_store, tmp_path):
+    target_state(orch_store)
+    path = tmp_path / "inventory.md"
+    inventory = write_inventory(path, issues=[issue("i1")])
+    begin_carry_forward_import(orch_store, orch_store.load("target-1"), inventory)
+    before_state = state_bytes(orch_store)
+    before_events = orch_store.events("target-1")
+
+    changed = tmp_path / "changed.md"
+    write_inventory(changed, issues=[issue("i1", summary="changed")])
+    with pytest.raises(CarryForwardRefused, match="different inventory digest"):
+        import_carry_forward(orch_store, run_id="target-1", inventory_path=changed)
+    assert state_bytes(orch_store) == before_state
+    assert orch_store.events("target-1") == before_events
+    assert orch_store.load("target-1").issues == {}
+
+
 def test_invalid_inventory_refuses_before_any_write(orch_store, tmp_path):
     target_state(orch_store)
     path = tmp_path / "inventory.md"
