@@ -314,7 +314,15 @@ the helper refuses, preserve the run and review the evidence.
   configured cap allows two; a cap of one still serialises them.
 - Approval invalidation, process-ownership recovery, uncertain-launch handling,
   infrastructure retries and per-issue budgets are unchanged.
-- The repair and its tests ran on Linux only. Native Fedora terminal behaviour,
-  Windows/PowerShell 7 process handling, ACL/reparse-point behaviour and locking
-  are not verified by this work. The live run was inspected read-only; recovery
-  was tested on a temporary copy and was not executed against the live run.
+- The repair and its tests ran on Linux only. The assembled integration
+  `8ad1901bbc49d343f3633220ac78723c0264907e` (W03 source
+  `4e6df8ae6872d332a5809cb5d589450097a5934c`, W03 documentation
+  `eb41010511d503bcf55cb91b97336db9b770f959`) reports 370 passed and 5 skipped,
+  with clean lint and whitespace. The four legacy live-evidence recovery cases skip
+  because the retained live run advanced past the exact round batch; they need a host
+  retaining `round-N/verdict-code.md` and `round-N/verdict-docs.md`. No assertion was
+  weakened; the ownership-conflict and recovery-replay guarantees are exercised
+  synthetically. Native Fedora terminal behaviour, Windows/PowerShell 7 process
+  handling, ACL/reparse-point behaviour and locking are not verified by this work. The
+  live run was inspected read-only; recovery was tested on a temporary copy and was
+  not executed against the live run.

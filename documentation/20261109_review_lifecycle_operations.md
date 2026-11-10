@@ -8,9 +8,13 @@
   `e9ea61ffd7529c5f2ad630567366b2cb56b78aae`
 - Documentation baseline: assembled W01+W02 source `817f518d00129c05900bd50b397af1b7f69a8565`
   (integration `0c9d72cc0fc4b3420393d111f087d43a8f99a5f3`)
-- Whole-chain verification: W03 results were not available when this runbook was
-  written. The procedures below follow the committed interfaces. They do not
-  certify end-to-end verification, Fedora acceptance or a live operation.
+- Whole-chain verification: observed on assembled integration
+  `8ad1901bbc49d343f3633220ac78723c0264907e` (W03 source
+  `4e6df8ae6872d332a5809cb5d589450097a5934c`, W03 documentation
+  `eb41010511d503bcf55cb91b97336db9b770f959`): full local suite 370 passed,
+  5 skipped, lint and whitespace clean. Coverage limits and unverified platform
+  gates are recorded in section 11. No Fedora acceptance or live operation is
+  claimed.
 
 This runbook is for an operator or on-call reviewer who must read a stopped or
 escalated run, choose a guarded transition, continue work safely, or assess a
@@ -331,12 +335,28 @@ PowerShell remain deferred and unverified, including ACL, replacement, locking a
 interruption behavior. Accepted diagnostic-location caveats do not waive disclosure
 or accounting integrity.
 
-At the time of writing, W03 whole-chain verification results were not available. The
-reducer milestone's recorded handover reports passing focused suites and a full-suite
-run of 9 failed, 315 passed and 1 skipped, with the failures in end-to-end tests
-outside its writable paths: known baseline recovery cases, retired status
-expectations, and one legacy-status input case. Treat that as a pending verification
-item, not as acceptance. No end-to-end or Fedora acceptance result is claimed here.
+Observed on assembled integration `8ad1901bbc49d343f3633220ac78723c0264907e` (W03
+source `4e6df8ae6872d332a5809cb5d589450097a5934c`, W03 documentation
+`eb41010511d503bcf55cb91b97336db9b770f959`): `uv run pytest -q` reports 370 passed
+and 5 skipped, with `uv run ruff check .` and `git diff --check` clean. The five skips
+are one pre-existing skip and four explicit absent-prerequisite skips for legacy
+live-evidence recovery. Those four need a host that retains the exact
+`round-N/verdict-code.md` and `round-N/verdict-docs.md` batch; the retained live run
+advanced to round 5 with attempt-suffixed verdict names, so that batch is absent. No
+assertion was weakened; the ownership-conflict and recovery-replay guarantees are
+exercised synthetically.
+
+W03 records its handover as partial and states the remaining limits. CB-D3 (completion
+evidence reconciled before its audit) has no isolated synthetic test because it belongs
+to the process-dispatch pipeline, which the tests do not start; CB-D1, CB-D2 and CB-D4
+are covered by S07. CB-F0 and CB-F1 are not claimed because this baseline has no
+carry-forward run construction; S08 binds preservation to the committed explicit
+migration authority instead. CH01 and CH02 (approval hash and candidate association)
+are covered by the existing Engine-level approval test in the routing module, not by a
+new synthetic test.
+
+This is Linux-local evidence on the assembled integration, not Fedora acceptance. No
+live operation, live recovery, Windows or PowerShell verification is claimed.
 
 The documentation reviewer receives this runbook, the normative application
 document and code-free handovers; no code inputs.
