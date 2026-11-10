@@ -214,3 +214,37 @@ def test_adapters_receive_resolved_worker_and_replacement_reasoning(tmp_path):
     replacement_argv = adapter.command(request("replacement"))
     assert "provider/coder#low" in worker_argv
     assert "provider/coder#high" in replacement_argv
+
+
+def test_cli_repository_replacement_update_never_copies_the_worker_model(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    from orch.config import global_config_path, resolve_config
+    from orch.models import inspect_preferences, update_preferences
+
+    global_file = global_config_path()
+    global_file.parent.mkdir(parents=True)
+    global_file.write_text(
+        '[models.worker]\nmodel = "provider/coder"\nreasoning = "low"\n'
+        '[models.replacement]\ninherit = "worker"\nreasoning = "high"\n')
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / ".orch.toml"
+    update_preferences(path=target, role="replacement", reasoning="medium", repo=repo)
+    text = target.read_text()
+    assert 'inherit = "worker"' in text
+    assert 'reasoning = "medium"' in text
+    assert "provider/coder" not in text
+    assert "model =" not in text
+    view = inspect_preferences(resolve_config(repo))
+    replacement = next(row for row in view.rows if row.role == "replacement")
+    assert replacement.model == "provider/coder"
+    assert replacement.reasoning == "medium"
+
+    update_preferences(path=target, role="replacement", reasoning="inherit", repo=repo)
+    replacement = next(
+        row for row in inspect_preferences(resolve_config(repo)).rows
+        if row.role == "replacement")
+    assert replacement.reasoning == "high"
+
