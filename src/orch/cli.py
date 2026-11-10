@@ -589,7 +589,17 @@ def run_command(args):
                 for agent, info in state.workers.items():
                     print(f"  {agent}: {info.get('status', 'pending')}; attempt {info.get('attempt', 0)}; checks {info.get('checks', 'pending')}")
                 for issue in state.issues.values():
-                    print(f"  Issue {issue.id}: {issue.status}; root {issue.root_issue_id}; {issue.summary}")
+                    legacy = f" (legacy {issue.legacy_status})" if issue.legacy_status else ""
+                    print(f"  Issue {issue.id}: {issue.lifecycle}{legacy}; "
+                          f"root {issue.root_issue_id}; {issue.summary}")
+                for application in state.review_applications.values():
+                    print(f"  Application {application.application_id}: "
+                          f"{len(application.applied_entry_ids)}/{len(application.entries)} "
+                          f"entries applied; next {application.next_entry_index}; "
+                          f"{'complete' if application.complete else 'incomplete'}")
+                if state.dependency_record is not None:
+                    print(f"  Dependency record: plan {state.dependency_record.plan_version}; "
+                          f"{len(state.dependency_record.dependencies)} dependent issue(s)")
                 if state.error:
                     print(f"  Blocker: {state.error}")
         return 0

@@ -73,18 +73,21 @@ def test_derived_depth_three_escalates_root():
 
 
 def test_passing_role_must_resolve_its_own_known_issues():
-    issues = {"f1": IssueState(id="f1", worker="w1", root_issue_id="f1", owner_role="code")}
+    # A reviewer finishes work that was actually dispatched (in repair). An
+    # undispatched pending issue cannot be reviewer-finished.
+    issues = {"f1": IssueState(id="f1", worker="w1", root_issue_id="f1",
+                               owner_role="code", status="in_repair")}
     with pytest.raises(ValueError, match="explicitly resolve"):
         plan_role_routing(issues, Verdict(reviewer="code", result="pass"), manifest(), "code")
     plan = plan_role_routing(
         issues, Verdict(reviewer="code", result="pass", resolved=["f1"]), manifest(), "code")
-    assert plan.issues["f1"].status == "resolved"
+    assert plan.issues["f1"].status == "finished"
 
 
 def test_docs_pass_leaves_open_code_findings_untouched():
     issues = {"f1": IssueState(id="f1", worker="w1", root_issue_id="f1", owner_role="code")}
     plan = plan_role_routing(issues, Verdict(reviewer="docs", result="pass"), manifest(), "docs")
-    assert plan.issues["f1"].status == "open"
+    assert plan.issues["f1"].status == "pending"
     assert plan.touched == []
 
 

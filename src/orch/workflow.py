@@ -15,22 +15,39 @@ import portalocker
 
 from orch.config import Config
 from orch.contracts import (
+    ActivityRecord,
     ApprovalRequiredError,
     AssignmentState,
     CheckError,
     ContractError,
     Discussion,
+    EvidenceConflictError,
     FeatureSpec,
     Finding,
     Handover,
+    HumanDisposition,
     IssueState,
+    LifecycleTransitionError,
     Manifest,
+    RepairOutcomeCharge,
+    ReviewerProvenance,
     ReviewResult,
     RunState,
+    TransitionGuard,
     Verdict,
+    apply_human_disposition,
+    apply_lifecycle_transition,
     approval_hashes,
     approved_files,
+    assess_repair_outcome,
+    build_review_application,
+    classify_review_evidence,
+    create_pending_issue,
+    create_system_issue,
+    finish_system_issue,
+    load_dependency_record,
     read_markdown,
+    validate_dependency_record,
     within,
 )
 from orch.reporting import write_report
@@ -106,6 +123,18 @@ _UNCERTAINTY_EVENTS = frozenset({
 _RECOVERY_OPERATION_PREFIX = "uncertain-recovery:"
 
 
+def _dispatch_activity(issue: IssueState, worker_id: str, attempt: int) -> ActivityRecord:
+    """Real dispatch activity, kept separate from repair counters."""
+    return ActivityRecord(
+        activity_id=f"dispatch:{issue.id}:{attempt}",
+        kind="dispatch", issue_id=issue.id,
+        assignment_id=(issue.assignments[-1].assignment_id
+                       or f"{issue.id}:{len(issue.assignments) - 1}"),
+        attempt=attempt, process_ownership="known", started_at=timestamp(),
+        evidence=[f"worker:{worker_id}"],
+    )
+
+
 def _change_snapshot(root: Path, paths: list[str]) -> str:
     """Hash changed worktree content independently of staged/committed diff form."""
     digest = hashlib.sha256()
@@ -151,9 +180,15 @@ def next_action(state: RunState) -> str:
 
 _REVIEW_ROLES = ("code", "docs")
 _REVIEW_RESULT_PREFIX = "review-result:"
+_REVIEW_APPLICATION_PREFIX = "review-application:"
 _REVIEW_BATCH_RECOVERY_PREFIX = "review-batch-recovery:"
 _LEGACY_REVIEW_CONFLICT = "Issue is simultaneously resolved and open"
 _SYSTEM_ISSUE_TEMPLATES = ("check-{}", "post-check-{}", "integration-check-{}")
+# Lifecycle values that may still receive an authorized dispatch.
+_DISPATCHABLE = frozenset({"pending", "in_repair"})
+# A finding must reopen or continue work; these are the only reviewer-owned
+# lifecycle effects. Escalation is issue-scoped and never truncates the plan.
+_FINDING_STAYS = frozenset({"pending", "in_repair"})
 
 
 def system_issue_identity(identity: str, manifest: Manifest) -> bool:
@@ -171,12 +206,25 @@ class ReviewRoleOutcome:
 
 
 @dataclass
+class RoleEntryPlan:
+    """One ordered, deterministic entry of a complete role routing plan."""
+
+    entry_id: str
+    order_index: int
+    kind: str
+    issue_id: str
+    issue: IssueState
+    decision: dict
+
+
+@dataclass
 class RoleRoutingPlan:
     """A pure, fully validated routing result for one reviewer role.
 
     Nothing in the caller's issue register is mutated while this plan is built.
-    ``escalation`` records a reviewer-requested or exhausted budget boundary
-    that must be committed with the accepted result before being re-raised.
+    Every finding and resolution produces exactly one ordered entry. An
+    issue-scoped stop is recorded on that entry (and in ``escalations``); it
+    never truncates the remaining entries.
     """
 
     issues: dict[str, IssueState]
@@ -185,7 +233,86 @@ class RoleRoutingPlan:
     touched: list[str]
     affected_workers: list[str]
     accounting_decisions: list[dict]
+    entries: list[RoleEntryPlan]
+    escalations: list[str]
+    # Retained compatibility view: the first issue-scoped stop, if any.
     escalation: str | None = None
+
+
+def review_application_id(transaction: str) -> str:
+    """Stable application identity derived from a role transaction."""
+    if transaction.startswith(_REVIEW_RESULT_PREFIX):
+        return transaction.replace("review-result", "review-application", 1)
+    return f"{_REVIEW_APPLICATION_PREFIX}{transaction}"
+
+
+def _charge_dict(charge: RepairOutcomeCharge) -> dict:
+    """The retained accounting decision shape used by role transactions."""
+    return {
+        "issue": charge.issue,
+        "assignment_index": charge.assignment_index,
+        "repair_ordinal": charge.repair_ordinal,
+        "assessment": charge.assessment,
+        "failed_repair_charged": charge.failed_repair_charged,
+        "review_round_charged": charge.review_round_charged,
+    }
+
+
+def _lifecycle_source(issue: IssueState) -> str:
+    """Canonical source status, refusing ambiguous version-one records."""
+    return issue.current_lifecycle()
+
+
+def _apply_planned_lifecycle(source: IssueState, plan_issue: IssueState,
+                             guard: TransitionGuard, *, evidence: list[str]) -> IssueState:
+    """Replay one planned lifecycle effect through the guarded contract.
+
+    ``plan_issue`` already carries the planned counters and accounting outcome;
+    only the status transition is validated here, from the exact pre-application
+    source. This is the reducer's only status write path.
+    """
+    working = plan_issue.model_copy(deep=True)
+    working.status = _lifecycle_source(source)
+    apply_lifecycle_transition(working, plan_issue.status, guard, evidence=evidence)
+    return working
+
+
+def _planned_lifecycle(source: IssueState, target: str) -> tuple[str, TransitionGuard]:
+    """Return the canonical source and guard fact for a planned status effect."""
+    current = _lifecycle_source(source)
+    if target == current:
+        return current, TransitionGuard(no_change_evidence=True)
+    guard = TransitionGuard()
+    if (current, target) == ("pending", "in_repair") or (current, target) == ("in_repair", "in_repair"):
+        guard.subsequent_attempt = True
+    elif (current, target) == ("in_repair", "finished"):
+        guard.reviewer_acceptance = True
+    elif (current, target) == ("finished", "pending"):
+        guard.reopening_valid = True
+        guard.historical_attribution = True
+        guard.remaining_work = True
+    elif (current, target) == ("finished", "escalated"):
+        guard.reopening_valid = True
+        guard.stop_boundary = True
+    elif (current, target) == ("pending", "escalated") or (current, target) == ("in_repair", "escalated"):
+        guard.explicit_escalation = True
+    elif (current, target) == ("escalated", "finished"):
+        guard.scoped_human_acceptance = True
+        guard.owner_disposition = True
+        guard.acceptance_evidence = True
+    elif (current, target) == ("pending", "finished"):
+        # Only an owning reviewer acceptance reaches this point, and the plan
+        # does not manufacture a human disposition for a pending issue.
+        raise LifecycleTransitionError(
+            f"Issue {source.id}: a pending issue cannot be finished by reviewer "
+            "acceptance alone; dispatch it or record an explicit human disposition"
+        )
+    else:
+        raise LifecycleTransitionError(
+            f"Issue {source.id}: lifecycle effect {current} -> {target} is not available "
+            "to a review application"
+        )
+    return current, guard
 
 
 def _validate_repair_counters(identity: str, assignment: AssignmentState) -> None:
@@ -332,11 +459,11 @@ def repair_assessment_evidence(
                              or (issue.assignments[-1].assessed_repairs is None
                                  and issue.assignments[-1].failed_repairs == 0
                                  and issue.assignments[-1].review_rounds == 0
-                                 and issue.status != "resolved"))
+                                 and issue.status not in ("resolved", "finished")))
                         and decision.get("failed_repair_charged") is True
                         and decision.get("review_round_charged") is True)
                     or (assessment == "superseding_failure" and is_finding and ordinal > 0
-                        and issue.status == "resolved"
+                        and issue.status in ("resolved", "finished")
                         and issue.assignments[-1].assessed_repairs == ordinal
                         and ordinal not in charged_ordinals
                         and decision.get("failed_repair_charged") is True
@@ -353,7 +480,7 @@ def repair_assessment_evidence(
                     or (assessment == "resolved" and not is_finding
                         and not decision.get("failed_repair_charged")
                         and decision.get("review_round_charged") is (
-                            issue.status == "open"
+                            issue.status in ("open", "pending", "in_repair")
                             and (issue.assignments[-1].assessed_repairs is None
                                  or ordinal > issue.assignments[-1].assessed_repairs)))
                 )
@@ -381,7 +508,7 @@ def repair_assessment_evidence(
                 elif already_charged or (assignment.failed_repair_ordinals is not None
                                          and ordinal in assignment.failed_repair_ordinals):
                     assessment = "already_charged"
-                elif issue.status == "resolved" and mark == ordinal:
+                elif issue.status in ("resolved", "finished") and mark == ordinal:
                     if not record["resolved"]:
                         raise ContractError(
                             f"Review transaction {key} reopens {identity} at repair {ordinal} "
@@ -392,7 +519,7 @@ def repair_assessment_evidence(
                     record["pending_legacy_charges"].append(key)
                 elif ((mark is None and assignment.repairs > 0
                        and assignment.failed_repairs == 0 and assignment.review_rounds == 0
-                       and issue.status != "resolved")
+                       and issue.status not in ("resolved", "finished"))
                       or (mark is not None and ordinal > mark)):
                     assessment = "new_failure"
                 else:
@@ -560,7 +687,10 @@ def derive_repair_assessment(
     return work
 
 
-def _assess_repair_outcome(issue: IssueState, identity: str) -> dict:
+def _assess_repair_outcome(issue: IssueState, identity: str,
+                           provenance: ReviewerProvenance | None = None,
+                           *, resolved: bool = False,
+                           assignment_index: int | None = None) -> dict:
     """Apply and describe the accounting effect of this finding.
 
     ``repairs`` counts worker dispatch attempts for the issue. ``assessed_repairs``
@@ -574,13 +704,82 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> dict:
 
     The caller owns a deep copy, so mutating the counters here cannot affect the
     accepted register unless the whole plan validates.
+
+    When reviewer provenance is supplied (the authoritative acceptance path) the
+    committed W01 accounting authority owns the decision. The workflow-local
+    reconstruction below is retained only for pure planning of legacy registers
+    whose provenance has not been assembled yet.
     """
+    if provenance is not None:
+        # A role review assesses the current owning assignment's latest repair;
+        # an explicitly supplied historical index is honoured for recovery.
+        index = (assignment_index if assignment_index is not None
+                 else len(issue.assignments) - 1)
+        retained = None
+        if index is not None and index < len(issue.assignments):
+            assignment = issue.assignments[index]
+            ordinal = assignment.repairs
+            expected = ("successful" if resolved
+                        else "initial_work" if ordinal == 0 else "unsuccessful")
+            # The W01 authority stores one outcome per assignment ordinal. A
+            # valid reopening supersedes an earlier successful assessment, and a
+            # later pass may revalidate an earlier unsuccessful repair. Either
+            # way the differing earlier assessment is retained as history, so
+            # charge on a normalized copy and restore it afterwards rather than
+            # falsifying it.
+            retained = [
+                outcome for outcome in assignment.outcomes
+                if outcome.repair_ordinal == ordinal and outcome.outcome != expected
+            ]
+        if retained:
+            working = issue.model_copy(deep=True)
+            current = working.assignments[index]
+            current.outcomes = [
+                outcome for outcome in current.outcomes
+                if not (outcome.repair_ordinal == current.repairs
+                        and outcome.outcome != expected)
+            ]
+            charge = assess_repair_outcome(
+                working, identity, provenance, assignment_index=index,
+                resolved=resolved)
+            working.assignments[index].outcomes = (
+                list(working.assignments[index].outcomes) + retained)
+            issue.assignments = working.assignments
+            return _charge_dict(charge)
+        charge = assess_repair_outcome(
+            issue, identity, provenance, assignment_index=index,
+            resolved=resolved)
+        return _charge_dict(charge)
+    if resolved:
+        # Pure-planning projection of a passing assessment. The authoritative
+        # path above delegates the same decision to the W01 authority.
+        assignment_index = len(issue.assignments) - 1
+        current = issue.assignments[-1]
+        _validate_repair_counters(identity, current)
+        was_active = issue.lifecycle in _DISPATCHABLE
+        new_outcome = (current.assessed_repairs is None
+                       or current.repairs > current.assessed_repairs)
+        round_charged = was_active and new_outcome
+        if round_charged:
+            current.review_rounds += 1
+        if current.assessed_repairs is None:
+            current.assessed_repairs = current.repairs
+        else:
+            current.assessed_repairs = max(current.assessed_repairs, current.repairs)
+        if current.failed_repair_ordinals is None:
+            current.failed_repair_ordinals = []
+        return {
+            "issue": identity, "assignment_index": assignment_index,
+            "repair_ordinal": current.repairs, "assessment": "resolved",
+            "failed_repair_charged": False, "review_round_charged": round_charged,
+        }
     assignment_index = len(issue.assignments) - 1
     current = issue.assignments[-1]
     _validate_repair_counters(identity, current)
     if current.failed_repair_ordinals is None:
         if current.repairs > 0 and current.assessed_repairs is None and (
-                current.failed_repairs or current.review_rounds or issue.status == "resolved"):
+                current.failed_repairs or current.review_rounds
+                or issue.status in ("resolved", "finished")):
             raise ContractError(
                 f"Issue {identity} has repair history without durable assessment provenance. "
                 "Counters alone cannot prove which repair outcome was assessed."
@@ -601,7 +800,8 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> dict:
                 "repair_ordinal": 0, "assessment": "initial_work",
                 "failed_repair_charged": False, "review_round_charged": False}
     if current.assessed_repairs is None:
-        if current.failed_repairs or current.review_rounds or issue.status == "resolved":
+        if current.failed_repairs or current.review_rounds \
+                or issue.status in ("resolved", "finished"):
             raise ContractError(
                 f"Issue {identity} has repair history without durable assessment "
                 "provenance. Counters alone cannot prove which repair outcome was "
@@ -628,7 +828,7 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> dict:
         return {"issue": identity, "assignment_index": assignment_index,
                 "repair_ordinal": ordinal, "assessment": "new_failure",
                 "failed_repair_charged": True, "review_round_charged": True}
-    if issue.status == "resolved" and ordinal == current.assessed_repairs:
+    if issue.status in ("resolved", "finished") and ordinal == current.assessed_repairs:
         current.failed_repairs += 1
         current.failed_repair_ordinals.append(ordinal)
         return {"issue": identity, "assignment_index": assignment_index,
@@ -640,12 +840,22 @@ def _assess_repair_outcome(issue: IssueState, identity: str) -> dict:
 
 
 def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
-                      manifest: Manifest, role: str) -> RoleRoutingPlan:
-    """Validate one role's verdict and compute its issue changes without mutating state.
+                      manifest: Manifest, role: str, *,
+                      provenance: ReviewerProvenance | None = None) -> RoleRoutingPlan:
+    """Validate one role's verdict and build its complete ordered plan.
 
     Ownership, lineage, within-role pass completeness and budgets are checked
-    here. A rejected verdict therefore never has to be rolled back because no
-    counter or status was changed before the whole plan validated.
+    here. Nothing in the caller's register is mutated.
+
+    Every finding and resolution produces one entry. An issue-scoped stop
+    (explicit escalation, depth rule, allowance exhaustion, reassignment
+    refusal) is recorded on that entry and in ``escalations``; it never returns
+    early or drops the remaining entries. Missing parents or a lineage cycle are
+    a whole-verdict defect and are refused before any entry is planned.
+
+    When ``provenance`` is supplied the committed W01 accounting authority owns
+    each repair decision. Without it this remains a pure planning helper for a
+    legacy register whose provenance has not yet been assembled.
     """
     if role not in _REVIEW_ROLES:
         raise ContractError(f"Unknown reviewer role: {role!r}")
@@ -653,6 +863,16 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
         raise ContractError(f"Verdict identity {verdict.reviewer!r} does not match role {role!r}")
     workers = {w.id for w in manifest.workers}
     work = {identity: issue.model_copy(deep=True) for identity, issue in issues.items()}
+    # This is a pure planning projection, not an authoritative migration: a
+    # version-one ``open`` record is planned as pending, or in_repair when it
+    # already records repair activity. Committing an ordinary operation still
+    # refuses an ambiguous base register, and an explicit migration remains the
+    # only route to authoritative version-two state.
+    for issue in work.values():
+        if issue.status == "resolved":
+            issue.status = "finished"
+        elif issue.status == "open":
+            issue.status = "in_repair" if issue.has_repair_activity else "pending"
     findings: dict[str, Finding] = {}
     for finding in verdict.findings:
         if finding.worker not in workers or not set(finding.related_workers) <= workers:
@@ -688,13 +908,17 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
         raise ContractError("Issue is simultaneously resolved and open")
     if verdict.result == "pass":
         missing = sorted(issue.id for issue in work.values()
-                         if issue.owner_role == role and issue.status == "open"
+                         if issue.owner_role == role
+                         and issue.lifecycle in _DISPATCHABLE
                          and issue.id not in resolved)
         if missing:
             raise ContractError("Passing verdict must explicitly resolve " + ", ".join(missing))
 
     touched: set[str] = set()
     accounting_decisions: list[dict] = []
+    entries: list[RoleEntryPlan] = []
+    escalations: list[str] = []
+
     remaining = dict(findings)
     while remaining:
         progress = False
@@ -707,63 +931,94 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
             root = parent.root_issue_id if parent else identity
             if finding.root_issue_id != root:
                 raise ContractError(f"Incorrect root for {identity}")
-            if previous:
-                if (previous.parent_issue_id, previous.worker) != (finding.parent_issue_id, finding.worker):
+            if previous is not None:
+                if (previous.parent_issue_id, previous.worker) != (
+                        finding.parent_issue_id, finding.worker):
                     raise ContractError(f"Issue identity changed: {identity}")
-                current = previous.assignments[-1]
-                accounting_decisions.append(_assess_repair_outcome(previous, identity))
-                previous.status = "open"
+                before_lifecycle = previous.lifecycle
+                decision = _assess_repair_outcome(
+                    previous, identity, provenance)
+                accounting_decisions.append(decision)
             else:
-                previous = IssueState(id=identity, worker=finding.worker, root_issue_id=root,
-                                      parent_issue_id=finding.parent_issue_id, depth=depth,
-                                      summary=finding.summary, owner_role=role,
-                                      assignments=[AssignmentState(failed_repair_ordinals=[])])
+                previous = create_pending_issue(
+                    identity, finding.worker, root_issue_id=root,
+                    parent_issue_id=finding.parent_issue_id, depth=depth,
+                    owner_role=role, summary=finding.summary,
+                )
                 work[identity] = previous
-                accounting_decisions.append({
+                before_lifecycle = previous.lifecycle
+                decision = {
                     "issue": identity, "assignment_index": 0, "repair_ordinal": 0,
                     "assessment": "initial_work", "failed_repair_charged": False,
                     "review_round_charged": False,
-                })
+                }
+                accounting_decisions.append(decision)
             touched.add(identity)
+            stopped: str | None = None
+            reassigned = False
+
             if depth > manifest.limits.max_issue_depth:
-                work[root].status = "escalated"
+                stopped = (f"Derived issue {identity} exceeds depth limit; "
+                           f"escalate root {root}")
+                target = work[root]
+                if target.lifecycle in _DISPATCHABLE or target.lifecycle == "finished":
+                    target.status = "escalated"
                 touched.add(root)
-                return RoleRoutingPlan(
-                    issues=work, findings=findings, resolved=[], touched=sorted(touched),
-                    affected_workers=sorted({f.worker for f in findings.values()}),
-                    accounting_decisions=accounting_decisions,
-                    escalation=(f"Derived issue {identity} exceeds depth limit; "
-                                f"escalate root {root}"),
-                )
-            if finding.action == "escalate":
-                previous.status = "escalated"
-                return RoleRoutingPlan(
-                    issues=work, findings=findings, resolved=[], touched=sorted(touched),
-                    affected_workers=sorted({f.worker for f in findings.values()}),
-                    accounting_decisions=accounting_decisions,
-                    escalation=f"Issue {identity} requires escalation",
-                )
-            current = previous.assignments[-1]
-            latest_decision = accounting_decisions[-1]
-            new_failure_charge = latest_decision["failed_repair_charged"]
-            exhausted = (
-                (new_failure_charge
-                 and current.failed_repairs >= manifest.limits.max_failed_repairs_per_assignment)
-                or (new_failure_charge
-                    and current.repairs >= manifest.limits.max_repair_attempts)
-                or (latest_decision["review_round_charged"]
-                    and current.review_rounds >= manifest.limits.max_review_rounds)
-            )
-            if exhausted or finding.action == "reassign":
-                if len(previous.assignments) - 1 >= manifest.limits.max_reassignments:
+                escalations.append(stopped)
+
+            if finding.action == "escalate" and stopped is None:
+                stopped = f"Issue {identity} requires escalation"
+                if previous.lifecycle in _DISPATCHABLE or previous.lifecycle == "finished":
                     previous.status = "escalated"
-                    return RoleRoutingPlan(
-                        issues=work, findings=findings, resolved=[], touched=sorted(touched),
-                        affected_workers=sorted({f.worker for f in findings.values()}),
-                        accounting_decisions=accounting_decisions,
-                        escalation=f"Issue {identity} exhausted replacement allowance",
-                    )
-                previous.assignments.append(AssignmentState(failed_repair_ordinals=[]))
+                escalations.append(stopped)
+
+            if stopped is None:
+                current = previous.assignments[-1]
+                new_failure_charge = decision["failed_repair_charged"]
+                exhausted = (
+                    (new_failure_charge
+                     and current.failed_repairs >= manifest.limits.max_failed_repairs_per_assignment)
+                    or (new_failure_charge
+                        and current.repairs >= manifest.limits.max_repair_attempts)
+                    or (decision["review_round_charged"]
+                        and current.review_rounds >= manifest.limits.max_review_rounds)
+                )
+                if exhausted or finding.action == "reassign":
+                    if len(previous.assignments) - 1 >= manifest.limits.max_reassignments:
+                        stopped = f"Issue {identity} exhausted replacement allowance"
+                        if previous.lifecycle in _DISPATCHABLE:
+                            previous.status = "escalated"
+                        escalations.append(stopped)
+                    else:
+                        previous.assignments.append(
+                            AssignmentState(failed_repair_ordinals=[]))
+                        reassigned = True
+
+            if stopped is None:
+                if previous.lifecycle == "finished":
+                    # A valid owning-reviewer finding reopens finished work.
+                    previous.status = "pending"
+                elif previous.lifecycle == "escalated":
+                    # A repeated ordinary finding cannot silently release an
+                    # escalated issue. It is issue-scoped and consumes nothing.
+                    stopped = (f"Issue {identity} is escalated; ordinary review "
+                               "cannot reopen it without explicit human continuation")
+                    escalations.append(stopped)
+
+            entry_id = f"finding:{identity}"
+            entry_decision = {
+                "kind": "finding", "issue": identity,
+                "lifecycle": {"from": before_lifecycle, "to": previous.lifecycle},
+                "accounting": dict(decision),
+                "reopened": before_lifecycle == "finished" and previous.lifecycle == "pending",
+                "reassigned": reassigned,
+                "escalation": stopped,
+            }
+            entries.append(RoleEntryPlan(
+                entry_id=entry_id, order_index=len(entries), kind="finding",
+                issue_id=identity, issue=previous.model_copy(deep=True),
+                decision=entry_decision,
+            ))
             del remaining[identity]
             progress = True
         if not progress:
@@ -771,35 +1026,46 @@ def plan_role_routing(issues: dict[str, IssueState], verdict: Verdict,
 
     for identity in resolved:
         issue = work[identity]
-        was_open = issue.status == "open"
+        before_lifecycle = issue.lifecycle
         _validate_repair_counters(identity, issue.assignments[-1])
-        issue.status = "resolved"
-        # A passing assessment covers the current repair outcome even though it
-        # is not a failure. Record the mark so a later revalidation of the same
-        # outcome cannot charge it as failed. A newly resolved outcome counts as
-        # a review round; re-resolving an already resolved outcome does not.
-        current = issue.assignments[-1]
-        new_outcome = (current.assessed_repairs is None
-                       or current.repairs > current.assessed_repairs)
-        round_charged = was_open and new_outcome
-        if round_charged:
-            current.review_rounds += 1
-        if current.assessed_repairs is None:
-            current.assessed_repairs = current.repairs
-        else:
-            current.assessed_repairs = max(current.assessed_repairs, current.repairs)
-        if current.failed_repair_ordinals is None:
-            current.failed_repair_ordinals = []
-        accounting_decisions.append({
-            "issue": identity, "assignment_index": len(issue.assignments) - 1,
-            "repair_ordinal": current.repairs, "assessment": "resolved",
-            "failed_repair_charged": False, "review_round_charged": round_charged,
-        })
+        decision = _assess_repair_outcome(
+            issue, identity, provenance, resolved=True)
+        accounting_decisions.append(decision)
+        stopped: str | None = None
+        if before_lifecycle == "escalated":
+            stopped = (f"Issue {identity} is escalated; an ordinary resolution "
+                       "cannot silently release it without explicit human continuation")
+            escalations.append(stopped)
+        elif before_lifecycle == "finished":
+            # Re-resolving a finished issue is a validated no-change entry.
+            pass
+        elif before_lifecycle == "in_repair":
+            issue.status = "finished"
+        elif before_lifecycle == "pending":
+            raise ContractError(
+                f"Issue {identity} is pending, not in repair; a reviewer cannot finish "
+                "undispatched work. Dispatch it or record an explicit human disposition."
+            )
         touched.add(identity)
+        entry_id = f"resolution:{identity}"
+        entries.append(RoleEntryPlan(
+            entry_id=entry_id, order_index=len(entries), kind="resolution",
+            issue_id=identity, issue=issue.model_copy(deep=True),
+            decision={
+                "kind": "resolution", "issue": identity,
+                "lifecycle": {"from": before_lifecycle, "to": issue.lifecycle},
+                "accounting": dict(decision),
+                "reopened": False, "reassigned": False,
+                "escalation": stopped,
+            },
+        ))
+
     return RoleRoutingPlan(
         issues=work, findings=findings, resolved=resolved, touched=sorted(touched),
         affected_workers=sorted({f.worker for f in findings.values()}),
-        accounting_decisions=accounting_decisions,
+        accounting_decisions=accounting_decisions, entries=entries,
+        escalations=escalations,
+        escalation=escalations[0] if escalations else None,
     )
 
 
@@ -936,6 +1202,184 @@ def _review_acceptance_events(events: list[dict], key: str) -> list[dict]:
             and event.get("transaction") == key]
 
 
+def _operation_provenance(key: str, operation: dict) -> ReviewerProvenance:
+    """Assemble the mandatory reviewer provenance for one accepted operation."""
+    try:
+        return ReviewerProvenance(
+            reviewer_role=operation["role"],
+            attempt_id=str(operation["attempt_id"]),
+            candidate_sha=str(operation["candidate_sha"]),
+            verdict_sha256=str(operation["verdict_sha256"]),
+            evidence_digest=str(operation["evidence_digest"]),
+            verdict_path=str(operation["verdict_path"]),
+            transaction=key,
+            ownership_valid=True,
+            dispatch_evidence=True,
+            completion_evidence=True,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ContractError(
+            f"Review transaction {key} has incomplete reviewer provenance: {exc}"
+        ) from exc
+
+
+def _entry_issue(entry: RoleEntryPlan, base: IssueState | None, *,
+                 transaction: str) -> IssueState:
+    """Replay one entry's planned status effect through the guarded contract."""
+    if base is None:
+        source = entry.issue.model_copy(deep=True)
+        source.status = "pending"
+        source.lifecycle_history = []
+    else:
+        source = base.model_copy(deep=True)
+    final = entry.issue.model_copy(deep=True)
+    if final.status == source.lifecycle:
+        current = _lifecycle_source(source)
+        guard = TransitionGuard(no_change_evidence=True)
+    else:
+        current, guard = _planned_lifecycle(source, final.status)
+    working = final.model_copy(deep=True)
+    working.status = current
+    apply_lifecycle_transition(
+        working, final.lifecycle, guard,
+        evidence=[f"transaction:{transaction}", f"entry:{entry.entry_id}"],
+    )
+    return working
+
+
+def _ensure_review_application(store: StateStore, state: RunState,
+                               application) -> RunState:
+    """Persist a new intent or verify the already-durable one.
+
+    An interrupted application retains applied entry state, so it is no longer
+    byte-identical to a freshly built intent. Replay compares only the stable
+    intent fields and never rewrites applied decisions.
+    """
+    existing = state.review_applications.get(application.application_id)
+    if existing is None:
+        return store.begin_review_application(state, application)
+    stable = (
+        existing.transaction, existing.reviewer_role, existing.attempt_id,
+        existing.candidate_sha, existing.evidence_digest, existing.verdict_sha256,
+        existing.verdict_path, existing.approved_inputs,
+    )
+    expected = (
+        application.transaction, application.reviewer_role, application.attempt_id,
+        application.candidate_sha, application.evidence_digest,
+        application.verdict_sha256, application.verdict_path,
+        application.approved_inputs,
+    )
+    if stable != expected:
+        raise EvidenceConflictError(
+            f"Review application {application.application_id} already has a "
+            "different durable intent"
+        )
+    stored_entries = {entry.entry_id: entry.proposed_decision
+                      for entry in existing.entries}
+    built_entries = {entry.entry_id: entry.proposed_decision
+                     for entry in application.entries}
+    if stored_entries != built_entries:
+        raise EvidenceConflictError(
+            f"Review application {application.application_id} durable entry intent "
+            "disagrees with the replayed decision"
+        )
+    return state
+
+
+def _apply_planned_entries(store: StateStore, state: RunState, application_id: str,
+                           plan: RoleRoutingPlan,
+                           base_issues: dict[str, IssueState]) -> RunState:
+    """Apply every not-yet-applied planned entry in deterministic order.
+
+    An issue-scoped escalation does not stop the loop: later entries are still
+    validated and committed. Application never launches a worker.
+    """
+    for entry_plan in plan.entries:
+        application = state.review_applications[application_id]
+        stored = next(item for item in application.entries
+                      if item.entry_id == entry_plan.entry_id)
+        if stored.state == "applied":
+            if stored.decision != entry_plan.decision:
+                raise EvidenceConflictError(
+                    f"Entry {entry_plan.entry_id} was already applied with a different decision"
+                )
+        else:
+            issue = _entry_issue(
+                entry_plan, base_issues.get(entry_plan.issue_id),
+                transaction=application.transaction,
+            )
+            state = store.apply_review_entry(
+                state, application_id, entry_plan.entry_id,
+                decision=entry_plan.decision, issue=issue,
+            )
+        state = store.record_review_entry_audit(
+            state, application_id, entry_plan.entry_id)
+    return store.complete_review_application(state, application_id)
+
+
+def _apply_unescorted_side_effects(store: StateStore, state: RunState,
+                                   plan: RoleRoutingPlan,
+                                   entry_issue_ids: set[str]) -> RunState:
+    """Apply planned lifecycle effects that are not themselves review entries.
+
+    A depth-rule stop names the affected root, which may not be a finding or
+    resolution in the same verdict. It is still a guarded transition, recorded
+    after the entries are applied; it never drops or replaces an entry.
+    """
+    for identity in plan.touched:
+        if identity in entry_issue_ids:
+            continue
+        source = state.issues.get(identity)
+        target = plan.issues.get(identity)
+        if source is None or target is None or source.lifecycle == target.lifecycle:
+            continue
+        current, guard = _planned_lifecycle(source, target.lifecycle)
+        updated = target.model_copy(deep=True)
+        updated.status = current
+        transition = apply_lifecycle_transition(
+            updated, target.lifecycle, guard,
+            evidence=["review-application:lineage-stop"],
+        )
+        state.issues[identity] = updated
+        state = store.save(state)
+        store.event(
+            state.run_id, "lifecycle_transition", issue=identity,
+            from_status=transition.from_status, to_status=transition.to_status,
+            guard=transition.guard, evidence=transition.evidence,
+            reason="issue-scoped lineage stop",
+        )
+    return state
+
+
+def _build_application_issues(snapshot_issues: dict[str, IssueState],
+                              plan: RoleRoutingPlan) -> dict[str, IssueState]:
+    """Return intent-time snapshots plus synthetic pending new issues.
+
+    Snapshots must be the exact register the intent was persisted against. A
+    normalized planning copy is not enough: the store refuses an entry whose
+    pre-application evidence does not match the durable register.
+    """
+    view = dict(snapshot_issues)
+    for entry in plan.entries:
+        if entry.issue_id in view:
+            continue
+        synthetic = entry.issue.model_copy(deep=True)
+        synthetic.status = "pending"
+        synthetic.lifecycle_history = []
+        view[entry.issue_id] = synthetic
+    return view
+
+
+def _recorded_application_issues(operation: dict,
+                                 fallback: dict[str, IssueState]
+                                 ) -> dict[str, IssueState]:
+    recorded = operation.get("application_base_issues")
+    if not isinstance(recorded, dict):
+        return dict(fallback)
+    return {identity: IssueState.model_validate(value)
+            for identity, value in recorded.items()}
+
+
 def _finish_review_operation(store: StateStore, state: RunState, key: str,
                              operation: dict, manifest: Manifest) -> tuple[RunState, ReviewResult]:
     """Commit or replay one role acceptance from its recorded durable decision.
@@ -973,7 +1417,8 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
     if not isinstance(base, dict):
         raise ContractError(f"Review transaction {key} has no pre-routing issue snapshot")
     base_issues = {identity: IssueState.model_validate(value) for identity, value in base.items()}
-    plan = plan_role_routing(base_issues, verdict, manifest, role)
+    provenance = _operation_provenance(key, operation)
+    plan = plan_role_routing(base_issues, verdict, manifest, role, provenance=provenance)
     recorded_decisions = operation.get("accounting_decisions")
     if not isinstance(recorded_decisions, list):
         raise ContractError(
@@ -1024,7 +1469,7 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
                 ) from exc
             if (source_operation.get("status") != "completed"
                     or source_operation.get("accounting_decisions") is not None
-                    or source_issue.status != "resolved"
+                    or source_issue.status not in ("resolved", "finished")
                     or not source_issue.assignments
                     or source_issue.assignments[-1].repairs != ordinal
                     or source_issue.assignments[-1].assessed_repairs != ordinal
@@ -1050,11 +1495,33 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
         transaction=key,
         escalation=plan.escalation,
     )
-    merged = dict(state.issues)
-    for identity in plan.touched:
-        merged[identity] = plan.issues[identity].model_copy(deep=True)
-    state.issues = merged
+    application_id: str | None = None
+    if plan.entries:
+        application_issues = _build_application_issues(
+            _recorded_application_issues(operation, state.issues), plan)
+        application = build_review_application(
+            result, verdict, application_issues,
+            approved_inputs=operation.get("approved_inputs") or {},
+            proposed_decisions={entry.entry_id: entry.decision for entry in plan.entries},
+        )
+        application_id = application.application_id
+        state = _ensure_review_application(store, state, application)
+        state = _apply_planned_entries(
+            store, state, application_id, plan, application_issues)
+        state = _apply_unescorted_side_effects(
+            store, state, plan,
+            {entry.issue_id for entry in plan.entries},
+        )
+    else:
+        state = store.save(state)
+
     state.review_results[key] = result
+    store.event(
+        state.run_id, "review_application_recorded",
+        transaction=key, application_id=application_id,
+        entry_ids=[entry.entry_id for entry in plan.entries],
+        escalations=plan.escalations,
+    )
     state = store.save(state)
 
     events = store.events(state.run_id)
@@ -1078,11 +1545,16 @@ def _finish_review_operation(store: StateStore, state: RunState, key: str,
             affected_workers=result.affected_workers, escalation=result.escalation,
             binding=result.binding, accounting_decisions=plan.accounting_decisions,
             legacy_reconciliations=reconciliations,
+            application_id=application_id,
+            entry_ids=[entry.entry_id for entry in plan.entries],
         )
     state = store.record_operation(state, key, {
         "status": "completed", "event_id": event["id"],
         "after_issues_digest": _issues_digest(state.issues),
         "completed_at": timestamp(),
+        "application_id": application_id,
+        "entry_ids": [entry.entry_id for entry in plan.entries],
+        "escalations": plan.escalations,
     })
     return state, state.review_results[key]
 
@@ -1135,9 +1607,16 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
     evidence = repair_assessment_evidence(state)
     base_issues = derive_repair_assessment(
         state.issues, evidence, finding_ids, relevant_ids)
+    # Refuse an ambiguous legacy lifecycle before the first durable write. A
+    # version-one open record with repair activity requires explicit migration;
+    # it is never guessed as pending or in repair during acceptance.
+    for identity in finding_ids | set(verdict.resolved):
+        planned = base_issues.get(identity)
+        if planned is not None:
+            _lifecycle_source(planned)
     for identity in finding_ids:
         issue = base_issues.get(identity)
-        if issue is None or issue.status != "resolved" or not issue.assignments:
+        if issue is None or issue.status not in ("resolved", "finished") or not issue.assignments:
             continue
         assignment_index = len(issue.assignments) - 1
         assignment = issue.assignments[-1]
@@ -1150,7 +1629,13 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
                 f"Issue {identity} is resolved at repair {ordinal}, but retained successful "
                 "assessment evidence cannot attribute the reopening; refusing before mutation"
             )
-    plan = plan_role_routing(base_issues, verdict, manifest, role)
+    provenance = ReviewerProvenance(
+        reviewer_role=role, attempt_id=attempt_id, candidate_sha=candidate_sha,
+        verdict_sha256=digest, evidence_digest=evidence_digest,
+        verdict_path=str(path), transaction=key, ownership_valid=True,
+        dispatch_evidence=True, completion_evidence=True,
+    )
+    plan = plan_role_routing(base_issues, verdict, manifest, role, provenance=provenance)
     legacy_reconciliations = []
     for identity, issue in base_issues.items():
         previous = state.issues.get(identity)
@@ -1190,15 +1675,25 @@ def accept_review_result(store: StateStore, state: RunState, *, role: str,
         "verdict": verdict.model_dump(mode="json"),
         "base_issues": {identity: issue.model_dump(mode="json")
                         for identity, issue in base_issues.items()},
+        "application_base_issues": {identity: issue.model_dump(mode="json")
+                                    for identity, issue in state.issues.items()},
         "accounting_decisions": plan.accounting_decisions,
         "legacy_reconciliations": legacy_reconciliations,
+        "entry_ids": [entry.entry_id for entry in plan.entries],
+        "application_id": (review_application_id(key) if plan.entries else None),
     }
     state = store.record_operation(state, key, operation)
     return _finish_review_operation(store, state, key, state.operations[key], manifest)
 
 
 def review_transaction_gaps(state: RunState, events: list[dict]) -> list[str]:
-    """Report incomplete or unaudited role transactions that block review."""
+    """Report incomplete, unaudited or partially applied review transactions.
+
+    Completion of the role transaction is not enough: every planned entry must
+    have an applied decision and its stable audit event, and the application must
+    be marked complete. An untouched entry is named so resume-before-dispatch can
+    act on it instead of treating the verdict as fully applied.
+    """
     gaps: list[str] = []
     for key, operation in state.operations.items():
         if not key.startswith(_REVIEW_RESULT_PREFIX):
@@ -1223,11 +1718,207 @@ def review_transaction_gaps(state: RunState, events: list[dict]) -> list[str]:
               or accepted[0].get("legacy_reconciliations")
               != operation.get("legacy_reconciliations")):
             gaps.append(f"{key} (acceptance audit accounting provenance disagrees with transaction)")
+        entry_ids = operation.get("entry_ids")
+        application_id = operation.get("application_id") or (
+            review_application_id(key) if entry_ids else None)
+        if entry_ids:
+            application = state.review_applications.get(application_id)
+            if application is None:
+                gaps.append(f"{key} (durable review application missing)")
+                continue
+            if not application.fully_applied:
+                missing = [entry.entry_id for entry in application.entries
+                           if entry.state != "applied"]
+                gaps.append(f"{key} (unapplied entries: {', '.join(missing)})")
+            if not application.complete:
+                gaps.append(f"{key} (application completion record missing)")
+            audits = [event for event in events
+                      if event.get("kind") == "review_entry_applied"
+                      and event.get("application_id") == application_id]
+            if len(audits) != len(application.entries):
+                gaps.append(f"{key} (entry audit events missing or duplicated)")
+            assessment = classify_review_evidence(
+                state, application_id, operation="gap_check", events=events)
+            if assessment.classification != "verified":
+                detail = ", ".join(
+                    assessment.missing_inputs + assessment.missing_digests
+                    + assessment.conflicts)
+                gaps.append(
+                    f"{key} (evidence {assessment.classification}"
+                    + (f": {detail}" if detail else "") + ")")
     for key in state.review_results:
         operation = state.operations.get(key)
         if not isinstance(operation, dict) or operation.get("status") != "completed":
             gaps.append(f"{key} (role result has no completed transaction)")
     return sorted(set(gaps))
+
+
+def resume_review_applications(store: StateStore, state: RunState,
+                               manifest: Manifest) -> RunState:
+    """Resume every durable but incomplete review application.
+
+    This runs before dispatch and review finalisation. It never launches a
+    worker: it reconciles audits, applies only entries whose deterministic
+    decisions were already persisted, and completes the application when every
+    entry and audit agrees. A contradiction is refused, not repaired.
+    """
+    for application_id, application in list(state.review_applications.items()):
+        if application.complete:
+            continue
+        operation = state.operations.get(application.transaction)
+        if not isinstance(operation, dict):
+            raise ContractError(
+                f"Review application {application_id} has no durable transaction; "
+                "refusing to invent its decisions"
+            )
+        if operation.get("status") != "completed":
+            state, _result = _finish_review_operation(
+                store, state, application.transaction, operation, manifest)
+            continue
+        # A completed transaction with an incomplete application is a supported
+        # crash boundary. Replay from its retained base, never current counters.
+        base = operation.get("base_issues")
+        recorded = operation.get("verdict")
+        if not isinstance(base, dict) or not isinstance(recorded, dict):
+            raise ContractError(
+                f"Review application {application_id} cannot be resumed: "
+                "its transaction has no retained base evidence"
+            )
+        base_issues = {identity: IssueState.model_validate(value)
+                       for identity, value in base.items()}
+        verdict = Verdict.model_validate(recorded)
+        provenance = _operation_provenance(application.transaction, operation)
+        plan = plan_role_routing(
+            base_issues, verdict, manifest, application.reviewer_role,
+            provenance=provenance)
+        application_issues = _build_application_issues(
+            _recorded_application_issues(operation, state.issues), plan)
+        rebuilt = build_review_application(
+            state.review_results[application.transaction], verdict, application_issues,
+            approved_inputs=application.approved_inputs,
+            proposed_decisions={entry.entry_id: entry.decision for entry in plan.entries},
+        )
+        state = _ensure_review_application(store, state, rebuilt)
+        state = _apply_planned_entries(
+            store, state, application_id, plan, application_issues)
+        state = _apply_unescorted_side_effects(
+            store, state, plan, {entry.issue_id for entry in plan.entries})
+        state = store.save(state)
+    return state
+
+
+def load_validated_dependencies(manifest: Manifest, plan: Path,
+                                state: RunState) -> dict:
+    """Return the validated issue-level dependency view, if configured.
+
+    The reducer never parses a guessed path or schema: the physical record must
+    be declared by the approved manifest, and W01 validation must accept every
+    known ID, owner, shared scope and the acyclic graph. Any contradiction stops
+    affected scheduling for reassessment rather than choosing an interpretation.
+    """
+    if not manifest.dependency_record:
+        return {}
+    path = within(plan, manifest.dependency_record)
+    if not path.is_file():
+        raise ContractError(
+            f"Dependency record {manifest.dependency_record} is declared but missing: {path}"
+        )
+    record, _body = load_dependency_record(path)
+    worker_scopes = {worker.id: list(worker.allowed_paths)
+                     for worker in manifest.workers}
+    validate_dependency_record(
+        record,
+        known_issue_ids=set(state.issues),
+        issue_owners={identity: issue.worker for identity, issue in state.issues.items()},
+        known_worker_ids=set(worker_scopes),
+        approved_scopes=worker_scopes,
+    )
+    state.dependency_record = record
+    return {item.dependent_issue_id: item for item in record.dependencies}
+
+
+def _verification_evidence_assembled(state: RunState, prerequisite: str) -> bool:
+    """Whether a verification prerequisite has assembled, not merely claimed."""
+    issue = state.issues.get(prerequisite)
+    if issue is not None:
+        if issue.lifecycle != "finished":
+            return False
+        # A passing review result is the assembled acceptance evidence. An
+        # earlier worker's handover claim alone is not enough.
+        return any(issue.id in result.resolved
+                   for result in state.review_results.values())
+    return prerequisite in state.artifacts
+
+
+def issue_dependency_blockers(issue: IssueState, state: RunState,
+                              dependencies: dict) -> list[str]:
+    """Return human-readable waits that keep one issue from dispatch."""
+    dependency = dependencies.get(issue.id)
+    if dependency is None:
+        return []
+    blockers: list[str] = []
+    for prerequisite in dependency.prerequisite_issue_ids:
+        required = state.issues.get(prerequisite)
+        if required is None:
+            blockers.append(f"unknown semantic prerequisite {prerequisite}")
+        elif required.lifecycle != "finished":
+            blockers.append(
+                f"semantic prerequisite {prerequisite} is {required.lifecycle}")
+    for prerequisite in dependency.verification_prerequisites:
+        if not _verification_evidence_assembled(state, prerequisite):
+            blockers.append(
+                f"verification prerequisite {prerequisite} has no assembled evidence")
+    return blockers
+
+
+def select_dispatchable_issues(issues: list[IssueState], state: RunState,
+                               dependencies: dict,
+                               active_resources: set[str] | None = None
+                               ) -> tuple[list[IssueState], dict[str, list[str]]]:
+    """Select ready issues while serialising declared shared resources.
+
+    Waiting consumes no attempt: an issue omitted here is simply left for a
+    later wave. At most one issue per shared-resource key is selected, including
+    keys already active in another worker's wave.
+    """
+    active = set(active_resources or ())
+    selected: list[IssueState] = []
+    waiting: dict[str, list[str]] = {}
+    for issue in sorted(issues, key=lambda item: item.id):
+        if issue.lifecycle not in _DISPATCHABLE:
+            continue
+        blockers = issue_dependency_blockers(issue, state, dependencies)
+        if blockers:
+            waiting[issue.id] = blockers
+            continue
+        dependency = dependencies.get(issue.id)
+        resources = set(dependency.shared_resource_paths) if dependency else set()
+        if resources & active:
+            waiting[issue.id] = [
+                "shared resource serialised: " + ", ".join(sorted(resources & active))]
+            continue
+        selected.append(issue)
+        active.update(resources)
+    return selected, waiting
+
+
+def promotion_blockers(state: RunState, events: list[dict] | None = None) -> list[str]:
+    """Return exact reasons promotion must wait for explicit disposition."""
+    events = events or []
+    blockers: list[str] = []
+    gaps = review_transaction_gaps(state, events)
+    blockers.extend(f"review application gap: {gap}" for gap in gaps)
+    for issue in sorted(state.issues.values(), key=lambda item: item.id):
+        current = issue.lifecycle
+        if current == "finished":
+            continue
+        if current == "escalated":
+            blockers.append(
+                f"escalated issue {issue.id} has no explicit human disposition")
+        else:
+            blockers.append(
+                f"issue {issue.id} is {current}, not finished or explicitly accepted/deferred")
+    return blockers
 
 
 def plan_issue_ownership(state: RunState, run_dir: Path, manifest: Manifest) -> list[dict]:
@@ -1501,10 +2192,10 @@ def _legacy_pre_batch(
             raise ContractError(f"Pre-batch issue {identity} is missing from state")
         if issue.owner_role == "system":
             raise ContractError(f"Workflow-owned issue {identity} was changed by a review batch")
-        if issue.status != "open":
+        if issue.lifecycle not in _DISPATCHABLE:
             raise ContractError(
-                f"Issue {identity} is {issue.status}, not open; this is not the expected "
-                "partially applied review batch"
+                f"Issue {identity} is {issue.lifecycle}, not open/in repair; this is not "
+                "the expected partially applied review batch"
             )
         assignment = issue.assignments[-1]
         if assignment.review_rounds < 1:
@@ -1531,10 +2222,10 @@ def _legacy_pre_batch(
         issue = pre.get(identity)
         if issue is None:
             raise ContractError(f"Resolved issue {identity} is missing from the register")
-        if issue.status != "open":
+        if issue.lifecycle not in _DISPATCHABLE:
             raise ContractError(
-                f"Issue {identity} is already {issue.status}; resolutions from this batch "
-                "were applied, so the generic batch recovery does not apply"
+                f"Issue {identity} is already {issue.lifecycle}; resolutions from this "
+                "batch were applied, so the generic batch recovery does not apply"
             )
         if issue.owner_role is None:
             raise ContractError(f"Issue {identity} has no validated owner")
@@ -2208,6 +2899,9 @@ class Engine:
         self.record = WorkspaceRecord.from_dict(state.workspace)
         self.runner = runner or ProcessRunner()
         self.adapters = adapters or {"planner": CodexAdapter(self.runner), "opencode": OpenCodeAdapter(self.runner)}
+        # Independent roles may finish concurrently; their durable commits are
+        # serialised and each reloads the latest revision first.
+        self._review_commit_lock = asyncio.Lock()
 
     def save(self):
         saved = self.store.save(self.state)
@@ -2298,6 +2992,41 @@ class Engine:
         return _sha256_text(json.dumps(payload, sort_keys=True, separators=(",", ":"),
                                        ensure_ascii=False))
 
+    def resume_review_applications(self) -> None:
+        """Resume durable applications before any relevant dispatch."""
+        self.state = resume_review_applications(
+            self.store, self.state, self.manifest)
+
+    def dependencies(self) -> dict:
+        return load_validated_dependencies(self.manifest, self.plan, self.state)
+
+    def dispatchable_issues(self, worker, dependencies: dict | None = None,
+                            active_resources: set[str] | None = None):
+        """Ready issues for one worker, with dependency/resource waits named."""
+        dependencies = self.dependencies() if dependencies is None else dependencies
+        candidates = [issue for issue in self.state.issues.values()
+                      if issue.worker == worker.id
+                      and issue.lifecycle in _DISPATCHABLE]
+        return select_dispatchable_issues(
+            candidates, self.state, dependencies, active_resources)
+
+    def record_human_disposition(self, disposition: HumanDisposition) -> None:
+        """Apply one explicitly recorded human control action.
+
+        This is a contract-layer surface, not a new CLI command. It refuses an
+        unknown issue and records the guarded transition as audit evidence.
+        """
+        issue = self.state.issues.get(disposition.issue_id)
+        if issue is None:
+            raise ContractError(
+                f"Human disposition names unknown issue {disposition.issue_id}")
+        transition = apply_human_disposition(issue, disposition)
+        self.save()
+        self.event("human_disposition", issue=issue.id, kind=disposition.kind,
+                   from_status=transition.from_status, to_status=transition.to_status,
+                   scope=disposition.scope, evidence=transition.evidence,
+                   deferred_stage=disposition.deferred_stage)
+
     def finalize_review_transactions(self, candidate) -> None:
         """Complete or refuse role transactions recorded before an interruption."""
         for key, operation in list(self.state.operations.items()):
@@ -2319,6 +3048,7 @@ class Engine:
                 )
                 self.event("review_transaction_replayed", transaction=key,
                            role=result.role, result=result.result)
+        self.resume_review_applications()
         gaps = review_transaction_gaps(self.state, self.store.events(self.state.run_id))
         if gaps:
             raise Escalation(
@@ -2331,7 +3061,22 @@ class Engine:
             self.state.phase = phase
         if stage:
             self.state.stage = stage
-        self.save()
+        try:
+            self.save()
+        except ContractError as exc:
+            if "Stale state revision" not in str(exc):
+                raise
+            # A concurrent durable commit advanced the revision. The disk state
+            # is authoritative; reapply only the requested transition.
+            error = self.state.error
+            self.state = self.store.load(self.state.run_id)
+            if phase:
+                self.state.phase = phase
+            if stage:
+                self.state.stage = stage
+            if error is not None:
+                self.state.error = error
+            self.save()
         self.event("transition", phase=self.state.phase, stage=self.state.stage, cycle=self.state.round)
 
     def check_approval(self):
@@ -2580,8 +3325,22 @@ class Engine:
             return skip("handover identity does not match this worker")
         return resolved
 
-    async def run_worker(self, worker):
+    def _finish_system_issue(self, identity: str, evidence: list[str]) -> None:
+        """Finish one workflow-owned check issue through the guarded path."""
+        issue = self.state.issues.get(identity)
+        if issue is None or issue.lifecycle == "finished":
+            return
+        if issue.lifecycle not in ("pending", "in_repair"):
+            raise LifecycleTransitionError(
+                f"Issue {identity} is {issue.lifecycle}; check evidence cannot finish it")
+        transition = finish_system_issue(issue, check_evidence=evidence)
+        self.event("lifecycle_transition", issue=identity,
+                   from_status=transition.from_status, to_status=transition.to_status,
+                   guard=transition.guard, evidence=transition.evidence)
+
+    async def run_worker(self, worker, active_resources: set[str] | None = None):
         self.check_recovery_audit()
+        self.resume_review_applications()
         workspace = self.record.workers[worker.id]
         info = self.state.workers.setdefault(worker.id, {})
         if info.get("commit_pending"):
@@ -2617,11 +3376,25 @@ class Engine:
             info["dependency_shas"] = dependencies
             self.state.workspace = {**self.state.workspace, **self.record.to_dict()}
             self.save()
-        issues = [i for i in self.state.issues.values() if i.worker == worker.id and i.status == "open"]
+        dependencies_view = self.dependencies()
         while True:
             self.check_control()
             self.check_approval()
-            issues = [i for i in self.state.issues.values() if i.worker == worker.id and i.status == "open"]
+            candidates = [i for i in self.state.issues.values()
+                          if i.worker == worker.id and i.lifecycle in _DISPATCHABLE]
+            if not candidates:
+                # A worker with no registered issue still performs its owned
+                # work pass (initial work, resume after a failed attempt, or a
+                # rework handover); it must not remain permanently unchecked.
+                issues, waiting = [], {}
+            else:
+                issues, waiting = select_dispatchable_issues(
+                    candidates, self.state, dependencies_view, active_resources)
+                if not issues:
+                    self.event("dispatch_waiting", agent=worker.id,
+                               waits={identity: reasons
+                                      for identity, reasons in waiting.items()})
+                    return
             attempt = int(info.get("attempt", 0)) + 1
             output = self.run_dir / f"round-{self.state.round}" / "handover" / f"{worker.id}-{attempt}.md"
             inputs = [within(self.plan, worker.instruction)]
@@ -2639,8 +3412,28 @@ class Engine:
                 f"Allowed paths: {worker.allowed_paths}.")
             role = "replacement" if any(len(i.assignments) > 1 for i in issues) else "worker"
             for issue in issues:
+                # Dispatch is a guarded lifecycle transition, recorded with the
+                # durable intent. A waiting issue never reaches this point.
+                if issue.lifecycle == "pending":
+                    apply_lifecycle_transition(
+                        issue, "in_repair",
+                        TransitionGuard(
+                            identity_valid=True, owner_lineage_valid=True,
+                            dispatch_intent=True, dependencies_ready=True,
+                            allowance_available=True, process_ownership_known=True,
+                        ),
+                        evidence=[f"dispatch:{worker.id}:attempt-{attempt}"],
+                    )
+                else:
+                    apply_lifecycle_transition(
+                        issue, "in_repair",
+                        TransitionGuard(subsequent_attempt=True),
+                        evidence=[f"dispatch:{worker.id}:attempt-{attempt}"],
+                    )
                 issue.assignments[-1].repairs += 1
                 issue.attempt = attempt
+                self.state.activity.append(_dispatch_activity(
+                    issue, worker.id, attempt))
             info.update(handover=str(output), checked=False, branch=workspace.branch,
                         worktree=str(workspace.path))
             self.save()
@@ -2669,12 +3462,12 @@ class Engine:
                 info = self.state.workers[worker.id]
                 info.pop("commit_pending", None)
                 workspace.baseline_sha = sha
-                check_issue = self.state.issues.get(f"check-{worker.id}")
-                if check_issue:
-                    check_issue.status = "resolved"
-                mutation_issue = self.state.issues.get(f"post-check-{worker.id}")
-                if mutation_issue:
-                    mutation_issue.status = "resolved"
+                self._finish_system_issue(
+                    f"check-{worker.id}",
+                    [f"worker-check:{worker.id}:round-{self.state.round}:pass"])
+                self._finish_system_issue(
+                    f"post-check-{worker.id}",
+                    [f"post-check:{worker.id}:round-{self.state.round}:pass"])
                 info.update(sha=sha, checked=True, status="done", checks="pass")
                 self.state.workspace = {**self.state.workspace, **self.record.to_dict()}
                 self.save()
@@ -2683,8 +3476,10 @@ class Engine:
                 self.event("worker_check_failed", agent=worker.id, error=str(exc))
                 key = f"check-{worker.id}"
                 if key not in self.state.issues:
-                    self.state.issues[key] = IssueState(id=key, worker=worker.id, root_issue_id=key,
-                                                      summary=str(exc), owner_role="system")
+                    self.state.issues[key] = create_system_issue(
+                        key, worker.id, root_issue_id=key, summary=str(exc),
+                        evidence=[f"worker-check-failure:{worker.id}:round-{self.state.round}"],
+                    )
                 issue = self.state.issues[key]
                 current = issue.assignments[-1]
                 if current.repairs and current.repairs not in (current.failed_repair_ordinals or []):
@@ -2699,24 +3494,69 @@ class Engine:
                 feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"{worker.id}-{attempt}.md"
                 atomic_write(feedback, f"# CHECK feedback\n\n{exc}\n")
                 info["feedback"] = str(feedback)
-                issues = [i for i in self.state.issues.values() if i.worker == worker.id and i.status == "open"]
                 self.save()
 
     async def work(self):
+        # Finish durable review applications before any repair dispatch: an
+        # interrupted acceptance must not be silently skipped by new work.
+        self.resume_review_applications()
         pending = {w.id: w for w in self.manifest.workers if not self.state.workers.get(w.id, {}).get("checked")}
         while pending:
             ready = [w for w in pending.values() if all(self.state.workers.get(d, {}).get("checked") for d in w.depends_on)]
             if not ready:
                 raise Escalation("No schedulable workers; dependency state is inconsistent")
-            semaphore = asyncio.Semaphore(self.manifest.limits.concurrency)
-            async def one(worker, semaphore=semaphore):
-                async with semaphore:
-                    await self.run_worker(worker)
-            async with asyncio.TaskGroup() as group:
-                for worker in ready:
-                    group.create_task(one(worker))
+            dependencies = self.dependencies()
+            # Serialise declared shared resources across workers by scheduling a
+            # wave whose selected issues do not overlap. Waiting issues keep
+            # their status and consume no attempt.
+            wave: list = []
+            used: set[str] = set()
+            wave_resources: dict[str, set[str]] = {}
             for worker in ready:
-                del pending[worker.id]
+                candidates = [issue for issue in self.state.issues.values()
+                              if issue.worker == worker.id
+                              and issue.lifecycle in _DISPATCHABLE]
+                selected, _waiting = select_dispatchable_issues(
+                    candidates, self.state, dependencies, used)
+                resources = set()
+                for issue in selected:
+                    dependency = dependencies.get(issue.id)
+                    if dependency:
+                        resources.update(dependency.shared_resource_paths)
+                if candidates and not selected:
+                    continue
+                wave.append(worker)
+                wave_resources[worker.id] = resources
+                used.update(resources)
+            if not wave:
+                return
+            before = {identity: self.state.workers.get(identity, {}).get("attempt", 0)
+                      for identity in pending}
+            semaphore = asyncio.Semaphore(self.manifest.limits.concurrency)
+            async def one(worker, semaphore=semaphore, resources=wave_resources):
+                async with semaphore:
+                    await self.run_worker(worker, resources.get(worker.id, set()))
+            async with asyncio.TaskGroup() as group:
+                for worker in wave:
+                    group.create_task(one(worker))
+            for worker in wave:
+                if self.state.workers.get(worker.id, {}).get("checked"):
+                    del pending[worker.id]
+            after = {identity: self.state.workers.get(identity, {}).get("attempt", 0)
+                     for identity in pending}
+            if pending and after == before:
+                waits = []
+                for worker in pending.values():
+                    candidates = [issue for issue in self.state.issues.values()
+                                  if issue.worker == worker.id
+                                  and issue.lifecycle in _DISPATCHABLE]
+                    _selected, waiting = select_dispatchable_issues(
+                        candidates, self.state, dependencies)
+                    waits.extend(f"{identity}: {', '.join(reasons)}"
+                                 for identity, reasons in waiting.items())
+                raise Escalation(
+                    "No schedulable repair issue; dependency or shared-resource waits "
+                    "are unresolved: " + ("; ".join(waits) or "no pending issue"))
 
     def invalidate_mutated_workers(self) -> bool:
         """Recheck worker snapshots before combining their commits.
@@ -2750,10 +3590,11 @@ class Engine:
             info.update(checked=False, status="rework")
             issue_id = f"post-check-{worker_id}"
             if issue_id not in self.state.issues:
-                self.state.issues[issue_id] = IssueState(
-                    id=issue_id, worker=worker_id, root_issue_id=issue_id,
-                    summary="Worker worktree changed after its successful CHECK; revalidate retained changes.",
-                    owner_role="system",
+                self.state.issues[issue_id] = create_system_issue(
+                    issue_id, worker_id, root_issue_id=issue_id,
+                    summary="Worker worktree changed after its successful CHECK; "
+                            "revalidate retained changes.",
+                    evidence=[f"post-check-mutation:{worker_id}:round-{self.state.round}"],
                 )
             feedback = self.run_dir / f"round-{self.state.round}" / "feedback" / f"{worker_id}.md"
             atomic_write(
@@ -2817,10 +3658,22 @@ class Engine:
 
         operation = self.state.operations.get(key)
         if operation is not None:
-            updated, result = _finish_review_operation(
-                self.store, self.state, key, operation, self.manifest
-            )
-            self._adopt_review_state(updated)
+            for commit_attempt in range(2):
+                try:
+                    async with self._review_commit_lock:
+                        self.state = self.store.load(self.state.run_id)
+                        operation = self.state.operations.get(key)
+                        if operation is not None:
+                            updated, result = _finish_review_operation(
+                                self.store, self.state, key, operation, self.manifest
+                            )
+                            self._adopt_review_state(updated)
+                    break
+                except ContractError as exc:
+                    if "Stale state revision" not in str(exc) or commit_attempt:
+                        raise
+            if operation is None:
+                result = self.state.review_results[key]
             self._verify_review_result_evidence(result, candidate, evidence_digest)
             return ReviewRoleOutcome(role=role, result=result, reused=True)
         result = self.state.review_results.get(key)
@@ -2860,13 +3713,27 @@ class Engine:
                         role=role,
                         error=f"{role} reviewer requested escalation",
                     )
-                updated, result = accept_review_result(
-                    self.store, self.state, role=role, candidate_sha=candidate.sha,
-                    evidence_digest=evidence_digest,
-                    attempt_id=str(self.state.workers[logical].get("attempt_id")),
-                    verdict=verdict, verdict_path=output, manifest=self.manifest,
-                )
-                self._adopt_review_state(updated)
+                for commit_attempt in range(2):
+                    try:
+                        async with self._review_commit_lock:
+                            self.state = self.store.load(self.state.run_id)
+                            updated, result = accept_review_result(
+                                self.store, self.state, role=role,
+                                candidate_sha=candidate.sha,
+                                evidence_digest=evidence_digest,
+                                attempt_id=str(
+                                    self.state.workers[logical].get("attempt_id")),
+                                verdict=verdict, verdict_path=output,
+                                manifest=self.manifest,
+                            )
+                            self._adopt_review_state(updated)
+                        break
+                    except ContractError as exc:
+                        # A concurrent independent role may have advanced the
+                        # durable revision between dispatch and this synchronous
+                        # commit. Replay is idempotent from the recorded intent.
+                        if "Stale state revision" not in str(exc) or commit_attempt:
+                            raise
                 if result.escalation is None:
                     self.event("review_role_completed", role=role, result=result.result,
                                transaction=result.transaction,
@@ -2900,6 +3767,9 @@ class Engine:
         current = self.state
         current.issues = updated.issues
         current.review_results = updated.review_results
+        current.review_applications = updated.review_applications
+        current.activity = updated.activity
+        current.dependency_record = updated.dependency_record
         current.operations = updated.operations
         current.revision = updated.revision
         current.updated_at = updated.updated_at
@@ -2954,8 +3824,11 @@ class Engine:
                     key = f"integration-check-{worker.id}"
                     issue = self.state.issues.get(key)
                     if issue is None:
-                        issue = IssueState(id=key, worker=worker.id, root_issue_id=key,
-                                           summary=str(exc), owner_role="system")
+                        issue = create_system_issue(
+                            key, worker.id, root_issue_id=key, summary=str(exc),
+                            evidence=[(f"integration-check-failure:{worker.id}:"
+                                       f"round-{self.state.round}")],
+                        )
                         self.state.issues[key] = issue
                     else:
                         current = issue.assignments[-1]
@@ -2978,9 +3851,12 @@ class Engine:
                 self.state.round += 1
                 self.transition(stage="WORK")
                 return
-            for issue in self.state.issues.values():
+            for issue in list(self.state.issues.values()):
                 if issue.id.startswith("integration-check-"):
-                    issue.status = "resolved"
+                    self._finish_system_issue(
+                        issue.id,
+                        [(f"integration-check:{issue.worker}:"
+                          f"round-{self.state.round}:pass")])
             self.state.candidate = candidate.to_dict() if hasattr(candidate, "to_dict") else {
                 "sha": candidate.sha, "path": str(candidate.path), "source_shas": candidate.source_shas, "branch": candidate.branch}
             self.transition(stage="REVIEW")
@@ -3019,9 +3895,16 @@ class Engine:
                     failures.append(f"{role}: no accepted role result")
             escalations = [f"{result.role}: {result.escalation}"
                            for result in accepted.values() if result.escalation]
-            if failures or escalations:
-                details = failures + escalations
-                raise Escalation("Independent review role failure: " + "; ".join(details))
+            if failures:
+                raise Escalation(
+                    "Independent review role failure: " + "; ".join(failures))
+            if escalations:
+                # An issue-scoped stop is applied and processing continues. It
+                # blocks the affected issue and promotion, not the whole run.
+                self.event("review_issue_scoped_escalations",
+                           escalations=escalations,
+                           transactions=sorted(result.transaction
+                                               for result in accepted.values()))
             if set(accepted) != set(roles):
                 raise Escalation("Promotion requires one accepted result from each independent role")
             for result in accepted.values():
@@ -3051,11 +3934,13 @@ class Engine:
                 self.state.round += 1
                 self.transition(stage="WORK")
             else:
-                system_open = sorted(issue.id for issue in self.state.issues.values()
-                                     if issue.owner_role == "system" and issue.status == "open")
-                if system_open:
+                blockers = promotion_blockers(
+                    self.state, self.store.events(self.state.run_id))
+                if blockers:
+                    self.event("promotion_blocked", blockers=blockers)
                     raise Escalation(
-                        "Open workflow-owned issue blocks promotion: " + ", ".join(system_open)
+                        "Promotion blocked by unresolved issue, dependency or "
+                        "application evidence: " + "; ".join(blockers)
                     )
                 self.event("dual_role_review_passed", candidate_sha=candidate.sha,
                            transactions=sorted(result.transaction for result in accepted.values()))

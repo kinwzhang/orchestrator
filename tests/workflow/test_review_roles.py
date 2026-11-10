@@ -102,13 +102,13 @@ def test_invalid_role_feedback_leaves_the_other_accepted_result_intact(tmp_path)
     store = StateStore(tmp_path / "state")
     state = state_with({
         "code-1": IssueState(id="code-1", worker="w1", root_issue_id="code-1",
-                             owner_role="code", status="open"),
+                             owner_role="code", status="in_repair"),
     })
     state = store.save(state)
     code = Verdict(reviewer="code", result="pass", candidate_sha=CANDIDATE,
                    resolved=["code-1"])
     state, code_result = accept(store, state, tmp_path, "code", code)
-    assert state.issues["code-1"].status == "resolved"
+    assert state.issues["code-1"].status == "finished"
     assert code_result.result == "pass"
 
     docs = Verdict(reviewer="docs", result="pass", candidate_sha=CANDIDATE,
@@ -118,7 +118,7 @@ def test_invalid_role_feedback_leaves_the_other_accepted_result_intact(tmp_path)
     after = store.load("run")
     assert after.review_results[code_result.transaction] == code_result
     assert not any(result.role == "docs" for result in after.review_results.values())
-    assert after.issues["code-1"].status == "resolved"
+    assert after.issues["code-1"].status == "finished"
 
 
 def test_duplicate_role_result_is_reused_without_double_charging(tmp_path):
@@ -416,7 +416,7 @@ def _charged_issue(identity="code-1", repairs=1, failed_repairs=1, review_rounds
                    assessed_repairs=1):
     return IssueState(
         id=identity, worker="w1", root_issue_id=identity, owner_role="code",
-        status="open",
+        status="in_repair",
         assignments=[AssignmentState(
             repairs=repairs, failed_repairs=failed_repairs,
             review_rounds=review_rounds, assessed_repairs=assessed_repairs,
@@ -484,6 +484,7 @@ def _successful_repair_then_pass(tmp_path, max_failed=3, max_rounds=3):
                 "max_review_rounds": max_rounds})
     issue = IssueState(
         id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
+        status="in_repair",
         assignments=[AssignmentState(repairs=1, assessed_repairs=0,
                                      failed_repair_ordinals=[])],
     )
@@ -515,7 +516,7 @@ def test_successful_repair_reopening_supersedes_pass_once_and_keeps_round_budget
         manifest_override=limits,
     )
     assignment = state.issues["code-1"].assignments[0]
-    assert state.issues["code-1"].status == "open"
+    assert state.issues["code-1"].status == "pending"
     assert (assignment.repairs, assignment.failed_repairs, assignment.review_rounds,
             assignment.assessed_repairs, assignment.failed_repair_ordinals) == (
                 2, 2, before.review_rounds, 2, [1, 2])
@@ -565,6 +566,7 @@ def test_reopening_an_already_failed_repair_does_not_charge_again(tmp_path):
         update={"max_failed_repairs_per_assignment": 3})
     issue = IssueState(
         id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
+        status="in_repair",
         assignments=[AssignmentState(repairs=1, assessed_repairs=0,
                                      failed_repair_ordinals=[])],
     )
@@ -592,6 +594,7 @@ def test_reopening_charge_is_attributed_to_the_replacement_assignment(tmp_path):
         update={"max_failed_repairs_per_assignment": 3})
     issue = IssueState(
         id="code-1", worker="w1", root_issue_id="code-1", owner_role="code",
+        status="in_repair",
         assignments=[AssignmentState(repairs=1, assessed_repairs=0,
                                      failed_repair_ordinals=[])],
     )
