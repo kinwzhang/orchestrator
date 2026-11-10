@@ -173,7 +173,11 @@ A version-one `open` record is never mapped to `pending` or `in_repair` from
 counters. Segregation of evidence into verified, recomputed-unbound,
 unverifiable-for-missing-inputs and conflicting classes is unchanged in intent and is
 now enforced by the single evidence authority described in
-`20261109_review_lifecycle_application.md`.
+`20261109_review_lifecycle_application.md`. The lifecycle, accounting, application,
+evidence and schema contract tests are part of the full suite observed at assembled
+integration `8ad1901bbc49d343f3633220ac78723c0264907e` (W03 source
+`4e6df8ae6872d332a5809cb5d589450097a5934c`): 370 passed and 5 skipped, with lint and
+whitespace clean. The skips and coverage limits are stated in that lifecycle document.
 
 Per assignment, allow up to three repairs and three review rounds, stopping
 after two unsuccessful repairs. One fresh replacement receives its own

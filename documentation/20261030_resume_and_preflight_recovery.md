@@ -222,3 +222,17 @@ unchanged. Re-entry returns the same event without adding another one.
 A resumed launch that exits non-zero remains an ordinary infrastructure failure
 and follows the recorded retry budget. Do not reset counters or hand-edit
 `state.json`, `events.jsonl` or the Markdown evidence files to force progress.
+
+## Verification status
+
+The assembled integration `8ad1901bbc49d343f3633220ac78723c0264907e` (W03 source
+`4e6df8ae6872d332a5809cb5d589450097a5934c`, W03 documentation
+`eb41010511d503bcf55cb91b97336db9b770f959`) reports the full local suite as 370
+passed and 5 skipped, with lint and whitespace clean. The four legacy live-evidence
+recovery cases skip with an explicit absent-prerequisite reason because the retained
+live run advanced past the exact round batch; they need a host retaining
+`round-N/verdict-code.md` and `round-N/verdict-docs.md`. No assertion was weakened,
+and the ownership-conflict and recovery-replay guarantees are exercised synthetically.
+CB-D3 has no isolated synthetic test because it belongs to the process-dispatch
+pipeline. No live recovery was executed, and no native Windows or PowerShell behaviour
+is verified.

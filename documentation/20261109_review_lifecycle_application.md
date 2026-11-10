@@ -8,10 +8,16 @@
   `e9ea61ffd7529c5f2ad630567366b2cb56b78aae`
 - Documentation baseline: assembled W01+W02 source `817f518d00129c05900bd50b397af1b7f69a8565`
   (integration `0c9d72cc0fc4b3420393d111f087d43a8f99a5f3`)
-- Whole-chain verification: W03 results were not available when this document was
-  written. Contract and reducer behavior below is bound to the two committed
-  interfaces. No final end-to-end verification, Fedora acceptance or live-run
-  result is claimed.
+- Whole-chain verification: observed on assembled integration
+  `8ad1901bbc49d343f3633220ac78723c0264907e` (W03 source
+  `4e6df8ae6872d332a5809cb5d589450097a5934c`, W03 documentation
+  `eb41010511d503bcf55cb91b97336db9b770f959`): full local suite 370 passed,
+  5 skipped, lint and whitespace clean. Coverage limits and unverified platform
+  gates are recorded in section 12. No Fedora acceptance or live operation is
+  claimed.
+
+Contract and reducer behavior below remains bound to the two committed interfaces;
+the observed suite is verification evidence, not a substitute for them.
 
 This note is the normative account of one issue's writable lifecycle, the separate
 records that surround it, the guarded transitions an operator may rely on, and the
@@ -421,30 +427,41 @@ implementation architecture.
 ## 12. Verification status
 
 The document above is bound to the committed contract and reducer interfaces at the
-source identifiers at the top of this note. Verification evidence is reported
-separately and must not be inferred from this document.
+source identifiers at the top of this note. The observed evidence below is the
+Linux-local suite on the assembled integration; it is not Fedora acceptance.
 
-- The contract milestone records contract tests for every listed transition,
-  unlisted and ungated refusal without mutation, same-status no-change, legacy
-  ambiguity, human dispositions, system check issues, activity separation,
-  dependency validation and explicit migration, as well as accounting, application,
-  evidence-class and schema-version cases.
-- The reducer milestone records its focused workflow and contract suites passing and
-  reports a full-suite run of 9 failed, 315 passed and 1 skipped, where the failures
-  are end-to-end cases owned outside its writable paths: known baseline recovery
-  cases, retired status expectations, and one legacy-status input case. Those results
-  are the reducer's recorded handover evidence, not an acceptance claim for the
-  assembled delivery.
-- W03 whole-chain verification results were not available when this note was
-  written. The verification scenarios in the approved plan — A–F escalation and
-  preservation, every crash boundary with audit reconciliation, duplicate and
-  approval-only review, reopening and already-charged outcomes, ordinal-zero work,
+- Integration `8ad1901bbc49d343f3633220ac78723c0264907e` (W03 source
+  `4e6df8ae6872d332a5809cb5d589450097a5934c`, W03 documentation
+  `eb41010511d503bcf55cb91b97336db9b770f959`) records `uv run pytest -q` as
+  370 passed and 5 skipped, with `uv run ruff check .` and `git diff --check`
+  clean.
+- W03's whole-chain module implements the approved matrix scenarios S01–S10 within
+  the baseline scope stated below. The confirmed observations include A–F escalation
+  with untouched entries preserved, per-entry crash injection at every position for
+  one-, two- and six-entry batches, golden-projection replay equivalence, duplicate
+  and approval-only review, reopening and already-charged outcomes, ordinal-zero work,
   historical attribution, every legal and illegal transition, dependency waiting and
-  shared-path serialization, blocking-issue promotion refusal, uncertain dispatch
-  without duplicate launch, missing/duplicate/reordered/stale evidence, and
-  carry-forward preservation — remain pending final evidence.
-- No Fedora end-to-end acceptance, live continuation, additional automatic product
-  repair or reassignment is claimed.
+  shared-path serialization, blocking-issue promotion refusal, uncertain dispatch, and
+  the distinct evidence classes.
+- The five skips are one pre-existing skip
+  (`test_retained_live_round_two_revalidation_...`) and four explicit
+  absent-prerequisite skips. The four legacy live-evidence recovery cases skip because
+  the retained live run advanced to round 5 with attempt-suffixed verdict names, so the
+  exact `round-N/verdict-code.md` and `round-N/verdict-docs.md` batch consumed by the
+  legacy recovery helper is no longer present. Re-running them requires a host that
+  retains that exact batch. No assertion was weakened; the ownership-conflict and
+  recovery-replay guarantees are exercised synthetically by S07 and S09.
+- W03 records its handover as partial for the remaining limits. CB-D3 (completion
+  evidence reconciled before its audit) has no isolated synthetic test because it
+  belongs to the process-dispatch pipeline, which these tests deliberately do not
+  start; CB-D1, CB-D2 and CB-D4 are covered by S07. CB-F0 and CB-F1 are not claimed:
+  this baseline has no carry-forward run construction, and S08 binds preservation to
+  the committed explicit-migration authority instead. CH01 and CH02 (approval hash and
+  candidate association) are covered by the existing Engine-level approval test in the
+  routing module, not by a new synthetic test.
+- No Fedora end-to-end acceptance, live continuation, live recovery, additional
+  automatic product repair or reassignment is claimed. Native Windows and PowerShell
+  remain deferred and unverified.
 
 ## 13. Related documentation
 
