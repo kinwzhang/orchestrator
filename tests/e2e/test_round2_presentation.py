@@ -158,3 +158,70 @@ def test_status_stays_readable_and_read_only_at_terminal_widths(
     assert "Run summary: demo" in rendered
     assert "\x1b" not in rendered
     assert (store.run_dir("demo-1") / "state.json").read_bytes() == snapshot
+
+
+def _seed_invocation_evidence(store):
+    current = store.load("demo-1")
+    current.started_at = "2026-10-31T09:00:00+00:00"
+    current.updated_at = "2026-10-31T10:40:41+00:00"
+    current.workers = {
+        "w1": {
+            "role": "worker", "status": "failed", "attempt": 2,
+            "attempt_id": "w1-1-2", "checks": "fail", "checked": True,
+            "started_at": "2026-10-31T10:30:00+00:00",
+            "activity": "2026-10-31T10:40:41+00:00",
+            "invocation_attempts": {
+                "w1-1-1": {"logical_id": "w1", "attempt_id": "w1-1-1",
+                           "adapter": "opencode", "provider": "alpha",
+                           "model": "alpha/one", "evidence_status": "recorded"},
+                "w1-1-2": {"logical_id": "w1", "attempt_id": "w1-1-2",
+                           "adapter": "opencode", "provider": "beta",
+                           "model": "beta/two", "evidence_status": "recorded"},
+            },
+        },
+    }
+    saved = store.save(current)
+    store.event(current.run_id, "invocation_identity", agent="w1", attempt="w1-1-2",
+                adapter="opencode", provider="beta", model="beta/two",
+                evidence_status="recorded")
+    return saved
+
+
+def test_next_summary_shows_attempt_invocation_and_local_timestamp(
+        tmp_path, monkeypatch, capsys):
+    from datetime import timedelta, timezone
+
+    from orch import reporting
+
+    store, _, _ = _run(tmp_path, monkeypatch, "PLAN_READY")
+    _seed_invocation_evidence(store)
+    monkeypatch.setattr(reporting, "_localize",
+                        lambda moment: moment.astimezone(timezone(timedelta(hours=8))))
+
+    assert _invoke(store, "next") == 0
+    captured = capsys.readouterr()
+    assert captured.out.count("Run summary: demo") == 1
+    # The current attempt comes from invocation evidence, never preferences.
+    assert "beta/two" in captured.out
+    assert "Attempt invocations" in captured.out
+    assert "w1-1-1" in captured.out and "alpha/one" in captured.out
+    assert "Run started (local)" in captured.out
+    assert "2026-10-31 18:40:41+08:00" in captured.out
+    assert "2026-10-31T10:40:41+00:00" not in captured.out
+
+
+def test_display_surfaces_do_not_mutate_durable_invocation_evidence(
+        tmp_path, monkeypatch, capsys):
+    store, _, _ = _run(tmp_path, monkeypatch, "PLAN_READY")
+    _seed_invocation_evidence(store)
+    state_path = store.run_dir("demo-1") / "state.json"
+    journal_path = store.run_dir("demo-1") / "events.jsonl"
+    snapshot = state_path.read_bytes()
+    journal = journal_path.read_bytes() if journal_path.exists() else None
+
+    assert _invoke(store, "status") == 0
+    assert _invoke(store, "next") == 0
+    capsys.readouterr()
+    assert state_path.read_bytes() == snapshot
+    if journal is not None:
+        assert journal_path.read_bytes() == journal
