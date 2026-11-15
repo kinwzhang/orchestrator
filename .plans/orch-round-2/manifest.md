@@ -11,6 +11,9 @@ workers:
       - src/orch/cli.py
       - src/orch/watch.py
       - src/orch/reporting.py
+      - src/orch/agents.py
+      - src/orch/workflow.py
+      - tests/agents/test_round2_invocation_identity.py
       - tests/workflow/test_presentation.py
       - tests/e2e/test_round2_presentation.py
       - documentation/20261115_operator_visibility.md
