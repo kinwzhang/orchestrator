@@ -9,7 +9,27 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
+from orch.reporting import attempt_identity, format_local_timestamp
 from orch.store import StateStore
+
+
+def _localize(moment: datetime) -> datetime:
+    """Conversion seam: convert an aware instant to the system-local zone.
+
+    ``astimezone`` with no argument asks the platform for the local offset
+    applicable to that specific instant, so it is portable and honours daylight
+    transitions. Tests may replace this function to control the boundary.
+    """
+    return moment.astimezone()
+
+
+def format_local_activity(value) -> str:
+    """Display a stored activity instant in system-local time.
+
+    Retained as the watch-specific wrapper for compatibility; the shared
+    formatter in reporting owns conversion, fallbacks and the display format.
+    """
+    return format_local_timestamp(value, localize=_localize)
 
 
 def status_table(store: StateStore, run_id: str) -> Table:
@@ -21,7 +41,8 @@ def status_table(store: StateStore, run_id: str) -> Table:
         table.add_row("Run state has not been published yet")
         return table
     table = Table(title=f"{state.slug}: {state.phase} / {state.stage} / cycle {state.round}")
-    for title in ("Agent", "Status", "Attempt", "Elapsed", "Last activity", "Checks", "Output"):
+    for title in ("Agent", "Status", "Attempt", "Provider", "Model", "Elapsed",
+                  "Last activity (local)", "Checks", "Output"):
         table.add_column(title)
     for name, data in state.workers.items():
         tail = ""
@@ -41,8 +62,10 @@ def status_table(store: StateStore, run_id: str) -> Table:
                 elapsed = round((datetime.now(UTC) - datetime.fromisoformat(data["started_at"])).total_seconds(), 1)
             except ValueError:
                 elapsed = ""
+        provider, model = attempt_identity(data, data.get("attempt_id"))
         values = [name, str(data.get("status", "pending")), str(data.get("attempt", 0)),
-                  str(elapsed), str(data.get("activity", "")), str(data.get("checks", "")), tail]
+                  provider, model, str(elapsed), format_local_activity(data.get("activity")),
+                  str(data.get("checks", "")), tail]
         # Log text is untrusted terminal input: strip ANSI/OSC/control sequences and
         # use literal Text so agent output cannot inject Rich markup.
         def safe(value):

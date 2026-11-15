@@ -105,6 +105,55 @@ def _preflight_failure(error: BaseException):
     return None
 
 
+_INVOCATION_FIELDS = ("logical_id", "attempt_id", "adapter", "provider", "model")
+
+
+def _identity_text(value) -> str:
+    if not isinstance(value, str):
+        return "unknown"
+    text = "".join(c for c in value if ord(c) >= 32 and ord(c) != 127).strip()
+    return text or "unknown"
+
+
+def record_invocation_identity(info: dict, logical_id: str, attempt_id: str,
+                               event: dict) -> dict | None:
+    """Persist one attempt's adapter invocation evidence, never preferences.
+
+    The event must name the exact active logical agent and attempt. A repeated
+    identical event is idempotent; conflicting evidence is retained with an
+    explicit conflicting status so presentation shows unknown instead of
+    silently overwriting history.
+    """
+    if not isinstance(info, dict) or not isinstance(attempt_id, str):
+        return None
+    if event.get("logical_id") != logical_id or event.get("attempt_id") != attempt_id:
+        return None
+    mapping = info.get("invocation_attempts")
+    if mapping is None:
+        mapping = {}
+        info["invocation_attempts"] = mapping
+    if not isinstance(mapping, dict):
+        return None
+    entry = {
+        "logical_id": logical_id,
+        "attempt_id": attempt_id,
+        "adapter": _identity_text(event.get("adapter")),
+        "provider": _identity_text(event.get("provider")),
+        "model": _identity_text(event.get("model")),
+        "evidence_status": "recorded",
+    }
+    existing = mapping.get(attempt_id)
+    if existing is None:
+        mapping[attempt_id] = entry
+    elif not isinstance(existing, dict):
+        mapping[attempt_id] = {**entry, "evidence_status": "conflicting"}
+    elif all(existing.get(field) == entry[field] for field in _INVOCATION_FIELDS):
+        return existing
+    else:
+        mapping[attempt_id] = {**entry, "evidence_status": "conflicting"}
+    return mapping[attempt_id]
+
+
 _ATTEMPT_TERMINAL_EVENTS = frozenset({
     "agent_completed",
     "agent_failed",
@@ -3479,7 +3528,17 @@ class Engine:
             info["activity"] = timestamp()
             # Process identities are journaled before waiting for agent completion.
             kind = event.get("kind")
-            if kind == "process_started":
+            if kind == "invocation_identity":
+                if info.get("attempt_id") == attempt_id:
+                    recorded = record_invocation_identity(
+                        info, logical_id, attempt_id, event)
+                    if recorded is not None:
+                        self.event(
+                            "invocation_identity", agent=logical_id, attempt=attempt_id,
+                            adapter=recorded["adapter"], provider=recorded["provider"],
+                            model=recorded["model"],
+                            evidence_status=recorded["evidence_status"])
+            elif kind == "process_started":
                 info["process"] = {k: event[k] for k in ("pid", "create_time") if k in event}
                 info["process_attempt_id"] = attempt_id
             elif kind == "process_completed" and info.get("process_attempt_id") == attempt_id:

@@ -1,9 +1,435 @@
 """Markdown reports generated from recorded facts, never code-quality judgments."""
+import re
 from collections import defaultdict
+from datetime import datetime
+from io import StringIO
 from pathlib import Path
+
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 from orch.contracts import RunState
 from orch.store import atomic_write
+
+# Untrusted values may reach a terminal through state, handovers or summaries.
+# Strip ANSI/OSC/control sequences and always render through literal Text so
+# Rich markup in stored content is never interpreted.
+_OSC_SEQUENCE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+_ANSI_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_SHORT_SUMMARY_LIMIT = 100
+_NO_TIMESTAMP = "—"
+_UNVERIFIED_TIMESTAMP = "unavailable (unverified timestamp)"
+_UNKNOWN = "unknown"
+
+
+def _safe_text(value) -> str:
+    text = "" if value is None else str(value)
+    text = _OSC_SEQUENCE.sub("", text)
+    text = _ANSI_SEQUENCE.sub("", text)
+    return "".join(c for c in text if c in "\n\t" or ord(c) >= 32 and ord(c) != 127)
+
+
+def _localize(moment: datetime) -> datetime:
+    """Conversion seam: use the system zone applicable to this instant.
+
+    ``astimezone`` with no argument asks the platform for the local offset that
+    applies to the specific instant, so it is portable and honours daylight
+    transitions. Tests may replace this function to control the boundary.
+    """
+    return moment.astimezone()
+
+
+def format_local_timestamp(value, *, localize=None) -> str:
+    """Display one stored structured instant in system-local time.
+
+    Persisted values stay untouched. Absent values use an em dash; malformed,
+    unsafe or timezone-naive legacy values are reported as unavailable rather
+    than assumed to be UTC or echoed back to the terminal. The returned text
+    includes seconds and a colon-separated numeric UTC offset.
+    """
+    text = "" if value is None else _safe_text(value).strip()
+    if not text:
+        return _NO_TIMESTAMP
+    try:
+        moment = datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return _UNVERIFIED_TIMESTAMP
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        return _UNVERIFIED_TIMESTAMP
+    convert = localize or _localize
+    try:
+        local = convert(moment)
+    except (OverflowError, OSError, ValueError):
+        return _UNVERIFIED_TIMESTAMP
+    if local.tzinfo is None or local.utcoffset() is None:
+        return _UNVERIFIED_TIMESTAMP
+    return local.isoformat(sep=" ", timespec="seconds")
+
+
+def _identity_value(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = _safe_text(value).strip()
+    return text or None
+
+
+def attempt_identity(info: dict, attempt_id) -> tuple[str, str]:
+    """Return the recorded provider and model for exactly one attempt.
+
+    This reads only invocation evidence captured at the adapter boundary. It
+    never consults current preferences, role defaults or display names. Missing,
+    malformed, mismatched or conflicting evidence is reported as unknown; a
+    known model is still shown when only its provider is unqualified.
+    """
+    if not isinstance(info, dict) or not isinstance(attempt_id, str):
+        return (_UNKNOWN, _UNKNOWN)
+    mapping = info.get("invocation_attempts")
+    if not isinstance(mapping, dict):
+        return (_UNKNOWN, _UNKNOWN)
+    entry = mapping.get(attempt_id)
+    if not isinstance(entry, dict) or entry.get("evidence_status") != "recorded":
+        return (_UNKNOWN, _UNKNOWN)
+    recorded_id = entry.get("attempt_id")
+    if recorded_id is not None and recorded_id != attempt_id:
+        return (_UNKNOWN, _UNKNOWN)
+    provider = _identity_value(entry.get("provider")) or _UNKNOWN
+    model = _identity_value(entry.get("model")) or _UNKNOWN
+    if provider.casefold() == _UNKNOWN:
+        provider = _UNKNOWN
+    return (provider, model)
+
+
+def _short(value, limit: int = _SHORT_SUMMARY_LIMIT) -> str:
+    text = " ".join(_safe_text(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _table(title: str, columns, rows) -> Table:
+    table = Table(title=Text(_safe_text(title)), show_lines=False)
+    for column in columns:
+        table.add_column(_safe_text(column))
+    for row in rows:
+        table.add_row(*(Text(_safe_text(value)) for value in row))
+    return table
+
+
+def _field_table(title: str, pairs) -> Table:
+    return _table(title, ("Field", "Value"), pairs)
+
+
+def _render(parts, width: int) -> str:
+    buffer = StringIO()
+    console = Console(file=buffer, width=max(20, int(width)),
+                      force_terminal=False, color_system=None, highlight=False)
+    for part in parts:
+        console.print(part)
+    return buffer.getvalue().rstrip("\n")
+
+
+_HUMAN_ACTIONS = {
+    "APPROVE": "Review the plan, then run orch approve",
+    "HUMAN_TEST": "Test the feature branch, then run orch done",
+    "RESUME": "Review the blocker or pause, then run orch resume",
+    "NONE": "No further action; the run is complete or aborted",
+}
+
+
+def _checks_text(info: dict) -> str:
+    """Only claim checks for the current attempt when completion was recorded."""
+    checks = info.get("checks")
+    if info.get("checked") is True:
+        return _safe_text(checks) if checks not in (None, "") else "recorded"
+    if checks not in (None, ""):
+        return "not confirmed for this attempt"
+    return "pending"
+
+
+def _invocation_text(provider: str, model: str) -> str:
+    if provider == _UNKNOWN and model == _UNKNOWN:
+        return _UNKNOWN
+    return f"{provider} / {model}"
+
+
+def _worker_rows(state: RunState):
+    rows = []
+    for name in sorted(state.workers):
+        info = state.workers[name]
+        provider, model = attempt_identity(info, info.get("attempt_id"))
+        rows.append((
+            name,
+            info.get("role", "unrecorded"),
+            info.get("status", "pending"),
+            info.get("attempt", 0),
+            _invocation_text(provider, model),
+            _checks_text(info),
+            format_local_timestamp(info.get("activity")),
+        ))
+    return rows
+
+
+def _attempt_sort_key(attempt_id: str):
+    return [int(part) if part.isdigit() else part
+            for part in re.split(r"(\d+)", str(attempt_id))]
+
+
+def _attempt_rows(state: RunState):
+    """Enumerate retained invocation evidence plus each current attempt."""
+    rows = []
+    for name in sorted(state.workers):
+        info = state.workers[name]
+        mapping = info.get("invocation_attempts")
+        if not isinstance(mapping, dict):
+            mapping = {}
+        attempt_ids = set(mapping)
+        current = info.get("attempt_id")
+        if isinstance(current, str) and current:
+            attempt_ids.add(current)
+        for attempt_id in sorted(attempt_ids, key=_attempt_sort_key):
+            entry = mapping.get(attempt_id)
+            provider, model = attempt_identity(info, attempt_id)
+            adapter = _identity_value(entry.get("adapter")) if isinstance(entry, dict) else None
+            if isinstance(entry, dict) and entry.get("evidence_status") == "recorded":
+                evidence = "recorded"
+            elif isinstance(entry, dict):
+                evidence = "conflicting (shown as unknown)"
+            else:
+                evidence = "unknown"
+            rows.append((name, attempt_id, adapter or _UNKNOWN, provider, model, evidence))
+    return rows
+
+
+def _dependency_lookup(state: RunState) -> dict:
+    if state.dependency_record is None:
+        return {}
+    return {item.dependent_issue_id: item for item in state.dependency_record.dependencies}
+
+
+def _deferred_stages(issue) -> list[str]:
+    stages = set()
+    for transition in issue.lifecycle_history:
+        for evidence in transition.evidence:
+            if evidence.startswith("deferred-stage:"):
+                stages.add(evidence.split(":", 1)[1])
+    return sorted(stages)
+
+
+def _issue_rows(state: RunState, dependencies: dict):
+    rows, details, long_summaries = [], [], []
+    for identity in sorted(state.issues):
+        issue = state.issues[identity]
+        legacy = f" (legacy {issue.legacy_status})" if issue.legacy_status else ""
+        deferred = _deferred_stages(issue)
+        deferral = f" (deferred for {', '.join(deferred)})" if deferred else ""
+        summary = " ".join(_safe_text(issue.summary).split())
+        if len(summary) > _SHORT_SUMMARY_LIMIT:
+            long_summaries.append((identity, summary))
+        rows.append((
+            identity,
+            f"{issue.lifecycle}{legacy}{deferral}",
+            issue.attempt,
+            issue.reassignments,
+            issue.worker,
+            _short(summary) or "no summary recorded",
+        ))
+        dependency = dependencies.get(identity)
+        waits = []
+        if dependency is not None:
+            waits = sorted(set(dependency.prerequisite_issue_ids)
+                           | set(dependency.verification_prerequisites))
+        assignments = []
+        for number, assignment in enumerate(issue.assignments, start=1):
+            assignments.append(
+                f"assignment {number}: {assignment.repairs} repairs, "
+                f"{assignment.failed_repairs} failed, {assignment.review_rounds} review rounds")
+        parts = [
+            f"root {issue.root_issue_id}",
+            f"parent {issue.parent_issue_id or 'none'}",
+            f"depth {issue.depth}",
+            f"owner role {issue.owner_role or 'unrecorded'}",
+            f"waits on {', '.join(waits) if waits else 'nothing declared'}",
+            "; ".join(assignments) if assignments else "no assignments recorded",
+        ]
+        details.append(f"- {identity}: " + "; ".join(parts))
+    return rows, details, long_summaries
+
+
+def _application_rows(state: RunState):
+    rows, gaps = [], []
+    for identity in sorted(state.review_applications):
+        application = state.review_applications[identity]
+        state_label = "complete" if application.complete else "pending"
+        rows.append((
+            identity,
+            application.reviewer_role,
+            f"{len(application.applied_entry_ids)}/{len(application.entries)}",
+            application.next_entry_index,
+            state_label,
+        ))
+        for entry in application.entries:
+            if entry.state != "applied":
+                gaps.append(
+                    f"- {identity}: waiting to apply entry {entry.entry_id} "
+                    f"at position {entry.order_index}")
+    return rows, gaps
+
+
+def _dependency_rows(state: RunState):
+    record = state.dependency_record
+    if record is None:
+        return []
+    rows = []
+    for item in sorted(record.dependencies, key=lambda entry: entry.dependent_issue_id):
+        waits = sorted(set(item.prerequisite_issue_ids) | set(item.verification_prerequisites))
+        rows.append((
+            item.dependent_issue_id,
+            ", ".join(waits) if waits else "nothing declared",
+            ", ".join(item.shared_resource_paths) if item.shared_resource_paths else "none",
+            ", ".join(item.verification_prerequisites) if item.verification_prerequisites
+            else "none",
+        ))
+    return rows
+
+
+def _render_agents(state: RunState, width: int):
+    rows = _worker_rows(state)
+    if not rows:
+        return [Text("Agents: no agents recorded.")]
+    columns = ("Agent", "Role", "Status", "Attempt", "Invocation", "Checks",
+               "Activity (local)")
+    if width < 72:
+        parts = [Text("Agents", style="bold")]
+        for row in rows:
+            parts.append(_field_table(f"Agent: {row[0]}", zip(columns[1:], row[1:])))
+        return parts
+    return [Text("Agents", style="bold"), _table("", columns, rows)]
+
+
+def _render_attempts(state: RunState, width: int):
+    rows = _attempt_rows(state)
+    if not rows:
+        return []
+    columns = ("Agent", "Attempt", "Adapter", "Provider", "Model", "Evidence")
+    parts = [Text("Attempt invocations (recorded at the adapter boundary; "
+                  "current preferences are never used)", style="bold")]
+    if width < 100:
+        for row in rows:
+            parts.append(_field_table(f"Attempt: {row[1]} ({row[0]})",
+                                      zip(columns[2:], row[2:])))
+    else:
+        parts.append(_table("", columns, rows))
+    return parts
+
+
+def _render_issues(state: RunState, width: int):
+    dependencies = _dependency_lookup(state)
+    rows, details, long_summaries = _issue_rows(state, dependencies)
+    if not rows:
+        return [Text("Issues: no issues recorded.")]
+    columns = ("ID", "Lifecycle", "Attempt", "Reassignments", "Owner", "Summary")
+    if width < 100:
+        parts = [Text("Issues", style="bold")]
+        for row in rows:
+            parts.append(_field_table(f"Issue: {row[0]}", zip(columns[1:], row[1:])))
+    else:
+        parts = [Text("Issues", style="bold"), _table("", columns, rows)]
+    if details:
+        parts.append(Text("Issue details", style="bold"))
+        parts.extend(Text(line) for line in details)
+    if long_summaries:
+        parts.append(Text("Full issue summaries", style="bold"))
+        parts.extend(Text(f"- {identity}: {summary}")
+                     for identity, summary in long_summaries)
+    return parts
+
+
+def _render_applications(state: RunState, width: int):
+    rows, gaps = _application_rows(state)
+    if not rows:
+        return []
+    columns = ("Application", "Role", "Applied", "Next entry", "State")
+    parts = [Text("Review applications (application progress is separate from issue lifecycle)",
+                  style="bold")]
+    if width < 100:
+        for row in rows:
+            parts.append(_field_table(f"Application: {row[0]}", zip(columns[1:], row[1:])))
+    else:
+        parts.append(_table("", columns, rows))
+    if gaps:
+        parts.append(Text("Pending application entries", style="bold"))
+        parts.extend(Text(line) for line in gaps)
+    return parts
+
+
+def _render_dependencies(state: RunState, width: int):
+    rows = _dependency_rows(state)
+    if not rows:
+        return []
+    columns = ("Dependent issue", "Waits on", "Shared paths", "Verification waits")
+    parts = [Text("Dependency record", style="bold")]
+    if width < 100:
+        for row in rows:
+            parts.append(_field_table(f"Dependent issue: {row[0]}", zip(columns[1:], row[1:])))
+    else:
+        parts.append(_table("", columns, rows))
+    return parts
+
+
+def render_status(state: RunState, *, plan_path, run_path, width: int = 100,
+                  detail: bool = True) -> str:
+    """Render one already-loaded run as terminal-safe plain text.
+
+    Reads nothing and mutates nothing. ``detail`` selects the full operator view
+    with agent, issue and application sections; the compact view is the run
+    summary used for the no-slug multi-run overview.
+    """
+    from orch.workflow import next_action
+
+    action = next_action(state)
+    parts = []
+    if state.error:
+        parts.append(Text(_safe_text(f"Blocker: {state.error}")))
+    summary = [
+        ("Slug", state.slug),
+        ("Phase", state.phase),
+        ("Stage", state.stage),
+        ("Cycle", state.round),
+        ("Next action", action),
+    ]
+    human_action = _HUMAN_ACTIONS.get(action)
+    if human_action:
+        summary.append(("Human action", human_action))
+    summary.extend((
+        ("Run started (local)", format_local_timestamp(state.started_at)),
+        ("Last updated (local)", format_local_timestamp(state.updated_at)),
+    ))
+    summary.extend((("Plan", plan_path), ("Run", run_path)))
+    parts.append(_field_table(f"Run summary: {state.slug}", summary))
+    if detail:
+        parts.append(Text(""))
+        parts.extend(_render_agents(state, width))
+        attempts = _render_attempts(state, width)
+        if attempts:
+            parts.append(Text(""))
+            parts.extend(attempts)
+        parts.append(Text(""))
+        parts.extend(_render_issues(state, width))
+        applications = _render_applications(state, width)
+        if applications:
+            parts.append(Text(""))
+            parts.extend(applications)
+        dependencies = _render_dependencies(state, width)
+        if dependencies:
+            parts.append(Text(""))
+            parts.extend(dependencies)
+    else:
+        attempts = _render_attempts(state, width)
+        if attempts:
+            parts.append(Text(""))
+            parts.extend(attempts)
+    return _render(parts, width)
 
 
 def _metrics(value: dict, prefix: str = ""):
