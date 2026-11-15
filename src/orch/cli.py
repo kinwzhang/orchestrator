@@ -27,6 +27,7 @@ from orch.contracts import (
     read_markdown,
     write_markdown,
 )
+from orch.reporting import render_status
 from orch.store import StateStore, atomic_write, timestamp
 from orch.workflow import (
     Engine,
@@ -617,6 +618,30 @@ PREFERENCE_COMMANDS = frozenset(
     {"next", "plan", "approve", "run", "resume", "reopen", "recover-review"})
 
 
+def console_width(default: int = 100) -> int:
+    """Select the terminal width once in the CLI, not inside the renderer."""
+    try:
+        columns = shutil.get_terminal_size((default, 24)).columns
+    except (OSError, ValueError):
+        return default
+    return max(20, columns)
+
+
+def emit_next_status(store, entry) -> None:
+    """Print exactly one current persisted status after orch next handled work."""
+    try:
+        state = store.load(entry["run_id"])
+        text = render_status(
+            state, plan_path=Path(entry["plan"]), run_path=store.run_dir(entry["run_id"]),
+            width=console_width(), detail=True)
+    except Exception:  # noqa: BLE001 - any reload/render failure must not hide the original outcome
+        print("Status unavailable: the persisted run status could not be reloaded "
+              "or rendered; the command outcome and exit code are unchanged.",
+              file=sys.stderr)
+        return
+    print(text)
+
+
 def run_command(args):
     global_models = bool(getattr(args, "global_models", False))
     if args.command == "models":
@@ -641,30 +666,21 @@ def run_command(args):
         return 0
     if args.command == "status":
         entries = [locate(store, args.slug)] if args.slug else registry(store)
+        width = console_width()
+        blocks = []
         for entry in entries:
             if entry.get("status") == "creating":
-                print(f"{entry['slug']}: creation interrupted; repeat orch new with the original options")
+                blocks.append(
+                    f"{entry['slug']}: creation interrupted; repeat orch new with the "
+                    "original options")
                 continue
             state = store.load(entry["run_id"])
-            print(f"{state.slug}: {state.phase} / {state.stage} / cycle {state.round}; next: {next_action(state)}")
-            print(f"  Plan: {entry['plan']}\n  Run: {store.run_dir(state.run_id)}")
-            if args.slug:
-                for agent, info in state.workers.items():
-                    print(f"  {agent}: {info.get('status', 'pending')}; attempt {info.get('attempt', 0)}; checks {info.get('checks', 'pending')}")
-                for issue in state.issues.values():
-                    legacy = f" (legacy {issue.legacy_status})" if issue.legacy_status else ""
-                    print(f"  Issue {issue.id}: {issue.lifecycle}{legacy}; "
-                          f"root {issue.root_issue_id}; {issue.summary}")
-                for application in state.review_applications.values():
-                    print(f"  Application {application.application_id}: "
-                          f"{len(application.applied_entry_ids)}/{len(application.entries)} "
-                          f"entries applied; next {application.next_entry_index}; "
-                          f"{'complete' if application.complete else 'incomplete'}")
-                if state.dependency_record is not None:
-                    print(f"  Dependency record: plan {state.dependency_record.plan_version}; "
-                          f"{len(state.dependency_record.dependencies)} dependent issue(s)")
-                if state.error:
-                    print(f"  Blocker: {state.error}")
+            blocks.append(render_status(
+                state, plan_path=Path(entry["plan"]),
+                run_path=store.run_dir(entry["run_id"]), width=width,
+                detail=bool(args.slug)))
+        if blocks:
+            print("\n\n".join(blocks))
         return 0
     entry = locate(store, args.slug)
     if args.command == "watch":
@@ -690,7 +706,8 @@ def run_command(args):
                 value = ", ".join(str(item) for item in value) or "none"
             print(f"{name}: {value}")
         return 0
-    with store.lock(f"feature-{state.slug}"):
+    def execute():
+        nonlocal state
         command = args.command
         if command == "next":
             command = {"PLAN": "plan", "RESUME": "resume"}.get(next_action(state), "run")
@@ -700,7 +717,7 @@ def run_command(args):
                     print(f"Human gate: run orch resume {state.slug}")
                 else:
                     print(f"Human gate: {action}")
-                return 0
+                return
         if command == "plan":
             if state.phase not in {"DRAFT", "DISCUSSING", "PLAN_READY"}:
                 raise ContractError(f"Cannot plan from {state.phase}")
@@ -758,6 +775,19 @@ def run_command(args):
             store.event(state.run_id, "cleaned")
         else:
             raise ContractError(f"Unsupported command: {command}")
+
+    print_summary = args.command == "next"
+    try:
+        with store.lock(f"feature-{state.slug}"):
+            execute()
+    except BaseException:
+        if print_summary:
+            # Reload after handling so the summary reflects persisted state, and
+            # never hide the primary error or change its exit behaviour.
+            emit_next_status(store, entry)
+        raise
+    if print_summary:
+        emit_next_status(store, entry)
     return 0
 
 
