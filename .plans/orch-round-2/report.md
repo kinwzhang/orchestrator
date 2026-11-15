@@ -1,34 +1,34 @@
 # Feature report: orch-round-2
 
 Phase: AWAITING_TEST
-Stage: NOTIFY; cycle: 1
+Stage: NOTIFY; cycle: 2
 
-Candidate: 792101eff97cc7df1d11a747198c218ac45fc185
-Agent calls: 6; recorded agent time: 2262.99 seconds.
-Usage exposed for 6/6 calls; unknown usage is not zero.
+Candidate: 01c3453d61d979a42b5c6daae572c56aedd0724a
+Agent calls: 11; recorded agent time: 4054.34 seconds.
+Usage exposed for 11/11 calls; unknown usage is not zero.
 
 ## Recorded usage totals
 
 These sum matching metric names only; provider units may differ.
 
-- cache.read: 408290
+- cache.read: 762308
 - cache.write: 0
-- input: 3911
-- output: 1643
-- reasoning: 277
+- input: 7576
+- output: 2961
+- reasoning: 701
 
 ## Assignments
 
 - planner: done; handover: none
-- w04: done; handover: /home/zwj808/.local/state/orch/runs/orch-round-2-2286d3e6/round-1/handover/w04-2.md
-- w03: done; handover: /home/zwj808/.local/state/orch/runs/orch-round-2-2286d3e6/round-1/handover/w03-2.md
+- w04: done; handover: /home/zwj808/.local/state/orch/runs/orch-round-2-2286d3e6/round-2/handover/w04-3.md
+- w03: done; handover: /home/zwj808/.local/state/orch/runs/orch-round-2-2286d3e6/round-2/handover/w03-4.md
 - review-code: interrupted; handover: none
 - review-docs: done; handover: none
 
 ## Issues
 
 - check-w03 (finished, root check-w03, depth 0): Handover files_changed must match actual diff
-  - Assignment 1: 1 repairs, 0 failed repairs, 0 review rounds.
+  - Assignment 1: 1 repairs, 1 failed repairs, 0 review rounds.
 - check-w04 (finished, root check-w04, depth 0): Handover files_changed must match actual diff
   - Assignment 1: 1 repairs, 0 failed repairs, 0 review rounds.
 
@@ -40,6 +40,11 @@ These sum matching metric names only; provider units may differ.
 - w04 (opencode-go/deepseek-v4.1-flash): 263.11s; usage: {'input': 268, 'output': 366, 'reasoning': 0, 'cache': {'read': 61184, 'write': 0}}
 - review-docs (opencode-go/muse-spark-1.3-contributor): 40.51s; usage: {'input': 2256, 'output': 47, 'reasoning': 84, 'cache': {'read': 20977, 'write': 0}}
 - review-code (opencode-go/muse-spark-1.3-contributor): 178.12s; usage: {'input': 328, 'output': 140, 'reasoning': 2, 'cache': {'read': 54513, 'write': 0}}
+- w03 (opencode-go/deepseek-v4.1-flash): 236.57s; usage: {'input': 409, 'output': 270, 'reasoning': 140, 'cache': {'read': 44544, 'write': 0}}
+- w03 (opencode-go/deepseek-v4.1-flash): 413.60s; usage: {'input': 647, 'output': 488, 'reasoning': 173, 'cache': {'read': 97536, 'write': 0}}
+- w04 (opencode-go/deepseek-v4.1-flash): 961.43s; usage: {'input': 387, 'output': 313, 'reasoning': 102, 'cache': {'read': 147456, 'write': 0}}
+- review-docs (opencode-go/muse-spark-1.3-contributor): 26.19s; usage: {'input': 1935, 'output': 42, 'reasoning': 2, 'cache': {'read': 23409, 'write': 0}}
+- review-code (opencode-go/muse-spark-1.3-contributor): 153.56s; usage: {'input': 287, 'output': 205, 'reasoning': 7, 'cache': {'read': 41073, 'write': 0}}
 
 ## Human test and evidence
 
