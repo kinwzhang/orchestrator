@@ -107,6 +107,10 @@ Isolated versus inherited outcomes, all reproduced deterministically in the new 
 - A synthetic user-level allow rule listed before the profile is accepted, because the
   generated profile's denials remain the effective final state.
 - The same allow rule listed after the profile is refused.
+- A later allow rule that names one additional exact Markdown file, rather than the
+  wildcard, is refused in exactly the same way. The refusal therefore does not depend on
+  the later rule being broad, which is appropriate for a safety check but also means any
+  later widening is refused rather than merged.
 - The generated profile listed twice is refused.
 - A later plugin or MCP document is refused.
 - A report that omits the generated profile is refused.
@@ -123,6 +127,9 @@ Isolated versus inherited outcomes, all reproduced deterministically in the new 
 - Read and edit grants are exact file paths, not directories or patterns; external
   directory grants are the exact parent patterns needed for the copied inputs and the
   verdict.
+- The profile accepts Markdown only: a non-Markdown instruction, supplied input or
+  verdict path is refused before launch, so the review cannot be widened by renaming a
+  source file into the curated set.
 - The configuration directory override excludes the user-level configuration layer in
   the probes; inline configuration content is removed before launch.
 - The new deterministic tests assert the exact grants and refusals without weakening
