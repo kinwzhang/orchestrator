@@ -33,6 +33,7 @@ from orch.workflow import (
     Engine,
     approval_hashes,
     next_action,
+    record_invocation_identity,
     recover_review_batch,
     validate_plan,
 )
@@ -398,7 +399,9 @@ def plan_feature(store, entry, feature, state):
                            instruction_file=instruction, output_file=plan / "plan.md",
                            cwd=Path(state.workspace["feature_path"]), model=model,
                            writable_roots=(plan,))
-    argv = CodexAdapter().interactive_argv(request)
+    adapter = CodexAdapter()
+    argv = adapter.interactive_argv(request)
+    identity = adapter.invocation_identity(request)
     planner = state.workers.setdefault("planner", {})
     planner.update(status="running", role="planner", attempt=attempt, attempt_id=attempt_id,
                    started_at=timestamp(), output=str(request.output_file))
@@ -436,7 +439,12 @@ def plan_feature(store, entry, feature, state):
     info = state.workers.setdefault("planner", {})
     info.update(status="running", role="planner", attempt=attempt, attempt_id=attempt_id,
                 started_at=timestamp())
+    record_invocation_identity(info, "planner", attempt_id, {
+        "logical_id": "planner", "attempt_id": attempt_id, **identity})
     state = store.save(state)
+    store.event(state.run_id, "invocation_identity", agent="planner", attempt=attempt_id,
+                adapter=identity["adapter"], provider=identity["provider"],
+                model=identity["model"], evidence_status="recorded")
     kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     try:
         process = subprocess.Popen(executable_argv(argv), cwd=request.cwd, **kwargs)

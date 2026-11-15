@@ -9,10 +9,8 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
+from orch.reporting import attempt_identity, format_local_timestamp
 from orch.store import StateStore
-
-_LOCAL_UNAVAILABLE = "unavailable (unverified timestamp)"
-_NO_ACTIVITY = "—"
 
 
 def _localize(moment: datetime) -> datetime:
@@ -28,26 +26,10 @@ def _localize(moment: datetime) -> datetime:
 def format_local_activity(value) -> str:
     """Display a stored activity instant in system-local time.
 
-    Persisted values stay untouched. Absent values use an em dash; malformed,
-    unsafe or timezone-naive legacy values are reported as unavailable rather
-    than being assumed to be UTC or echoed back to the terminal.
+    Retained as the watch-specific wrapper for compatibility; the shared
+    formatter in reporting owns conversion, fallbacks and the display format.
     """
-    text = "" if value is None else str(value).strip()
-    if not text:
-        return _NO_ACTIVITY
-    try:
-        moment = datetime.fromisoformat(text)
-    except (TypeError, ValueError):
-        return _LOCAL_UNAVAILABLE
-    if moment.tzinfo is None or moment.utcoffset() is None:
-        return _LOCAL_UNAVAILABLE
-    try:
-        local = _localize(moment)
-    except (OverflowError, OSError, ValueError):
-        return _LOCAL_UNAVAILABLE
-    if local.tzinfo is None or local.utcoffset() is None:
-        return _LOCAL_UNAVAILABLE
-    return local.isoformat(sep=" ", timespec="seconds")
+    return format_local_timestamp(value, localize=_localize)
 
 
 def status_table(store: StateStore, run_id: str) -> Table:
@@ -59,8 +41,8 @@ def status_table(store: StateStore, run_id: str) -> Table:
         table.add_row("Run state has not been published yet")
         return table
     table = Table(title=f"{state.slug}: {state.phase} / {state.stage} / cycle {state.round}")
-    for title in ("Agent", "Status", "Attempt", "Elapsed", "Last activity (local)",
-                  "Checks", "Output"):
+    for title in ("Agent", "Status", "Attempt", "Provider", "Model", "Elapsed",
+                  "Last activity (local)", "Checks", "Output"):
         table.add_column(title)
     for name, data in state.workers.items():
         tail = ""
@@ -80,8 +62,9 @@ def status_table(store: StateStore, run_id: str) -> Table:
                 elapsed = round((datetime.now(UTC) - datetime.fromisoformat(data["started_at"])).total_seconds(), 1)
             except ValueError:
                 elapsed = ""
+        provider, model = attempt_identity(data, data.get("attempt_id"))
         values = [name, str(data.get("status", "pending")), str(data.get("attempt", 0)),
-                  str(elapsed), format_local_activity(data.get("activity")),
+                  provider, model, str(elapsed), format_local_activity(data.get("activity")),
                   str(data.get("checks", "")), tail]
         # Log text is untrusted terminal input: strip ANSI/OSC/control sequences and
         # use literal Text so agent output cannot inject Rich markup.

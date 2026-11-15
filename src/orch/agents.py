@@ -387,6 +387,24 @@ class AgentAdapter:
             else ModelSpec(model=request.model)
         )
 
+    def provider(self, model_id: str) -> str:
+        """Return the selected provider, or unknown when it is not established."""
+        return "unknown"
+
+    def invocation_identity(self, request: AgentRequest) -> dict:
+        """Describe the adapter and provider/model actually selected for a call.
+
+        This is invocation evidence for the command about to be handed to the
+        runner, never a projection of current preferences. A provider is only
+        named when the adapter can determine it from its own selection.
+        """
+        model = self.model(request).model
+        return {
+            "adapter": self.tool or "unknown",
+            "provider": self.provider(model),
+            "model": model,
+        }
+
     def command(self, request: AgentRequest) -> list[str]:
         raise NotImplementedError
 
@@ -431,6 +449,15 @@ class AgentAdapter:
         with self.request_environment(request) as (cwd, env):
             capabilities = await asyncio.to_thread(self.capabilities)
             command = self.command(request)
+            # Capture identity after the real command is constructed and
+            # immediately before the runner may create a process. A failure
+            # before this boundary leaves the attempt identity unknown.
+            await emit(on_event, {
+                "kind": "invocation_identity",
+                "logical_id": request.logical_id,
+                "attempt_id": request.attempt_id,
+                **self.invocation_identity(request),
+            })
             result = await self.runner.run(
                 command,
                 cwd,
@@ -461,6 +488,11 @@ class AgentAdapter:
 
 class CodexAdapter(AgentAdapter):
     tool = "codex"
+
+    def provider(self, model_id: str) -> str:
+        # The Codex invocation selects its own provider; the model string is
+        # not provider-qualified.
+        return "codex"
 
     def command(self, request: AgentRequest) -> list[str]:
         capabilities = self.capabilities()
@@ -510,6 +542,21 @@ class CodexAdapter(AgentAdapter):
 
 class OpenCodeAdapter(AgentAdapter):
     tool = "opencode"
+
+    def provider(self, model_id: str) -> str:
+        """Read the provider from a qualified OpenCode model identity.
+
+        OpenCode selects a provider-qualified model. Exactly one separator with
+        a non-empty prefix names the provider; an unqualified or ambiguous
+        identity leaves the provider explicitly unknown.
+        """
+        text = model_id.strip()
+        if text.count("/") != 1:
+            return "unknown"
+        prefix, remainder = text.split("/", 1)
+        if not prefix.strip() or not remainder.strip():
+            return "unknown"
+        return prefix.strip()
 
     @contextlib.contextmanager
     def request_environment(self, request: AgentRequest):

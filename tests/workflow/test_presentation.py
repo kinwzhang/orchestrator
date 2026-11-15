@@ -1,6 +1,7 @@
 from datetime import UTC, timedelta, timezone, tzinfo
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
 from orch.contracts import (
@@ -13,7 +14,7 @@ from orch.contracts import (
     ReviewEntry,
     RunState,
 )
-from orch.reporting import render_status
+from orch.reporting import attempt_identity, format_local_timestamp, render_status
 from orch.store import StateStore
 from orch.watch import format_local_activity, status_table
 
@@ -269,3 +270,212 @@ def test_watch_table_labels_local_activity_and_keeps_persisted_evidence(tmp_path
     assert (store.run_dir("run") / "state.json").read_bytes() == snapshot
     assert store.load("run").workers["w1"]["activity"] == \
         "2026-10-31T10:38:41.981586+00:00"
+
+
+def _invocation_state(*, conflicting=False, legacy=False) -> RunState:
+    attempts = {
+        "w1-1-1": {
+            "logical_id": "w1", "attempt_id": "w1-1-1", "adapter": "opencode",
+            "provider": "alpha", "model": "alpha/one",
+            "evidence_status": "recorded",
+        },
+        "w1-1-2": {
+            "logical_id": "w1", "attempt_id": "w1-1-2", "adapter": "codex",
+            "provider": "codex", "model": "gpt-second",
+            "evidence_status": "conflicting" if conflicting else "recorded",
+        },
+    }
+    worker = {"role": "worker", "status": "running", "attempt": 2,
+              "attempt_id": "w1-1-2", "started_at": "2026-10-31T10:38:41+00:00",
+              "activity": "2026-10-31T10:40:41+00:00",
+              "checks": "pass", "checked": False}
+    if not legacy:
+        worker["invocation_attempts"] = attempts
+    return RunState(run_id="demo-1", slug="demo", phase="RUNNING", stage="WORK",
+                    started_at="2026-10-31T09:00:00+00:00",
+                    updated_at="2026-10-31T10:40:41+00:00",
+                    workers={"w1": worker})
+
+
+def _agent_row(rendered: str, agent: str) -> str:
+    rows = [line for line in rendered.splitlines()
+            if line.startswith("│") and f" {agent} " in line]
+    assert rows, rendered
+    return rows[0]
+
+
+def test_status_shows_the_current_attempt_invocation_in_the_agent_row(monkeypatch):
+    from orch import reporting
+
+    monkeypatch.setattr(reporting, "_localize", lambda moment: moment.astimezone(UTC))
+    state = _invocation_state()
+    before = state.model_dump(mode="json")
+    rendered = render_status(state, plan_path="/p", run_path="/r", width=160)
+    flat = " ".join(rendered.split())
+
+    # The row describes the current attempt only, from captured evidence.
+    row = _agent_row(rendered, "w1")
+    assert "codex" in row and "gpt-second" in row
+    assert "alpha/one" not in row
+    # Retained historical attempts are labeled separately.
+    assert "Attempt invocations" in flat
+    history = "\n".join(rendered.splitlines()[rendered.splitlines().index(
+        "Attempt invocations (recorded at the adapter boundary; current preferences are never used)"):])
+    assert "w1-1-1" in history and "alpha" in history and "alpha/one" in history
+    assert "w1-1-2" in history and "gpt-second" in history
+    assert state.model_dump(mode="json") == before
+
+
+def test_status_never_invents_identity_from_legacy_or_conflicting_evidence(monkeypatch):
+    from orch import reporting
+
+    monkeypatch.setattr(reporting, "_localize", lambda moment: moment.astimezone(UTC))
+    legacy = render_status(_invocation_state(legacy=True),
+                           plan_path="/p", run_path="/r", width=160)
+    assert "unknown" in _agent_row(legacy, "w1")
+    # A legacy current attempt is listed, but only with unknown identity.
+    assert "Attempt invocations" in legacy
+    assert "alpha/one" not in legacy
+
+    conflicting = render_status(_invocation_state(conflicting=True),
+                                plan_path="/p", run_path="/r", width=160)
+    assert "unknown" in _agent_row(conflicting, "w1")
+    assert "conflicting (shown as unknown)" in conflicting
+    # Historical recorded attempts remain visible; only the conflict is unknown.
+    assert "alpha/one" in conflicting
+
+
+def test_attempt_identity_reads_only_recorded_evidence():
+    info = {"attempt_id": "w1-1-2", "invocation_attempts": {
+        "w1-1-1": {"logical_id": "w1", "attempt_id": "w1-1-1",
+                   "adapter": "opencode", "provider": "alpha",
+                   "model": "alpha/one", "evidence_status": "recorded"},
+        "w1-1-2": {"logical_id": "w1", "attempt_id": "w1-1-2",
+                   "adapter": "opencode", "provider": "alpha",
+                   "model": "alpha/one", "evidence_status": "conflicting"},
+    }}
+    assert attempt_identity(info, "w1-1-1") == ("alpha", "alpha/one")
+    assert attempt_identity(info, "w1-1-2") == ("unknown", "unknown")
+    assert attempt_identity(info, "w1-1-9") == ("unknown", "unknown")
+    assert attempt_identity({}, "w1-1-1") == ("unknown", "unknown")
+    mismatched = {"invocation_attempts": {"w1-1-1": {
+        "attempt_id": "w1-1-2", "provider": "alpha", "model": "alpha/one",
+        "evidence_status": "recorded"}}}
+    assert attempt_identity(mismatched, "w1-1-1") == ("unknown", "unknown")
+    partial = {"invocation_attempts": {"w1-1-1": {
+        "attempt_id": "w1-1-1", "provider": "alpha",
+        "evidence_status": "recorded"}}}
+    assert attempt_identity(partial, "w1-1-1") == ("alpha", "unknown")
+
+
+def test_compact_status_shows_attempts_only_when_evidence_exists(monkeypatch):
+    from orch import reporting
+
+    monkeypatch.setattr(reporting, "_localize", lambda moment: moment.astimezone(UTC))
+    with_attempts = render_status(_invocation_state(), plan_path="/p", run_path="/r",
+                                  width=120, detail=False)
+    assert "Attempt invocations" in with_attempts
+    assert "alpha/one" in with_attempts and "gpt-second" in with_attempts
+    assert "Issues" not in with_attempts
+
+    without = render_status(_rich_state(), plan_path="/p", run_path="/r",
+                            width=120, detail=False)
+    assert "Attempt invocations" not in without
+
+
+def test_status_timestamps_use_system_local_time_with_numeric_offset(monkeypatch):
+    from orch import reporting
+
+    monkeypatch.setattr(reporting, "_localize", lambda moment: moment.astimezone(UTC))
+    rendered = render_status(_invocation_state(), plan_path="/p", run_path="/r", width=160)
+    assert "Run started (local)" in rendered
+    assert "2026-10-31 09:00:00+00:00" in rendered
+    assert "2026-10-31 10:40:41+00:00" in rendered
+
+    monkeypatch.setattr(reporting, "_localize",
+                        lambda moment: moment.astimezone(timezone(timedelta(hours=8))))
+    rendered = render_status(_invocation_state(), plan_path="/p", run_path="/r", width=160)
+    assert "2026-10-31 18:40:41+08:00" in rendered
+
+
+def test_status_timestamp_fallbacks_never_assume_utc(monkeypatch):
+    from orch import reporting
+
+    monkeypatch.setattr(reporting, "_localize", lambda moment: moment.astimezone(UTC))
+    state = RunState(
+        run_id="demo-1", slug="demo", phase="RUNNING", stage="WORK",
+        started_at="2026-10-31T09:00:00", updated_at="not-a-timestamp",
+        workers={"w1": {"status": "running", "activity": None}})
+    rendered = render_status(state, plan_path="/p", run_path="/r", width=120)
+    assert "unavailable (unverified timestamp)" in rendered
+    assert "2026-10-31 09:00:00" not in rendered
+    assert "—" in rendered
+
+
+def test_watch_shows_attempt_invocation_and_local_activity(tmp_path, monkeypatch):
+    from orch import watch
+
+    monkeypatch.setattr(watch, "_localize",
+                        lambda moment: moment.astimezone(timezone(timedelta(hours=8))))
+    store = StateStore(tmp_path / "state")
+    store.save(_invocation_state())
+    snapshot = (store.run_dir("demo-1") / "state.json").read_bytes()
+
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=260).print(
+        status_table(store, "demo-1"))
+    rendered = output.getvalue()
+    assert "Provider" in rendered and "Model" in rendered
+    assert "codex" in rendered and "gpt-second" in rendered
+    assert "2026-10-31 18:40:41+08:00" in rendered
+    assert (store.run_dir("demo-1") / "state.json").read_bytes() == snapshot
+
+
+def test_status_ignores_preference_fields_and_covers_reviewer_attempts():
+    state = RunState(run_id="demo-1", slug="demo", phase="RUNNING", stage="WORK", workers={
+        "w1": {"role": "worker", "status": "done", "attempt": 1,
+               "attempt_id": "w1-1-1", "model": "preferred/other",
+               "invocation_attempts": {"w1-1-1": {
+                   "logical_id": "w1", "attempt_id": "w1-1-1", "adapter": "opencode",
+                   "provider": "alpha", "model": "alpha/one",
+                   "evidence_status": "recorded"}}},
+        "code-reviewer": {"role": "code_reviewer", "status": "done", "attempt": 1,
+                          "attempt_id": "code-reviewer-1-1",
+                          "invocation_attempts": {"code-reviewer-1-1": {
+                              "logical_id": "code-reviewer",
+                              "attempt_id": "code-reviewer-1-1", "adapter": "opencode",
+                              "provider": "gamma", "model": "gamma/reviewer",
+                              "evidence_status": "recorded"}}},
+    })
+    rendered = render_status(state, plan_path="/p", run_path="/r", width=160)
+    assert "preferred/other" not in rendered
+    assert "alpha/one" in _agent_row(rendered, "w1")
+    assert "gamma/reviewer" in _agent_row(rendered, "code-reviewer")
+
+
+@pytest.mark.parametrize("status", ["running", "done", "failed", "interrupted"])
+def test_retained_evidence_survives_every_attempt_outcome(status):
+    state = RunState(run_id="demo-1", slug="demo", phase="RUNNING", stage="WORK", workers={
+        "w1": {"role": "worker", "status": status, "attempt": 1,
+               "attempt_id": "w1-1-1",
+               "invocation_attempts": {"w1-1-1": {
+                   "logical_id": "w1", "attempt_id": "w1-1-1", "adapter": "opencode",
+                   "provider": "alpha", "model": "alpha/one",
+                   "evidence_status": "recorded"}}},
+    })
+    rendered = render_status(state, plan_path="/p", run_path="/r", width=160)
+    assert "alpha/one" in _agent_row(rendered, "w1")
+
+
+def test_format_local_timestamp_is_generic(monkeypatch):
+    from orch import reporting
+
+    monkeypatch.setattr(reporting, "_localize",
+                        lambda moment: moment.astimezone(_OffsetProbe()))
+    assert format_local_timestamp("2026-01-15T12:00:00+00:00") == \
+        "2026-01-15 13:00:00+01:00"
+    assert format_local_timestamp("2026-07-15T12:00:00+00:00") == \
+        "2026-07-15 14:00:00+02:00"
+    assert format_local_timestamp(None) == "—"
+    assert format_local_timestamp("2026-07-15T12:00:00") == \
+        "unavailable (unverified timestamp)"
