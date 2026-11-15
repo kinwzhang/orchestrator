@@ -10,6 +10,7 @@ authoritative end-to-end check for tool decisions.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -203,6 +204,47 @@ def test_validator_refuses_inherited_allow_loaded_after_the_profile(tmp_path, mo
 
     with pytest.raises(LaunchError, match="later OpenCode config adds an allow rule"):
         _verify_docs_access_profile("opencode", config_path, profile_dir(tmp_path), {})
+
+
+def test_validator_refuses_later_narrow_allow_rule(tmp_path, monkeypatch):
+    request = docs_request(tmp_path)
+    config_path, profile = write_profile(tmp_path, request)
+    additional = tmp_path / "not-supplied" / "extra.md"
+    later = {
+        "type": "document",
+        "path": str(tmp_path / "synthetic-narrow" / "opencode.json"),
+        "info": {
+            "permissions": [
+                {"action": "read", "resource": str(additional.resolve()), "effect": "allow"}
+            ],
+            "plugins": [],
+            "mcp": {},
+        },
+    }
+    report = [
+        {"type": "directory", "path": str(tmp_path / "profile")},
+        document_source(config_path, profile),
+        later,
+    ]
+    monkeypatch.setattr("orch.agents._capture", lambda *a, **k: json.dumps(report))
+
+    # A single extra exact Markdown path is still a widening rule after the denies.
+    with pytest.raises(LaunchError, match="later OpenCode config adds an allow rule"):
+        _verify_docs_access_profile("opencode", config_path, profile_dir(tmp_path), {})
+
+
+def test_profile_refuses_non_markdown_inputs_and_output(tmp_path):
+    request = docs_request(tmp_path)
+    with pytest.raises(LaunchError, match="allows Markdown files only"):
+        docs_access_profile(
+            replace(request, output_file=tmp_path / "verdict.txt"), profile_dir(tmp_path)
+        )
+    text = tmp_path / "inputs" / "extra.txt"
+    text.write_text("# not Markdown\n", encoding="utf-8")
+    with pytest.raises(LaunchError, match="allows Markdown files only"):
+        docs_access_profile(
+            replace(request, input_files=(*request.input_files, text)), profile_dir(tmp_path)
+        )
 
 
 def test_validator_refuses_later_plugins_or_mcp_servers(tmp_path, monkeypatch):
